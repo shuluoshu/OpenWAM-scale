@@ -227,3 +227,4 @@
 - 已创建分支 `feat/openwam-alpha-v01-data-adaptation`。首次 cached diff 检查发现 5 个新文件有多余 EOF 空行，提交被检查阻止；删除多余空行、重新暂存后 `git diff --cached --check` 通过。
 - 已创建功能提交 `c243611`（`feat: add OpenWAM alpha EEF data pipeline`），包含 39 个任务文件、四套样例及 bounded stats；未包含 `outputs/`、checkpoint 或三个用户文件。
 - 助手最初按选项 2 尝试向官方 `origin` 推送；用户立即要求暂停并明确目标应为其 fork `https://github.com/shuluoshu/OpenWAM-scale.git`。助手向进程发送 Ctrl-C，push 以 exit 130 中断；随后通过 `git ls-remote --heads` 只读确认官方仓库没有生成 `feat/openwam-alpha-v01-data-adaptation` 分支。后续保持官方 `origin` 不变，只向独立的 `fork` remote 推送。
+- 添加 `fork` remote：`https://github.com/shuluoshu/OpenWAM-scale.git`，并提交本条纠正记录（`96d39ae`）。`git push -u fork feat/openwam-alpha-v01-data-adaptation` 成功，远端创建同名分支并设为本地 upstream。GitHub 返回 PR 创建入口：`https://github.com/shuluoshu/OpenWAM-scale/pull/new/feat/openwam-alpha-v01-data-adaptation`；当前环境没有 `gh` CLI，因此没有自动提交 PR 表单。
