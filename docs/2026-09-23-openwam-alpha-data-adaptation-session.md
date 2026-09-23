@@ -226,3 +226,4 @@
 - 远端为 `https://github.com/OpenWAM-Official/OpenWAM.git`；当前环境未安装 `gh` CLI。将先创建功能分支并精确暂存本任务文件（包括被 `.gitignore` 忽略、但属于交付要求的四套样例与 stats），明确排除三个用户文件和运行期 `outputs/`，再尝试通过现有 Git 凭据推送。PR 创建将依据推送结果和可用认证能力继续。
 - 已创建分支 `feat/openwam-alpha-v01-data-adaptation`。首次 cached diff 检查发现 5 个新文件有多余 EOF 空行，提交被检查阻止；删除多余空行、重新暂存后 `git diff --cached --check` 通过。
 - 已创建功能提交 `c243611`（`feat: add OpenWAM alpha EEF data pipeline`），包含 39 个任务文件、四套样例及 bounded stats；未包含 `outputs/`、checkpoint 或三个用户文件。
+- 助手最初按选项 2 尝试向官方 `origin` 推送；用户立即要求暂停并明确目标应为其 fork `https://github.com/shuluoshu/OpenWAM-scale.git`。助手向进程发送 Ctrl-C，push 以 exit 130 中断；随后通过 `git ls-remote --heads` 只读确认官方仓库没有生成 `feat/openwam-alpha-v01-data-adaptation` 分支。后续保持官方 `origin` 不变，只向独立的 `fork` remote 推送。
