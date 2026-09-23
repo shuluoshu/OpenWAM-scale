@@ -1,0 +1,162 @@
+{
+  "name": "robodojo",
+  "profile_path": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/configs/dataloader/canonical_eef_robodojo_openloop.yaml",
+  "dataset_dir": "/mnt/data/cpfs/b5/post_train_data/robodojo_sim/sweep_blocks",
+  "dataset_id": "robodojo_sweep_blocks_openloop",
+  "episode_index": 0,
+  "window_offset": 0,
+  "sample_index": 0,
+  "prompt": "Pick up the broom, hand it over to the right hand, then use the dustpan to sweep the blocks.",
+  "pipeline": [
+    "parquet",
+    "absolute EEF20",
+    "source normalization",
+    "scatter OpenWAM80",
+    "model forward"
+  ],
+  "raw_frame_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32
+  ],
+  "video_frame_indices": [
+    0,
+    4,
+    8,
+    12,
+    16,
+    20,
+    24,
+    28,
+    32
+  ],
+  "shapes": {
+    "video": [
+      9,
+      384,
+      320,
+      3
+    ],
+    "action": [
+      32,
+      80
+    ],
+    "action_mask": [
+      32,
+      80
+    ],
+    "proprio": [
+      1,
+      80
+    ],
+    "proprio_mask": [
+      1,
+      80
+    ]
+  },
+  "active_action_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43
+  ],
+  "stats_path": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_alpha_data_examples/stats/robodojo_sweep_blocks.npy",
+  "stats_metadata": {
+    "dataset_dir": "/mnt/data/cpfs/b5/post_train_data/robodojo_sim/sweep_blocks",
+    "state_key": "observation.states.eef",
+    "action_key": "actions.eef",
+    "episode_indices": [
+      0,
+      1
+    ],
+    "state_width": 20,
+    "action_width": 20,
+    "state_rows": 1689,
+    "action_rows": 1689,
+    "seed": 42,
+    "schema_fingerprint": "b218b33cc75da4389fb18a9d983412b66af2643e4b873212d8f7f602141de050",
+    "generated_at_utc": "2026-09-23T12:07:29.177637+00:00"
+  },
+  "summaries": {
+    "raw_action_eef20": {
+      "min": -1.0,
+      "max": 1.0014115571975708,
+      "mean": 0.11438032239675522
+    },
+    "normalized_action_eef20": {
+      "min": -1.0,
+      "max": 1.0,
+      "mean": -0.08245788514614105
+    },
+    "unified_action80": {
+      "min": -1.0,
+      "max": 1.0,
+      "mean": -0.020614471286535263
+    },
+    "raw_proprio_eef20": {
+      "min": -1.0,
+      "max": 1.0,
+      "mean": 0.15690669417381287
+    },
+    "normalized_proprio_eef20": {
+      "min": -1.0,
+      "max": 1.0,
+      "mean": -0.08904199302196503
+    },
+    "unified_proprio80": {
+      "min": -1.0,
+      "max": 1.0,
+      "mean": -0.022260501980781555
+    }
+  },
+  "files": {
+    "image": "robodojo_frames.png",
+    "npz": "robodojo.npz"
+  }
+}

@@ -2,7 +2,7 @@
 
 - 日期：2026-09-23（UTC）
 - 仓库：`/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM`
-- 状态：设计与环境盘点中
+- 状态：设计已确认，正在编写实施计划
 - 说明：本文件持续记录本次任务中用户可见的对话、执行的命令/文件操作、关键输出、设计决定和验证结果；不记录隐藏推理、凭据或无关敏感信息。
 
 ## 目标
@@ -43,6 +43,8 @@
 用户批准推荐的总体架构：新增通用 canonical EEF LeRobot-v3 reader；V0_1 选 InternData-A1 与 AgiBotWorld 小规模数据；统一使用 absolute EEF20 → source normalization → OpenWAM 80D；RobotWin 使用 fullfield companion；foundation checkpoint 做 open-loop；输出 HTML/PNG/NPZ 可视化；新版对比 HTML 放在当前仓库内且不覆盖原文件。
 
 用户随后批准验收与失败策略：缺失必要字段/stats 时 fail-fast；CPU contract、四类真实数据、两步 GPU 训练、两类 open-loop、离线 HTML 均作为验收项。
+
+用户补充 MoraVLA/pretrain 的实际启动入口为 `pretrain/launch/qwena1_nogen/pretrain.sh`，要求参考该入口确认配置。
 
 ## 已比较的实现方案
 
@@ -133,3 +135,92 @@
 - 系统化定位 OpenWAM Python/Torch 初始化超时原因。
 - 给出 2–3 种数据适配方案与推荐设计，等待用户批准。
 - 设计批准后编写 spec、计划、测试与实现，并记录全部验证命令和结果。
+
+### MoraVLA 实际启动配置复核（2026-09-23）
+
+- 完整读取 `/mnt/data/cpfs/b5/yeqingda/pretrain/launch/qwena1_nogen/pretrain.sh`。
+- 完整读取其默认加载的 `launch/qwena1_nogen/train_files/pretrain.yaml`。
+- 已核实 framework 为 `qwena1_nogen`，model state/action width 为 36D，训练策略为 `action_mode: delta`，EEF 默认在 `head_camera` 坐标系，训练时以 0.5 概率随机使用 wrist frame。
+- YAML 的图像相对索引为 `[-15, 0, 15]`；启动脚本默认通过 CLI 将 `frame_sample_fps` 覆盖为 5。
+- 启动脚本设置 `LEROBOT_STATS_ROOT=${DATA_ROOT_DIR}/stats`，配置启用 external stats。
+- 这修正了先前将“当前默认 MoraVLA recipe”描述为 96D 的不准确假设：MoraVLA 代码中仍有 96D layout，但用户给出的实际启动入口使用 36D contract。
+- 已据此修订设计文档。OpenWAM 适配仍保持已批准的 absolute EEF20 → source stats normalization → unified 80D；只参考 MoraVLA 的 EEF 字段、坐标帧选择、delta/normalize 次序和外部 stats 校验，不直接复用 36D delta 输出。
+- 检查仓库根目录时未发现本地 `AGENTS.md`；本轮重新完整读取并遵循 `/mnt/data/cpfs/b5/yeqingda/software/AGENTS_RULES.md`。
+
+## 实现执行记录（2026-09-23）
+
+### 计划与流程
+
+- 用户明确要求“开始执行”并多次要求继续。
+- 创建实施计划 `docs/superpowers/plans/2026-09-23-openwam-alpha-data-adaptation.md`，完成占位符扫描和 `git diff --check`。
+- 启用 `superpowers:executing-plans`、`superpowers:test-driven-development`；遇到导入超时时启用 `superpowers:systematic-debugging`。
+- 当前检出是 `main` 的普通工作目录而非 linked worktree。用户已明确授权在当前仓库开始执行；保持用户原有 `burn_gpu.py`、`nohup.out`、`openwam_codebase_guide.html` 不动。
+- 基线：`tests/dataloader/test_lerobotv3_utils.py tests/dataloader/test_mixture_from_config.py` 共 37 项通过。
+
+### Canonical EEF reader
+
+- 先创建 `tests/dataloader/test_canonical_eef_lerobot.py`，确认因模块不存在而红灯。
+- 新增 `openwam/dataloader/canonical_eef_lerobot.py` 并注册 `canonical_eef_lerobot`。
+- contract：absolute EEF20，action/state 分离 stats，raw normalization 后 scatter 到 80D，episode/window 硬限制，trace opt-in，missing EEF/non-finite/degenerate rot6d/provenance mismatch fail-fast。
+- 有意覆盖 `__getitem__` 不使用基类的“失败后换窗口重试”，避免坏 EEF 被静默跳过。
+- reader 5 项、reader+mixture 14 项测试通过。
+
+### Stats、YAML、open-loop 与可视化
+
+- 新增 bounded stats 脚本和测试；相关 8 项测试通过。
+- 新增两训练 profile、两 open-loop profile 和 `openwam_alpha_v0_1_smoke.yaml`；Hydra 组合 2 项测试通过。
+- 新增 `scripts/open_loop_inference.py`；2 项 orchestration/shape/non-finite 测试通过。
+- 系统化定位 open-loop 单测 180 秒无输出：根因是导入 `openwam.deploy.*` 时 package `__init__` eager-import 完整 deploy/model 栈，在容器内触发 CUDA 304 warning 与大量共享文件系统 module stat。将 checkpoint loader 延迟到真实运行时导入，并在脚本内按公开 sync schedule contract 构造 schedule；测试恢复正常。
+- 新增 `scripts/visualize_model_inputs.py`，2 项 PNG/JSON/NPZ/offline HTML 测试通过。
+
+### 四类真实数据 CPU 验收
+
+- 仅扫描 episode 0/1 生成 stats：InternData-A1 558 行、AgiBotWorld 6016 行、RoboDojo 1689 行、RobotWin 927 行。
+- InternData-A1 指令：`Pick up the lotus root with the right arm and place it in the basket`。
+- AgiBotWorld 指令：`Wipe the whiteboard`。
+- RoboDojo 指令：`Pick up the broom, hand it over to the right hand, then use the dustpan to sweep the blocks.`。
+- 首轮 RobotWin 可视化失败，证据为 fullfield 下 `videos` 软链接指向容器内不存在的 `/mnt/cpfs/post_train_data/...`；实际视频位于用户提供的 `/mnt/data/cpfs/b5/post_train_data/robotwin_traj/...`。
+- 先增加 failing test，再在 LeRobot 基类增加可覆盖的 `_resolve_video_file` hook，canonical reader/profile 增加显式 `video_root`。metadata/EEF 继续来自 fullfield，视频来自原轨迹。canonical + InternData 回归 109 项通过。
+- 重新执行后四个 profile 均产出 PNG/JSON/NPZ，`assets/openwam_alpha_data_examples/index.html` 离线报告生成成功；人工查看 RobotWin contact sheet，九帧三视角内容正常。
+
+### GPU smoke 首轮结果
+
+- 容器外 H20-3e：143771 MiB total / 142646 MiB free；Torch 2.7.1+cu128，实测 `import torch` 24.84 秒，CUDA available，GPU tensor 加和成功。此前 30 秒探测超时不能证明环境不可用。
+- 首次两步训练已成功完成数据构建、24.8 GB foundation 权重加载和第一个 forward/backward；在第一个 Adam optimizer step 的 `torch._foreach_sqrt` OOM。
+- OOM 证据：GPU 139.81 GiB，PyTorch allocated 112.91 GiB、reserved-unallocated 11.18 GiB、free 13.83 GiB，临时申请 22.43 GiB。
+- 根因是 12.4B 总参数/6.0B trainable 参数在单卡上的 Adam step 峰值与显存碎片，不是数据或模型 shape 错误。
+- 为使 smoke YAML 在单卡稳定可训，按配置原生能力将 `zero_stage` 改为 2、`offload_optimizer_device` 改为 `cpu`，并在文档命令加入 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`；随后重跑两步。
+
+### GPU smoke 重跑结果与本轮续接（2026-09-23）
+
+- 用户询问“现在呢”，助手说明会接管既有 GPU session，不重复启动训练，并继续维护本日志。
+- 重新完整读取 `/mnt/data/cpfs/b5/yeqingda/software/AGENTS_RULES.md`；仓库根目录仍无独立 `AGENTS.md`。复核实施计划、当前分支和工作树：仍在用户已经授权执行的 `main` 普通工作目录中，保留三个用户文件不动。
+- 通过既有 terminal session `26883` 取得修正后训练的最终输出。DeepSpeed ZeRO-2 + CPU optimizer offload 初始化成功；两步训练均完成且 loss 有限：step 1 `loss=0.1251`（video `0.1199`、action `0.0052`），step 2 `loss=0.3834`（video `0.3832`、action `0.0002`）。总训练迭代约 51 秒，进程退出码为 0。
+- 下一项验收是使用 foundation checkpoint、CUDA、2 denoise steps 对 RoboDojo 与 RobotWin 各运行一个真实 open-loop 样例，并检查保存数组的 shape 和 finite 性。
+
+### 真实 CUDA open-loop 验收（2026-09-23）
+
+- 使用 `/mnt/data/cpfs/b5/yeqingda/envs/openwam/bin/python`、foundation checkpoint、`cuda:0`、seed 42 和 2 denoise steps 运行 `scripts/open_loop_inference.py`。
+- RoboDojo profile：checkpoint `generate` 成功，joint denoising 约 24.25 秒；指令为 `Pick up the broom, hand it over to the right hand, then use the dustpan to sweep the blocks.`；保存 `outputs/openwam_alpha_open_loop/robodojo/{prediction.npz,manifest.json}`。
+- RobotWin profile：checkpoint `generate` 成功，joint denoising 约 5.14 秒；指令为 `Put large block, medium block, and small block in the center by size.`；保存 `outputs/openwam_alpha_open_loop/robotwin/{prediction.npz,manifest.json}`。
+- 两次运行都返回 `prediction_normalized80 (32,80)`、gather 后的 normalized/physical EEF `(32,20)`、GT `(32,80)`，active indices 精确为 `0..9,34..43`。
+- 单独加载两个 NPZ 检查：所有浮点数组均 finite，两个输出目录都仅包含预期的 `prediction.npz` 与 `manifest.json`。
+- RoboDojo 首次启动在共享存储导入/加载阶段长时间无 stdout；只读检查显示进程处于 disk-sleep、GPU 尚空闲。尝试用 `py-spy dump` 采样调用栈时，采样工具因目标进程已经结束而返回 `No such file or directory`；随后读取原 terminal session，确认推理本身已正常退出（code 0）。未因此修改代码或重启成功任务。
+
+### 最终验证记录（2026-09-23）
+
+- 首次将 focused 测试文件以“`tests/dataloader` → `tests/` → `tests/dataloader`”交错顺序传给 pytest 时，18 项通过、9 项 `test_mixture_from_config.py` 在 setup 阶段找不到 `fake_dataset_factory`。该 fixture 位于 `tests/dataloader/conftest.py`，不是产品代码报错。
+- 系统化最小复现：`canonical + mixture` 为 15 passed，`prepare + mixture` 为 12 passed，`canonical + prepare + mixture` 的交错参数顺序复现 fixture error；将两个 `tests/dataloader/*` 参数相邻排列后，同样 18 项全部通过。曾尝试把测试 bucket helper 移出 test module，但不能改变该行为，已完整撤回该无效修改。结论是 pytest 对交错目录参数的 conftest scope/collection 行为；最终命令将同目录文件连续排列。
+- Fresh focused suite：27 passed（canonical、mixture from config、stats、open-loop、visualization、configs、docs）。
+- Fresh LeRobot 回归 suite：146 passed（LeRobot-v3 utils、InternData-A1、canonical、mixture from config）。
+- `git diff --check` 通过；相关源码、配置、测试与文档的尾随空白扫描无结果。
+- 离线链接检查：`assets/openwam_alpha_data_examples/index.html` 的 12 个本地链接、`docs/pretrain_vs_openwam_data_pipeline.html` 的 5 个本地链接全部存在。
+- 资产清点：四个 profile 各有 PNG/JSON/NPZ，另有四份 bounded stats；两个 open-loop 输出各有 manifest 与 prediction NPZ。
+- 最终自审未发现 TODO/FIXME/未实现分支。stats 脚本第 86 行的 `pass` 仅是 `Path.relative_to` 的正常 `try/except` 控制流，用于允许输出位于数据源目录之外。
+- 撤回无效测试-helper 尝试后，在最终文件状态重新运行相同的正确排序 focused suite：27 passed in 2.55s；再次运行 `git diff --check` 通过。
+- 最终 `git status --short` 确认 `burn_gpu.py`、`nohup.out`、`openwam_codebase_guide.html` 仍仅为用户原有 untracked 文件；未加入、未覆盖、未删除。当前仍是普通 `main` 工作目录，未自行 commit、push 或创建 PR。
+
+### 集成选择（2026-09-23）
+
+- 用户选择选项 2：创建功能分支、提交、推送并创建 Pull Request。
+- 远端为 `https://github.com/OpenWAM-Official/OpenWAM.git`；当前环境未安装 `gh` CLI。将先创建功能分支并精确暂存本任务文件（包括被 `.gitignore` 忽略、但属于交付要求的四套样例与 stats），明确排除三个用户文件和运行期 `outputs/`，再尝试通过现有 Git 凭据推送。PR 创建将依据推送结果和可用认证能力继续。

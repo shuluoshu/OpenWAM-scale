@@ -1,0 +1,98 @@
+defaults:
+  - model: dual_system
+  - _self_
+
+dataloader:
+  type: mixture
+  weight_strategy: proportional
+  seed: 42
+  datasets:
+    interndata_genie1:
+      type: canonical_eef_lerobot
+      enabled: true
+      weight: 1.0
+      dataset_id: interndata_genie1_smoke
+      dataset_dir: /mnt/data/cpfs/b5big/pretrain_data_release/pretrain_datasetsV0_1/interndata_a1/pick_and_place_tasks/pick_and_place_part2/omniobject3d-lotus_root/genie1__parallel_gripper
+      normalization_stats_path: /mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_alpha_data_examples/stats/interndata_genie1.npy
+      state_key: observation.states.eef
+      action_key: actions.eef
+      head_camera: observation.images.cam_high
+      left_wrist_camera: observation.images.cam_left_wrist
+      right_wrist_camera: observation.images.cam_right_wrist
+      num_frames: 33
+      video_stride: 4
+      window_stride: 1
+      height: 384
+      width: 320
+      multiview: true
+      normalize_mode: quantile
+      unify_action: true
+      unify_action_map: ["0-9", "34-43"]
+      episode_indices: [0, 1]
+      max_episodes: 2
+      max_windows: 8
+      return_trace: false
+    agibotworld_a2d:
+      type: canonical_eef_lerobot
+      enabled: true
+      weight: 1.0
+      dataset_id: agibotworld_a2d_smoke
+      dataset_dir: /mnt/data/cpfs/b5big/pretrain_data_release/pretrain_datasetsV0_1/agibotworld/task_512/a2d_gripper__dual_gripper__base__unmodified
+      normalization_stats_path: /mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_alpha_data_examples/stats/agibotworld_a2d.npy
+      state_key: observation.states.eef
+      action_key: actions.eef
+      head_camera: observation.images.cam_high
+      left_wrist_camera: observation.images.cam_left_wrist
+      right_wrist_camera: observation.images.cam_right_wrist
+      num_frames: 33
+      video_stride: 4
+      window_stride: 1
+      height: 384
+      width: 320
+      multiview: true
+      normalize_mode: quantile
+      unify_action: true
+      unify_action_map: ["0-9", "34-43"]
+      episode_indices: [0, 1]
+      max_episodes: 2
+      max_windows: 8
+      return_trace: false
+
+training:
+  debug: false
+  learning_rate: 1.0e-4
+  adam_betas: [0.9, 0.95]
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  num_epochs: null
+  max_steps: 2
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  lr_scheduler: null
+  warmup_ratio: 0.0
+  lr_min_ratio: 0.01
+  action_lr: null
+  video_lr: null
+  mixed_precision: bf16
+  zero_stage: 2
+  use_gradient_checkpointing: true
+  use_gradient_checkpointing_offload: false
+  initialize_model_on_cpu: false
+  offload_optimizer_device: cpu
+  lambda_video: 1.0
+  lambda_action: 1.0
+  max_timestep_boundary: 1.0
+  min_timestep_boundary: 0.0
+  output_path: outputs/openwam_alpha_v0_1_smoke
+  save_steps: 0
+  save_full_states_for_resume: false
+  keep_last_k_ckpts: 1
+  finetune_ckpt_path: /mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Pretrain-Foundation-Model
+  resume_ckpt_path: null
+  dataset_num_workers: 0
+
+project:
+  name: openwam-alpha-v0-1-smoke
+  output_dir: outputs/openwam_alpha_v0_1_smoke
+  seed: 42
+  wandb: null

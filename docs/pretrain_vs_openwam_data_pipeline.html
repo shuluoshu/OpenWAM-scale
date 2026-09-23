@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MoraVLA pretrain 与 OpenWAM-α 数据链路对比</title>
+<style>
+body{font:15px/1.65 system-ui;margin:0;background:#0b1220;color:#e5e7eb}main{max-width:1180px;margin:auto;padding:32px}h1,h2{color:#f8fafc}.card{background:#172033;border:1px solid #334155;border-radius:12px;padding:18px;margin:18px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}table{width:100%;border-collapse:collapse}th,td{padding:10px;border:1px solid #475569;vertical-align:top}th{background:#25324a}code{color:#7dd3fc}img{width:100%;border-radius:8px}a{color:#7dd3fc}.flow{font-family:ui-monospace,monospace;background:#070c16;padding:14px;border-radius:8px;white-space:pre-wrap}.ok{color:#86efac}.warn{color:#fdba74}@media(max-width:800px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body><main>
+<h1>MoraVLA pretrain vs OpenWAM-α：已验证的数据处理链</h1>
+<p>本页是在原始 <code>pretrain_vs_openwam_comparison.html</code> 基础上针对本次实现整理的离线报告；原文件未被覆盖。</p>
+
+<section class="card"><h2>先说结论</h2>
+<p>MoraVLA 的实际启动入口是 <code>launch/qwena1_nogen/pretrain.sh</code>，加载 <code>launch/qwena1_nogen/train_files/pretrain.yaml</code>。它的当前训练 contract 是 <b>36D</b>、<code>action_mode: delta</code>、<code>eef_frame: head_camera</code>，训练时以 0.5 概率切到 wrist frame；脚本默认覆盖为 <code>FRAME_SAMPLE_FPS=5</code> 并从 <code>${DATA_ROOT_DIR}/stats</code> 读取 external stats。</p>
+<p>OpenWAM-α foundation checkpoint 是 <b>80D</b> action/state head。因此本实现复用 MoraVLA 已生成的 EEF 字段和显式 frame/stats 思路，但不直接复用其 36D delta；MoraVLA 代码库其他位置存在的 <b>96D</b> layout 也不是此启动脚本的输出，更不能直接送进 OpenWAM。</p></section>
+
+<div class="grid">
+<section class="card"><h2>MoraVLA qwena1_nogen</h2><div class="flow">LeRobot row + calibration
+→ image offsets [-15, 0, 15]
+→ world EEF to head_camera / wrist frame
+→ delta action
+→ external normalization
+→ 36D state/action layout
+→ Qwen3-VL + action expert forward</div></section>
+<section class="card"><h2>本次 OpenWAM-α 适配</h2><div class="flow">LeRobot row: absolute EEF20
+→ 33 raw steps
+→ source-specific quantile normalization
+→ left 0:10 → OpenWAM 0:10
+→ right 10:20 → OpenWAM 34:44
+→ 32×80 GT + masks
+→ frames 0,4,...,32 (9 canvases)
+→ dual-system model forward / generate</div></section>
+</div>
+
+<section class="card"><h2>逐项对比</h2><table>
+<tr><th>项目</th><th>MoraVLA 实际启动配置</th><th>OpenWAM-α 本实现</th></tr>
+<tr><td>入口</td><td><code>qwena1_nogen/pretrain.sh</code></td><td><code>scripts/train.py --config-name openwam_alpha_v0_1_smoke</code></td></tr>
+<tr><td>动作语义</td><td>head/wrist-frame delta</td><td>absolute EEF20，先按源归一化</td></tr>
+<tr><td>模型宽度</td><td>36D；另有代码路径定义 96D</td><td>80D unified head</td></tr>
+<tr><td>时间采样</td><td>offset [-15,0,15]，启动 FPS 5</td><td>33 steps，视频 stride 4 得九帧</td></tr>
+<tr><td>统计量</td><td>external stats root</td><td>只对 profile 的 episode 0/1 生成并校验 provenance</td></tr>
+<tr><td>失败策略</td><td>可配置 skip invalid</td><td class="warn">EEF/schema/stats/shape 非法立即失败，不回退 joint</td></tr>
+</table></section>
+
+<section class="card"><h2>四类真实样例</h2><p class="ok">均已走完 parquet → EEF20 → normalization → 80D scatter → forward input 链。</p>
+<div class="grid">
+<figure><img src="../assets/openwam_alpha_data_examples/interndata_frames.png"><figcaption>InternData-A1 Genie-1：Pick up the lotus root…</figcaption></figure>
+<figure><img src="../assets/openwam_alpha_data_examples/agibotworld_frames.png"><figcaption>AgiBotWorld A2D：Wipe the whiteboard</figcaption></figure>
+<figure><img src="../assets/openwam_alpha_data_examples/robodojo_frames.png"><figcaption>RoboDojo：sweep blocks</figcaption></figure>
+<figure><img src="../assets/openwam_alpha_data_examples/robotwin_frames.png"><figcaption>RobotWin：blocks ranking；EEF 来自 fullfield，视频来自原轨迹</figcaption></figure>
+</div>
+<p><a href="../assets/openwam_alpha_data_examples/index.html">打开完整 forward-input 报告（含 JSON/NPZ）</a></p></section>
+
+<section class="card"><h2>验收边界</h2><p>训练只做两步 smoke；推理是 RoboDojo/RobotWin 各一个离线 open-loop chunk。它证明配置、数据、checkpoint 和 generate 接口能连通，不代表闭环成功率或模型质量。</p></section>
+</main></body></html>

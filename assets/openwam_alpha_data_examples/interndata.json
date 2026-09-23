@@ -1,0 +1,162 @@
+{
+  "name": "interndata",
+  "profile_path": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/configs/dataloader/canonical_eef_interndata_smoke.yaml",
+  "dataset_dir": "/mnt/data/cpfs/b5big/pretrain_data_release/pretrain_datasetsV0_1/interndata_a1/pick_and_place_tasks/pick_and_place_part2/omniobject3d-lotus_root/genie1__parallel_gripper",
+  "dataset_id": "interndata_genie1_smoke",
+  "episode_index": 0,
+  "window_offset": 0,
+  "sample_index": 0,
+  "prompt": "Pick up the lotus root with the right arm and place it in the basket",
+  "pipeline": [
+    "parquet",
+    "absolute EEF20",
+    "source normalization",
+    "scatter OpenWAM80",
+    "model forward"
+  ],
+  "raw_frame_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32
+  ],
+  "video_frame_indices": [
+    0,
+    4,
+    8,
+    12,
+    16,
+    20,
+    24,
+    28,
+    32
+  ],
+  "shapes": {
+    "video": [
+      9,
+      384,
+      320,
+      3
+    ],
+    "action": [
+      32,
+      80
+    ],
+    "action_mask": [
+      32,
+      80
+    ],
+    "proprio": [
+      1,
+      80
+    ],
+    "proprio_mask": [
+      1,
+      80
+    ]
+  },
+  "active_action_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43
+  ],
+  "stats_path": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_alpha_data_examples/stats/interndata_genie1.npy",
+  "stats_metadata": {
+    "dataset_dir": "/mnt/data/cpfs/b5big/pretrain_data_release/pretrain_datasetsV0_1/interndata_a1/pick_and_place_tasks/pick_and_place_part2/omniobject3d-lotus_root/genie1__parallel_gripper",
+    "state_key": "observation.states.eef",
+    "action_key": "actions.eef",
+    "episode_indices": [
+      0,
+      1
+    ],
+    "state_width": 20,
+    "action_width": 20,
+    "state_rows": 558,
+    "action_rows": 558,
+    "seed": 42,
+    "schema_fingerprint": "19a0c6f42018fb4e4c60cee4ef74904dc4005e5f41cf8b80da630ed2777a5e6c",
+    "generated_at_utc": "2026-09-23T12:07:29.213115+00:00"
+  },
+  "summaries": {
+    "raw_action_eef20": {
+      "min": -0.9776396155357361,
+      "max": 0.9999192357063293,
+      "mean": 0.13715122640132904
+    },
+    "normalized_action_eef20": {
+      "min": -0.9999083280563354,
+      "max": 0.9999189376831055,
+      "mean": -0.04683219641447067
+    },
+    "unified_action80": {
+      "min": -0.9999083280563354,
+      "max": 0.9999189376831055,
+      "mean": -0.011708049103617668
+    },
+    "raw_proprio_eef20": {
+      "min": -0.9776381254196167,
+      "max": 1.0,
+      "mean": 0.15518786013126373
+    },
+    "normalized_proprio_eef20": {
+      "min": -0.9996638298034668,
+      "max": 1.0,
+      "mean": 0.005772885866463184
+    },
+    "unified_proprio80": {
+      "min": -0.9996638298034668,
+      "max": 1.0,
+      "mean": 0.001443221466615796
+    }
+  },
+  "files": {
+    "image": "interndata_frames.png",
+    "npz": "interndata.npz"
+  }
+}

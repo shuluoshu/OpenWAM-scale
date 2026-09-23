@@ -1,0 +1,162 @@
+{
+  "name": "robotwin",
+  "profile_path": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/configs/dataloader/canonical_eef_robotwin_openloop.yaml",
+  "dataset_dir": "/mnt/data/cpfs/b5/post_train_data/robotwin_traj_fullfield/blocks_ranking_size/demo_clean",
+  "dataset_id": "robotwin_blocks_ranking_openloop",
+  "episode_index": 0,
+  "window_offset": 0,
+  "sample_index": 0,
+  "prompt": "Put large block, medium block, and small block in the center by size.",
+  "pipeline": [
+    "parquet",
+    "absolute EEF20",
+    "source normalization",
+    "scatter OpenWAM80",
+    "model forward"
+  ],
+  "raw_frame_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32
+  ],
+  "video_frame_indices": [
+    0,
+    4,
+    8,
+    12,
+    16,
+    20,
+    24,
+    28,
+    32
+  ],
+  "shapes": {
+    "video": [
+      9,
+      384,
+      320,
+      3
+    ],
+    "action": [
+      32,
+      80
+    ],
+    "action_mask": [
+      32,
+      80
+    ],
+    "proprio": [
+      1,
+      80
+    ],
+    "proprio_mask": [
+      1,
+      80
+    ]
+  },
+  "active_action_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43
+  ],
+  "stats_path": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_alpha_data_examples/stats/robotwin_blocks_ranking.npy",
+  "stats_metadata": {
+    "dataset_dir": "/mnt/data/cpfs/b5/post_train_data/robotwin_traj_fullfield/blocks_ranking_size/demo_clean",
+    "state_key": "observation.states.eef",
+    "action_key": "actions.eef",
+    "episode_indices": [
+      0,
+      1
+    ],
+    "state_width": 20,
+    "action_width": 20,
+    "state_rows": 927,
+    "action_rows": 927,
+    "seed": 42,
+    "schema_fingerprint": "08cf7f3ceeb626326e1e88bf2fa673227186f09d5636f383cc13a884a569d250",
+    "generated_at_utc": "2026-09-23T12:07:29.127372+00:00"
+  },
+  "summaries": {
+    "raw_action_eef20": {
+      "min": -0.9999499917030334,
+      "max": 1.0943760871887207,
+      "mean": 0.12193596363067627
+    },
+    "normalized_action_eef20": {
+      "min": -1.0,
+      "max": 1.0,
+      "mean": -0.023996060714125633
+    },
+    "unified_action80": {
+      "min": -1.0,
+      "max": 1.0,
+      "mean": -0.005999015178531408
+    },
+    "raw_proprio_eef20": {
+      "min": -0.9999499917030334,
+      "max": 1.0,
+      "mean": 0.1602439135313034
+    },
+    "normalized_proprio_eef20": {
+      "min": -1.0,
+      "max": 1.0,
+      "mean": -0.03813416510820389
+    },
+    "unified_proprio80": {
+      "min": -1.0,
+      "max": 1.0,
+      "mean": -0.009533540345728397
+    }
+  },
+  "files": {
+    "image": "robotwin_frames.png",
+    "npz": "robotwin.npz"
+  }
+}

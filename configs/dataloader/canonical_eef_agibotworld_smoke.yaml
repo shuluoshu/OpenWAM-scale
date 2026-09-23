@@ -1,0 +1,22 @@
+type: canonical_eef_lerobot
+dataset_id: agibotworld_a2d_smoke
+dataset_dir: /mnt/data/cpfs/b5big/pretrain_data_release/pretrain_datasetsV0_1/agibotworld/task_512/a2d_gripper__dual_gripper__base__unmodified
+normalization_stats_path: /mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_alpha_data_examples/stats/agibotworld_a2d.npy
+state_key: observation.states.eef
+action_key: actions.eef
+head_camera: observation.images.cam_high
+left_wrist_camera: observation.images.cam_left_wrist
+right_wrist_camera: observation.images.cam_right_wrist
+num_frames: 33
+video_stride: 4
+window_stride: 1
+height: 384
+width: 320
+multiview: true
+normalize_mode: quantile
+unify_action: true
+unify_action_map: ["0-9", "34-43"]
+episode_indices: [0, 1]
+max_episodes: 2
+max_windows: 8
+return_trace: false

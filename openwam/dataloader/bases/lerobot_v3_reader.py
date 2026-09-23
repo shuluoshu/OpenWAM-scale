@@ -1093,9 +1093,7 @@ class LeRobotV3Reader(BaseDataset):
             return []
 
         if kind == "head":
-            path = self._dataset_dir / self._video_path_template.format(
-                video_key=camera, chunk_index=int(row[chunk_col]), file_index=int(row[file_col])
-            )
+            path = self._resolve_video_file(camera, row)
             v_base = int(self._ep_video_frame_offsets[camera][ep_local]) + offset
             frame_indices = (real_local_indices + v_base).tolist()
             h, w = (_HEAD_SLOT_H, _HEAD_SLOT_W) if self._multiview else (self._height, self._width)
@@ -1105,9 +1103,7 @@ class LeRobotV3Reader(BaseDataset):
         # corrupt chunk/file index or offset lookup degrades to a black slot rather
         # than failing the whole sample (matches the pre-refactor robocoin behavior).
         try:
-            path = self._dataset_dir / self._video_path_template.format(
-                video_key=camera, chunk_index=int(row[chunk_col]), file_index=int(row[file_col])
-            )
+            path = self._resolve_video_file(camera, row)
             v_base = int(self._ep_video_frame_offsets[camera][ep_local]) + offset
             frame_indices = (real_local_indices + v_base).tolist()
             return _decode_video_frames(str(path), frame_indices, _WRIST_SLOT_H, _WRIST_SLOT_W)
@@ -1123,6 +1119,14 @@ class LeRobotV3Reader(BaseDataset):
                     camera,
                 )
             return []
+
+    def _resolve_video_file(self, camera: str, row) -> Path:
+        """Resolve one physical video path; companion readers may override its root."""
+        return self._dataset_dir / self._video_path_template.format(
+            video_key=camera,
+            chunk_index=int(row[f"videos/{camera}/chunk_index"]),
+            file_index=int(row[f"videos/{camera}/file_index"]),
+        )
 
     # ----- BaseDataset ------------------------------------------------------
 

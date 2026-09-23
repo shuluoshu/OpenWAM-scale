@@ -1,0 +1,162 @@
+{
+  "name": "agibotworld",
+  "profile_path": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/configs/dataloader/canonical_eef_agibotworld_smoke.yaml",
+  "dataset_dir": "/mnt/data/cpfs/b5big/pretrain_data_release/pretrain_datasetsV0_1/agibotworld/task_512/a2d_gripper__dual_gripper__base__unmodified",
+  "dataset_id": "agibotworld_a2d_smoke",
+  "episode_index": 0,
+  "window_offset": 0,
+  "sample_index": 0,
+  "prompt": "Wipe the whiteboard",
+  "pipeline": [
+    "parquet",
+    "absolute EEF20",
+    "source normalization",
+    "scatter OpenWAM80",
+    "model forward"
+  ],
+  "raw_frame_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32
+  ],
+  "video_frame_indices": [
+    0,
+    4,
+    8,
+    12,
+    16,
+    20,
+    24,
+    28,
+    32
+  ],
+  "shapes": {
+    "video": [
+      9,
+      384,
+      320,
+      3
+    ],
+    "action": [
+      32,
+      80
+    ],
+    "action_mask": [
+      32,
+      80
+    ],
+    "proprio": [
+      1,
+      80
+    ],
+    "proprio_mask": [
+      1,
+      80
+    ]
+  },
+  "active_action_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43
+  ],
+  "stats_path": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_alpha_data_examples/stats/agibotworld_a2d.npy",
+  "stats_metadata": {
+    "dataset_dir": "/mnt/data/cpfs/b5big/pretrain_data_release/pretrain_datasetsV0_1/agibotworld/task_512/a2d_gripper__dual_gripper__base__unmodified",
+    "state_key": "observation.states.eef",
+    "action_key": "actions.eef",
+    "episode_indices": [
+      0,
+      1
+    ],
+    "state_width": 20,
+    "action_width": 20,
+    "state_rows": 6016,
+    "action_rows": 6016,
+    "seed": 42,
+    "schema_fingerprint": "b2ac7ec3c3edb4c13cc430bd83373505563977a2bf61359e1c754fc09a2408ee",
+    "generated_at_utc": "2026-09-23T12:07:30.044167+00:00"
+  },
+  "summaries": {
+    "raw_action_eef20": {
+      "min": -0.9545595645904541,
+      "max": 1.0,
+      "mean": 0.2914389371871948
+    },
+    "normalized_action_eef20": {
+      "min": -1.0,
+      "max": 1.0,
+      "mean": -0.06194397807121277
+    },
+    "unified_action80": {
+      "min": -1.0,
+      "max": 1.0,
+      "mean": -0.015485994517803192
+    },
+    "raw_proprio_eef20": {
+      "min": -0.954541027545929,
+      "max": 1.0,
+      "mean": 0.2914412319660187
+    },
+    "normalized_proprio_eef20": {
+      "min": -1.0,
+      "max": 1.0,
+      "mean": -0.06192447990179062
+    },
+    "unified_proprio80": {
+      "min": -1.0,
+      "max": 1.0,
+      "mean": -0.015481117181479931
+    }
+  },
+  "files": {
+    "image": "agibotworld_frames.png",
+    "npz": "agibotworld.npz"
+  }
+}

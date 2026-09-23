@@ -34,7 +34,20 @@ This is preferred over two alternatives:
 - Adding independent LeRobot branches to the legacy HDF5 RoboDojo and RobotWin readers would duplicate window, video, prompt, normalization, and mask behavior.
 - Porting MoraVLA's complete `VlaPipeline` would bring in a second dataset framework and its `dual_eef_local_96d` model contract. OpenWAM-α uses a different 80D action head, so that port would be larger and less reliable.
 
-The design reuses MoraVLA's explicit field/frame semantics and processed EEF artifacts, not its Qwen tokenizer or 96D action-space composer.
+The design reuses MoraVLA's explicit field/frame semantics and processed EEF artifacts, not its Qwen tokenizer or model-specific action-space composer.
+
+## Verified MoraVLA Launch Contract
+
+The authoritative MoraVLA reference for this task is:
+
+```text
+/mnt/data/cpfs/b5/yeqingda/pretrain/launch/qwena1_nogen/pretrain.sh
+  -> launch/qwena1_nogen/train_files/pretrain.yaml
+```
+
+The launch script selects the `qwena1_nogen` framework and overrides the YAML's nominal 30 FPS with `FRAME_SAMPLE_FPS=5` unless the caller provides another value. It enables external LeRobot stats from `${DATA_ROOT_DIR}/stats`. The loaded YAML uses a 36D state/action head, `action_mode: delta`, `eef_frame: head_camera`, a 0.5 probability of choosing a wrist EEF frame during training, and image offsets `[-15, 0, 15]`.
+
+These are facts about the actual MoraVLA training recipe, superseding the earlier assumption that its current default recipe directly emitted 96D actions. MoraVLA still contains 96D layout implementations elsewhere, but they are not the launch contract used for this comparison. OpenWAM cannot directly consume either the verified 36D head-camera delta contract or the separate 96D layouts because its foundation checkpoint expects normalized 80D unified actions. The adaptation therefore borrows field selection, coordinate-frame handling, temporal sampling, delta construction order, and external-stats validation as reference behavior while retaining the approved OpenWAM absolute EEF20-to-80D model contract.
 
 ## Representation Contract
 
@@ -62,9 +75,9 @@ All other unified dimensions are zero with `False` action/proprio masks. The mod
 
 ### Why MoraVLA deltas are not copied
 
-MoraVLA's default pretraining recipe converts world EEF poses into head/wrist/local deltas and composes a 96D action vector. The downloaded OpenWAM-α foundation checkpoint instead has an 80D action/state head and the existing OpenWAM data path normalizes EEF before scattering it into that head. Using MoraVLA's 96D values directly would load valid numbers into the wrong model semantics.
+MoraVLA's verified `qwena1_nogen` recipe converts EEF poses into head-camera deltas and feeds a 36D action/state head; training may randomly use wrist-frame EEF with probability 0.5. The downloaded OpenWAM-α foundation checkpoint instead has an 80D action/state head and the existing OpenWAM data path normalizes absolute EEF before scattering it into that head. Feeding the 36D delta values directly would load valid numbers into the wrong shape and semantics.
 
-The comparison documentation will show this boundary explicitly. The new reader can expose raw calibration fields for inspection, but it will not introduce a second 96D model path.
+The comparison documentation will show this boundary explicitly, including the 36D launch recipe and the distinct 96D layouts found elsewhere in MoraVLA. The new reader can expose raw calibration fields for inspection, but it will not introduce a second MoraVLA model path.
 
 ## Data Flow
 
@@ -186,7 +199,7 @@ Small representative PNG/JSON examples will be kept under `assets/openwam_alpha_
 
 - every YAML field;
 - exact stats, training, open-loop, and visualization commands;
-- absolute EEF20 versus MoraVLA local/head/wrist delta semantics;
+- absolute EEF20 versus the verified MoraVLA 36D head/wrist-frame delta semantics;
 - normalized versus physical-unit predictions; and
 - how to add another compatible dataset profile.
 
@@ -256,7 +269,7 @@ The current environment probe found an H20-3e with approximately 144 GB memory, 
 - Closed-loop RoboTwin/RoboDojo simulator evaluation.
 - Success-rate or model-quality claims from the smoke run.
 - Replacing existing HDF5 readers.
-- Adding the MoraVLA model, Qwen processor, 96D action head, or VLA losses to OpenWAM.
+- Adding the MoraVLA model, Qwen processor, 36D/96D action heads, or VLA losses to OpenWAM.
 - Modifying any supplied dataset in place.
 
 ## Deliverables

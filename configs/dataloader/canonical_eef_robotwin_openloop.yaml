@@ -1,0 +1,23 @@
+type: canonical_eef_lerobot
+dataset_id: robotwin_blocks_ranking_openloop
+dataset_dir: /mnt/data/cpfs/b5/post_train_data/robotwin_traj_fullfield/blocks_ranking_size/demo_clean
+video_root: /mnt/data/cpfs/b5/post_train_data/robotwin_traj/blocks_ranking_size/demo_clean
+normalization_stats_path: /mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_alpha_data_examples/stats/robotwin_blocks_ranking.npy
+state_key: observation.states.eef
+action_key: actions.eef
+head_camera: observation.images.cam_high
+left_wrist_camera: observation.images.cam_left_wrist
+right_wrist_camera: observation.images.cam_right_wrist
+num_frames: 33
+video_stride: 4
+window_stride: 1
+height: 384
+width: 320
+multiview: true
+normalize_mode: quantile
+unify_action: true
+unify_action_map: ["0-9", "34-43"]
+episode_indices: [0, 1]
+max_episodes: 2
+max_windows: 8
+return_trace: true
