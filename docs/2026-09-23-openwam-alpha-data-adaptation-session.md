@@ -224,3 +224,5 @@
 
 - 用户选择选项 2：创建功能分支、提交、推送并创建 Pull Request。
 - 远端为 `https://github.com/OpenWAM-Official/OpenWAM.git`；当前环境未安装 `gh` CLI。将先创建功能分支并精确暂存本任务文件（包括被 `.gitignore` 忽略、但属于交付要求的四套样例与 stats），明确排除三个用户文件和运行期 `outputs/`，再尝试通过现有 Git 凭据推送。PR 创建将依据推送结果和可用认证能力继续。
+- 已创建分支 `feat/openwam-alpha-v01-data-adaptation`。首次 cached diff 检查发现 5 个新文件有多余 EOF 空行，提交被检查阻止；删除多余空行、重新暂存后 `git diff --cached --check` 通过。
+- 已创建功能提交 `c243611`（`feat: add OpenWAM alpha EEF data pipeline`），包含 39 个任务文件、四套样例及 bounded stats；未包含 `outputs/`、checkpoint 或三个用户文件。
