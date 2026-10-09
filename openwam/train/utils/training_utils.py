@@ -121,30 +121,22 @@ def reduce_step_metrics(accelerator, losses: dict, grad_norm) -> dict:
     def _f(v):
         return v.item() if isinstance(v, torch.Tensor) else float(v)
 
-    if accelerator is not None and accelerator.num_processes > 1:
-        local = torch.tensor(
-            [
-                loss.detach().float().item(),
-                _f(losses["video"]),
-                _f(losses["action"]),
-                grad_norm.item(),
-            ],
-            device=loss.device,
-            dtype=torch.float32,
-        ).reshape(1, -1)
-        g = accelerator.gather(local).mean(dim=0)
-        return {
-            "loss_total": g[0].item(),
-            "loss_video": g[1].item(),
-            "loss_action": g[2].item(),
-            "grad_norm": g[3].item(),
-        }
-    return {
-        "loss_total": loss.detach().item(),
+    metrics = {
+        "loss_total": loss.detach().float().item(),
         "loss_video": _f(losses["video"]),
         "loss_action": _f(losses["action"]),
         "grad_norm": grad_norm.item(),
     }
+    for key in ("fk_position", "fk_rotation"):
+        if key in losses:
+            metrics["loss_"+key] = _f(losses[key])
+    if "fk_valid_count" in losses:
+        metrics["fk_valid_count"] = _f(losses["fk_valid_count"])
+    if accelerator is not None and accelerator.num_processes > 1:
+        local = torch.tensor(list(metrics.values()), device=loss.device, dtype=torch.float32).reshape(1, -1)
+        reduced = accelerator.gather(local).mean(dim=0)
+        metrics = {key: reduced[i].item() for i, key in enumerate(metrics)}
+    return metrics
 
 
 def write_debug_loss_row(

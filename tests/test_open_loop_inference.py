@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from omegaconf import OmegaConf
 from PIL import Image
@@ -53,6 +54,10 @@ class _Dataset:
                 "dataset_id": "fake",
                 "episode_index": 0,
                 "window_offset": 0,
+                "action_target_source": "next_state",
+                "action_target_state_key": "observation.states.eef",
+                "action_target_offset": 1,
+                "action_target_frame_indices": list(range(1, 33)),
                 "raw_action_eef20": np.ones((32, 20), dtype=np.float32),
                 "normalized_action_eef20": np.zeros((32, 20), dtype=np.float32),
                 "stats_path": "/stats/fake.npy",
@@ -110,6 +115,9 @@ def test_run_open_loop_forwards_model_contract_and_saves_outputs(tmp_path: Path,
     assert arrays["prediction_physical_eef20"].shape == (32, 20)
     assert arrays["gt_physical_eef20"].shape == (32, 20)
     assert manifest["checkpoint_dir"] == str(checkpoint.resolve())
+    assert manifest["action_target_source"] == "next_state"
+    assert manifest["action_target_offset"] == 1
+    assert manifest["action_target_frame_indices"] == list(range(1, 33))
     assert json.loads((tmp_path / "out" / "manifest.json").read_text())["denoise_steps"] == 2
 
 
@@ -139,3 +147,27 @@ def test_run_open_loop_rejects_nonfinite_prediction(tmp_path: Path, monkeypatch)
         assert "non-finite" in str(exc)
     else:
         raise AssertionError("non-finite predictions must fail")
+
+
+@pytest.mark.parametrize("width", [94, 112])
+def test_open_loop_accepts_extended_dimensions_and_preserves_full_predictions(tmp_path, monkeypatch, width):
+    profile = tmp_path / "profile.yaml"
+    OmegaConf.save(OmegaConf.create({"type": "canonical_eef_lerobot"}), profile)
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    ds = _Dataset()
+    for key in ("action", "action_mask", "proprio", "proprio_mask"):
+        ds.sample[key] = torch.nn.functional.pad(ds.sample[key], (0, width - 80))
+    architecture = _Architecture()
+    architecture.action_dim = width
+    ds.denormalize_head = lambda values, **kwargs: values.copy()
+    architecture.generate = lambda **kwargs: {"actions": np.zeros((32, width), np.float32)}
+    monkeypatch.setattr(open_loop, "build_dataset", lambda config, split: ds)
+    manifest = open_loop.run_open_loop(profile, checkpoint, tmp_path / "out",
+                                      model_loader=lambda *a, **k: (None, architecture))
+    assert manifest["prediction_shape"] == [32, width]
+    assert np.load(tmp_path / "out/prediction.npz")[f"prediction_normalized{width}"].shape == (32, width)
+    architecture.action_dim = 80
+    with pytest.raises(ValueError, match=f"checkpoint action_dim=80, reader width={width}"):
+        open_loop.run_open_loop(profile, checkpoint, tmp_path / "bad",
+                               model_loader=lambda *a, **k: (None, architecture))

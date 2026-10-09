@@ -16,7 +16,6 @@ from openwam.dataloader.canonical_eef_lerobot import canonical_schema_fingerprin
 from openwam.dataloader.utils.lerobotv3 import compute_file_local_offsets, load_episodes_parquet, parse_info_json
 from openwam.dataloader.utils.normalization import ROT6D_DIMS_EEF20, pin_rot6d_identity
 
-
 DEFAULT_STATE_KEY = "observation.states.eef"
 DEFAULT_ACTION_KEY = "actions.eef"
 DEFAULT_CAMERAS = (
@@ -73,7 +72,11 @@ def prepare_stats(
     camera_keys: tuple[str, str, str] = DEFAULT_CAMERAS,
     seed: int = 42,
 ) -> dict:
-    """Scan only ``episode_indices`` and write reader-compatible stats."""
+    """Write next-state target stats from only the selected episodes.
+
+    Action population is ``state[1:]`` separately within each episode. The
+    precomputed ``action_key`` is retained as provenance only, never read.
+    """
 
     bucket = Path(bucket).expanduser().resolve()
     output = Path(output).expanduser().resolve()
@@ -89,11 +92,11 @@ def prepare_stats(
 
     info = parse_info_json(bucket)
     features = info.get("features", {})
-    required = (state_key, action_key, *camera_keys)
+    required = (state_key, *camera_keys)
     missing_fields = [key for key in required if key not in features]
     if missing_fields:
         raise ValueError(f"missing canonical EEF schema fields in {bucket}/meta/info.json: {missing_fields}")
-    for key in (state_key, action_key):
+    for key in (state_key,):
         if list(features[key].get("shape", [])) != [20]:
             raise ValueError(f"{key} must declare shape [20], got {features[key].get('shape')}")
 
@@ -113,9 +116,11 @@ def prepare_stats(
             chunk_index=int(episode["data/chunk_index"]),
             file_index=int(episode["data/file_index"]),
         )
-        table = _read_table(path, ["episode_index", state_key, action_key])
+        table = _read_table(path, ["episode_index", state_key])
         start = int(episode["_row_offset"])
         length = int(episode["length"])
+        if length < 2:
+            raise ValueError(f"episode {int(episode['episode_index'])} needs at least two states for next-state targets")
         frame = table.slice(start, length).to_pandas()
         physical = set(int(value) for value in frame["episode_index"].tolist())
         expected_episode = int(episode["episode_index"])
@@ -124,8 +129,9 @@ def prepare_stats(
                 f"{path} row range [{start}:{start + length}] contains episode_index={sorted(physical)}, "
                 f"expected only {expected_episode}"
             )
-        action_parts.append(_validate_eef(np.stack(frame[action_key].to_list()), field=action_key, path=path))
-        state_parts.append(_validate_eef(np.stack(frame[state_key].to_list()), field=state_key, path=path))
+        episode_states = _validate_eef(np.stack(frame[state_key].to_list()), field=state_key, path=path)
+        action_parts.append(episode_states[1:])
+        state_parts.append(episode_states)
 
     actions = np.concatenate(action_parts, axis=0)
     states = np.concatenate(state_parts, axis=0)
@@ -139,6 +145,8 @@ def prepare_stats(
             "episode_indices": selected_ids,
             "state_width": 20,
             "action_width": 20,
+            "action_target_source": "next_state",
+            "action_target_offset": 1,
             "state_rows": int(states.shape[0]),
             "action_rows": int(actions.shape[0]),
             "seed": int(seed),
@@ -164,7 +172,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--episode-index", type=int, action="append", dest="episode_indices", required=True)
     parser.add_argument("--state-key", default=DEFAULT_STATE_KEY)
-    parser.add_argument("--action-key", default=DEFAULT_ACTION_KEY)
+    parser.add_argument("--action-key", default=DEFAULT_ACTION_KEY, help="Legacy source-action name for provenance only")
     parser.add_argument("--head-camera", default=DEFAULT_CAMERAS[0])
     parser.add_argument("--left-wrist-camera", default=DEFAULT_CAMERAS[1])
     parser.add_argument("--right-wrist-camera", default=DEFAULT_CAMERAS[2])

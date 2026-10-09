@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -11,8 +10,7 @@ import pyarrow.parquet as pq
 import pytest
 from PIL import Image
 
-from openwam.dataloader.canonical_eef_lerobot import CanonicalEEFLerobotDataset
-
+from openwam.dataloader.canonical_eef_lerobot import CanonicalEEFLerobotDataset, canonical_schema_fingerprint
 
 CAMS = (
     "observation.images.cam_high",
@@ -38,9 +36,7 @@ def _eef20(t: float) -> np.ndarray:
 
 
 def _schema_fingerprint(features: dict, state_key: str = STATE_KEY, action_key: str = ACTION_KEY) -> str:
-    selected = {key: features[key] for key in (state_key, action_key, *CAMS)}
-    encoded = json.dumps(selected, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
+    return canonical_schema_fingerprint(features, state_key=state_key, action_key=action_key, camera_keys=CAMS)
 
 
 def _stats_block(offset: float = 0.0) -> dict:
@@ -96,7 +92,8 @@ def make_bucket(root: Path, *, include_eef: bool = True) -> tuple[Path, Path]:
             }
             if include_eef:
                 row[STATE_KEY] = _eef20(float(frame_index))
-                row[ACTION_KEY] = _eef20(float(frame_index + 1))
+                # Deliberately encode +3: the reader must build +1 from states.
+                row[ACTION_KEY] = _eef20(float(min(frame_index + 3, 39)))
             rows.append(row)
     pq.write_table(pa.Table.from_pandas(pd.DataFrame(rows)), bucket / "data" / "chunk-000" / "file-000.parquet")
 
@@ -133,6 +130,8 @@ def make_bucket(root: Path, *, include_eef: bool = True) -> tuple[Path, Path]:
                     "episode_indices": [0, 1],
                     "state_width": 20,
                     "action_width": 20,
+                    "action_target_source": "next_state",
+                    "action_target_offset": 1,
                     "schema_fingerprint": _schema_fingerprint(features),
                 },
             },
@@ -150,12 +149,13 @@ def patch_video_decode(monkeypatch):
 
 
 def _dataset(bucket: Path, stats: Path, **kwargs) -> CanonicalEEFLerobotDataset:
+    max_windows = kwargs.pop("max_windows", 8)
     return CanonicalEEFLerobotDataset(
         str(bucket),
         normalization_stats_path=str(stats),
         episode_indices=[0, 1],
         max_episodes=2,
-        max_windows=8,
+        max_windows=max_windows,
         num_frames=33,
         video_stride=4,
         multiview=True,
@@ -205,7 +205,7 @@ def test_trace_and_gather_round_trip(tmp_path: Path):
 
 def test_missing_eef_fails_before_sampling(tmp_path: Path):
     bucket, stats = make_bucket(tmp_path, include_eef=False)
-    with pytest.raises(ValueError, match=r"observation\.states\.eef.*actions\.eef"):
+    with pytest.raises(ValueError, match=r"observation\.states\.eef"):
         _dataset(bucket, stats)
 
 
@@ -222,13 +222,62 @@ def test_nonfinite_eef_fails_without_retrying_another_window(tmp_path: Path):
     bucket, stats = make_bucket(tmp_path)
     table_path = bucket / "data" / "chunk-000" / "file-000.parquet"
     frame = pq.read_table(table_path).to_pandas()
-    bad = np.asarray(frame.at[0, ACTION_KEY]).copy()
+    bad = np.asarray(frame.at[1, STATE_KEY]).copy()
     bad[0] = np.nan
-    frame.at[0, ACTION_KEY] = bad
+    frame.at[1, STATE_KEY] = bad
     pq.write_table(pa.Table.from_pandas(frame), table_path)
     ds = _dataset(bucket, stats)
     with pytest.raises(ValueError, match="non-finite"):
         ds[0]
+
+
+def test_targets_use_next_states_instead_of_source_actions(tmp_path: Path):
+    bucket, stats = make_bucket(tmp_path)
+    ds = _dataset(bucket, stats, return_trace=True)
+    sample = ds[7]
+    expected = np.stack([_eef20(float(t)) for t in range(8, 40)])
+    np.testing.assert_array_equal(sample["trace"]["raw_action_eef20"], expected)
+    np.testing.assert_array_equal(sample["trace"]["raw_proprio_eef20"], [_eef20(7.0)])
+    assert sample["trace"]["action_target_frame_indices"] == list(range(8, 40))
+    assert sample["trace"]["action_target_source"] == "next_state"
+    assert sample["trace"]["action_target_state_key"] == STATE_KEY
+    assert sample["trace"]["action_target_offset"] == 1
+
+
+def test_last_sample_has_one_target_and_does_not_cross_episode(tmp_path: Path):
+    bucket, stats = make_bucket(tmp_path)
+    ds = _dataset(bucket, stats, max_windows=None, return_trace=True)
+    assert len(ds) == 78  # 39 usable starts in each selected 40-row episode.
+    sample = ds[38]
+    np.testing.assert_array_equal(sample["trace"]["raw_action_eef20"][0], _eef20(39.0))
+    assert sample["action_mask"].any(dim=1).tolist() == [True] + [False] * 31
+    assert not sample["action"][1:].any()
+    assert sample["trace"]["action_target_frame_indices"] == [39] + [None] * 31
+    next_episode = ds[39]
+    assert next_episode["trace"]["episode_index"] == 1
+    np.testing.assert_array_equal(next_episode["trace"]["raw_action_eef20"][0], _eef20(1.0))
+
+
+def test_next_state_targets_do_not_require_source_action_column(tmp_path: Path):
+    bucket, stats = make_bucket(tmp_path)
+    info_path = bucket / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    del info["features"][ACTION_KEY]
+    info_path.write_text(json.dumps(info))
+    data_path = bucket / "data/chunk-000/file-000.parquet"
+    pq.write_table(pq.read_table(data_path).drop([ACTION_KEY]), data_path)
+    sample = _dataset(bucket, stats, return_trace=True)[0]
+    np.testing.assert_array_equal(sample["trace"]["raw_action_eef20"][0], _eef20(1.0))
+
+
+def test_legacy_action_stats_are_rejected_with_regeneration_hint(tmp_path: Path):
+    bucket, stats = make_bucket(tmp_path)
+    payload = np.load(stats, allow_pickle=True).item()
+    payload["metadata"].pop("action_target_source")
+    payload["metadata"].pop("action_target_offset")
+    np.save(stats, payload, allow_pickle=True)
+    with pytest.raises(ValueError, match="prepare_openwam_eef_smoke"):
+        _dataset(bucket, stats)
 
 
 def test_separate_video_root_resolves_companion_metadata_layout(tmp_path: Path, monkeypatch):

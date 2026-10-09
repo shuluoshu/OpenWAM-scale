@@ -4,24 +4,17 @@
   "dataset_dir": "/mnt/data/cpfs/b5big/pretrain_data_release/pretrain_datasetsV0_1/agibotworld/task_512/a2d_gripper__dual_gripper__base__unmodified",
   "dataset_id": "agibotworld_a2d_smoke",
   "episode_index": 0,
-  "window_offset": 0,
-  "sample_index": 0,
+  "window_offset": 7,
+  "sample_index": 7,
   "prompt": "Wipe the whiteboard",
   "pipeline": [
     "parquet",
-    "absolute EEF20",
+    "next-state head-reference EE18 + TCP-local EEF20 + joint14 (t+1)",
     "source normalization",
-    "scatter OpenWAM80",
+    "scatter OpenWAM112",
     "model forward"
   ],
   "raw_frame_indices": [
-    0,
-    1,
-    2,
-    3,
-    4,
-    5,
-    6,
     7,
     8,
     9,
@@ -47,18 +40,62 @@
     29,
     30,
     31,
-    32
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39
   ],
   "video_frame_indices": [
-    0,
-    4,
+    7,
+    11,
+    15,
+    19,
+    23,
+    27,
+    31,
+    35,
+    39
+  ],
+  "action_target_source": "next_state",
+  "action_target_state_key": "observation.states.eef",
+  "action_target_offset": 1,
+  "action_target_frame_indices": [
     8,
+    9,
+    10,
+    11,
     12,
+    13,
+    14,
+    15,
     16,
+    17,
+    18,
+    19,
     20,
+    21,
+    22,
+    23,
     24,
+    25,
+    26,
+    27,
     28,
-    32
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39
   ],
   "shapes": {
     "video": [
@@ -69,90 +106,146 @@
     ],
     "action": [
       32,
-      80
+      112
     ],
     "action_mask": [
       32,
-      80
+      112
     ],
     "proprio": [
       1,
-      80
+      112
     ],
     "proprio_mask": [
       1,
-      80
+      112
     ]
   },
   "active_action_indices": [
-    0,
-    1,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7,
-    8,
     9,
-    34,
-    35,
-    36,
-    37,
-    38,
-    39,
-    40,
-    41,
-    42,
-    43
+    43,
+    80,
+    81,
+    82,
+    83,
+    84,
+    85,
+    86,
+    87,
+    88,
+    89,
+    90,
+    91,
+    92,
+    93
   ],
-  "stats_path": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_alpha_data_examples/stats/agibotworld_a2d.npy",
+  "stats_path": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_alpha_data_examples/stats/agibotworld_a2d_relative112.npy",
   "stats_metadata": {
-    "dataset_dir": "/mnt/data/cpfs/b5big/pretrain_data_release/pretrain_datasetsV0_1/agibotworld/task_512/a2d_gripper__dual_gripper__base__unmodified",
+    "representation": "head_tcp_relative_joint112",
+    "action_target_source": "next_state",
+    "action_target_offset": 1,
+    "anchor": "window_start",
     "state_key": "observation.states.eef",
-    "action_key": "actions.eef",
+    "joint_state_key": "observation.states.joint",
+    "tcp_pose_keys": {},
+    "tcp_from_eef": {},
+    "joint_indices": {
+      "left": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "right": [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14
+      ]
+    },
+    "raw_width": 52,
+    "unified_width": 112,
+    "joint_target": "relative",
+    "missing_tcp": "mask_pose",
+    "gripper_target": "absolute",
+    "head_world_to_camera_key": "observation.states.camera.world_to_camera",
+    "head_camera_available": true,
+    "head_pose_source": "declared_tcp",
+    "head_endpoint": "same_tcp_as_local",
+    "tcp_reference_to_world_key": null,
+    "tcp_reference_frame": "world",
+    "head_target": "reference_relative_in_current_head_camera",
+    "tcp_target": "local_relative_in_current_tcp",
+    "missing_head": "mask_head_pose",
+    "schema_fingerprint": "eb75394438b500f3d7074d9e2ce37c0f81c01e0f3be4fe4ac9798351fb70a690",
+    "dataset_dir": "/mnt/data/cpfs/b5big/pretrain_data_release/pretrain_datasetsV0_1/agibotworld/task_512/a2d_gripper__dual_gripper__base__unmodified",
     "episode_indices": [
       0,
       1
     ],
-    "state_width": 20,
-    "action_width": 20,
-    "state_rows": 6016,
-    "action_rows": 6016,
-    "seed": 42,
-    "schema_fingerprint": "b2ac7ec3c3edb4c13cc430bd83373505563977a2bf61359e1c754fc09a2408ee",
-    "generated_at_utc": "2026-09-23T12:07:30.044167+00:00"
+    "num_frames": 33,
+    "window_stride": 1,
+    "split": "train",
+    "action_rows": 191456,
+    "state_rows": 6014,
+    "population": "all window anchors and their valid future rows; ignores max_windows"
   },
   "summaries": {
     "raw_action_eef20": {
-      "min": -0.9545595645904541,
+      "min": 0.0,
       "max": 1.0,
-      "mean": 0.2914389371871948
+      "mean": 0.09988033771514893
     },
     "normalized_action_eef20": {
       "min": -1.0,
       "max": 1.0,
-      "mean": -0.06194397807121277
+      "mean": 0.0
     },
-    "unified_action80": {
+    "unified_action112": {
       "min": -1.0,
       "max": 1.0,
-      "mean": -0.015485994517803192
+      "mean": 0.007515486795455217
     },
     "raw_proprio_eef20": {
-      "min": -0.954541027545929,
+      "min": 0.0,
       "max": 1.0,
-      "mean": 0.2914412319660187
+      "mean": 0.09988033771514893
     },
     "normalized_proprio_eef20": {
       "min": -1.0,
       "max": 1.0,
-      "mean": -0.06192447990179062
+      "mean": 0.0
     },
-    "unified_proprio80": {
+    "unified_proprio112": {
       "min": -1.0,
       "max": 1.0,
-      "mean": -0.015481117181479931
+      "mean": 0.007864544168114662
+    },
+    "raw_action_joint14": {
+      "min": -5.245208740234375e-05,
+      "max": 5.2362680435180664e-05,
+      "mean": -7.766565346400967e-08
+    },
+    "raw_proprio_joint14": {
+      "min": -1.4944703578948975,
+      "max": 1.436152458190918,
+      "mean": -0.001415930688381195
+    },
+    "raw_action_head18": {
+      "min": 0.0,
+      "max": 0.0,
+      "mean": 0.0
+    },
+    "raw_proprio_head18": {
+      "min": 0.0,
+      "max": 0.0,
+      "mean": 0.0
     }
   },
   "files": {

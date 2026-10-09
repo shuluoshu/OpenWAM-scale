@@ -132,6 +132,7 @@ class LeRobotV3Reader(BaseDataset):
 
     # --- subclass-overridable class attributes ---
     DATASET_NAME: ClassVar[str] = "LeRobotV3"
+    UNIFIED_ACTION_DIM: ClassVar[int] = UNIFY_DIM
     NEEDED_COLS: ClassVar[Tuple[str, ...]] = ()
     HEAD_CAMERA: ClassVar[Optional[str]] = None
     LEFT_WRIST_CAMERA: ClassVar[Optional[str]] = None
@@ -196,8 +197,8 @@ class LeRobotV3Reader(BaseDataset):
         # ACTION_DIM-wide action/proprio into a UNIFY_DIM-wide vector and marks
         # only the mapped dims valid. unify_action_map is the yaml spec (see
         # openwam.dataloader.utils.unify_action); None + unify_action=True maps
-        # the raw dims in order (0..raw_dim-1). The unified width is the global
-        # UNIFY_DIM constant (not per-dataset configurable).
+        # the raw dims in order (0..raw_dim-1). The unified width defaults to UNIFY_DIM; specialized
+        # readers override UNIFIED_ACTION_DIM as a class-level contract.
         unify_action: bool = False,
         unify_action_map: Optional[Any] = None,
         unify_state_map: Optional[Any] = None,
@@ -254,7 +255,7 @@ class LeRobotV3Reader(BaseDataset):
         # unify. Defaults to the class ACTION_DIM, so existing readers are unchanged.
         self._raw_action_dim = int(self.ACTION_DIM)
         self._unify = bool(unify_action)
-        self._unify_dim = int(UNIFY_DIM)
+        self._unify_dim = int(self.UNIFIED_ACTION_DIM)
         self._unify_dst_index: Optional[np.ndarray] = None
         self._unify_state_dst_index: Optional[np.ndarray] = None
         if self._unify:

@@ -8,12 +8,14 @@
 body{font:15px/1.65 system-ui;margin:0;background:#0b1220;color:#e5e7eb}main{max-width:1180px;margin:auto;padding:32px}h1,h2{color:#f8fafc}.card{background:#172033;border:1px solid #334155;border-radius:12px;padding:18px;margin:18px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}table{width:100%;border-collapse:collapse}th,td{padding:10px;border:1px solid #475569;vertical-align:top}th{background:#25324a}code{color:#7dd3fc}img{width:100%;border-radius:8px}a{color:#7dd3fc}.flow{font-family:ui-monospace,monospace;background:#070c16;padding:14px;border-radius:8px;white-space:pre-wrap}.ok{color:#86efac}.warn{color:#fdba74}@media(max-width:800px){.grid{grid-template-columns:1fr}}
 </style>
 </head>
-<body><main>
+<body>
+<section class="card"><h2>2026-10-07 更新：当前 Mora reader 已为双参考系 relative112</h2><p>以下保留旧 80D / 36D 链路对照作为历史记录。当前 canonical profiles 同时预测同一 TCP 的头相机 relative pose 与 TCP-local relative pose，并保留 joint14，输出 112D，首目标为 state[t+1]；无已声明 TCP 时两套 pose 均屏蔽，无头相机/标定时只屏蔽头相机 pose。最新配置、统计和使用方法见 <a href="../assets/openwam_usage_docs/openwam-alpha-data-adaptation.md">relative112 使用说明</a>。原 80D foundation 需要显式扩维并按新表示训练。</p></section>
+<main>
 <h1>MoraVLA pretrain vs OpenWAM-α：已验证的数据处理链</h1>
 <p>本页是在原始 <code>pretrain_vs_openwam_comparison.html</code> 基础上针对本次实现整理的离线报告；原文件未被覆盖。</p>
 
 <section class="card"><h2>先说结论</h2>
-<p>MoraVLA 的实际启动入口是 <code>launch/qwena1_nogen/pretrain.sh</code>，加载 <code>launch/qwena1_nogen/train_files/pretrain.yaml</code>。它的当前训练 contract 是 <b>36D</b>、<code>action_mode: delta</code>、<code>eef_frame: head_camera</code>，训练时以 0.5 概率切到 wrist frame；脚本默认覆盖为 <code>FRAME_SAMPLE_FPS=5</code> 并从 <code>${DATA_ROOT_DIR}/stats</code> 读取 external stats。</p>
+<p>2026-09-23 对照的历史入口是 <code>launch/qwena1_nogen/pretrain.sh</code>，加载 <code>launch/qwena1_nogen/train_files/pretrain.yaml</code>。该 recipe 使用 <b>36D</b>、<code>action_mode: delta</code>、<code>eef_frame: head_camera</code>，训练时以 0.5 概率切到 wrist frame；脚本默认覆盖为 <code>FRAME_SAMPLE_FPS=5</code> 并从 <code>${DATA_ROOT_DIR}/stats</code> 读取 external stats。当前 MoraVLA 主入口 <code>launch/moravla/pretrain.sh</code> 使用 96D、50 步 chunk，不能与该历史 recipe 混为一谈。</p>
 <p>OpenWAM-α foundation checkpoint 是 <b>80D</b> action/state head。因此本实现复用 MoraVLA 已生成的 EEF 字段和显式 frame/stats 思路，但不直接复用其 36D delta；MoraVLA 代码库其他位置存在的 <b>96D</b> layout 也不是此启动脚本的输出，更不能直接送进 OpenWAM。</p></section>
 
 <div class="grid">
@@ -25,7 +27,8 @@ body{font:15px/1.65 system-ui;margin:0;background:#0b1220;color:#e5e7eb}main{max
 → 36D state/action layout
 → Qwen3-VL + action expert forward</div></section>
 <section class="card"><h2>本次 OpenWAM-α 适配</h2><div class="flow">LeRobot row: absolute EEF20
-→ 33 raw steps
+→ 33 raw state steps
+→ proprio = state[t]; action[k] = state[t+k+1] (ignore source actions.eef)
 → source-specific quantile normalization
 → left 0:10 → OpenWAM 0:10
 → right 10:20 → OpenWAM 34:44
@@ -37,7 +40,7 @@ body{font:15px/1.65 system-ui;margin:0;background:#0b1220;color:#e5e7eb}main{max
 <section class="card"><h2>逐项对比</h2><table>
 <tr><th>项目</th><th>MoraVLA 实际启动配置</th><th>OpenWAM-α 本实现</th></tr>
 <tr><td>入口</td><td><code>qwena1_nogen/pretrain.sh</code></td><td><code>scripts/train.py --config-name openwam_alpha_v0_1_smoke</code></td></tr>
-<tr><td>动作语义</td><td>head/wrist-frame delta</td><td>absolute EEF20，先按源归一化</td></tr>
+<tr><td>动作语义</td><td>head/wrist-frame delta</td><td>absolute EEF20：由下一帧 state 构造 action，再归一化（2026-10-07 更新）</td></tr>
 <tr><td>模型宽度</td><td>36D；另有代码路径定义 96D</td><td>80D unified head</td></tr>
 <tr><td>时间采样</td><td>offset [-15,0,15]，启动 FPS 5</td><td>33 steps，视频 stride 4 得九帧</td></tr>
 <tr><td>统计量</td><td>external stats root</td><td>只对 profile 的 episode 0/1 生成并校验 provenance</td></tr>

@@ -285,7 +285,13 @@ def build_architecture_from_ckpt_dir(ckpt_dir: str, *, weights_required: bool, o
         # Plain print so the warm-start is visible on the launch terminal even
         # when logger output is drowned out; non-main ranks have print disabled.
         print(f"[{tag}] loading pretrained weights: {weights}", flush=True)
-        architecture.load_checkpoint(weights)
+        expand_action_dim = override_cfg is not None and OmegaConf.select(
+            override_cfg, "training.expand_action_dim_from_checkpoint", default=False
+        )
+        if expand_action_dim:
+            architecture.load_checkpoint(weights, expand_action_dim_from_checkpoint=True)
+        else:
+            architecture.load_checkpoint(weights)
         print(f"[{tag}] pretrained weights loaded OK", flush=True)
     return resolved_arch, architecture, ckpt_cfg
 

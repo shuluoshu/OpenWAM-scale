@@ -84,6 +84,10 @@ def run_open_loop(
         raise ValueError("open-loop profile must produce trace metadata")
 
     _checkpoint_cfg, architecture = model_loader(str(checkpoint_dir), device=device)
+    width = int(sample["action"].shape[-1])
+    model_width = getattr(architecture, "action_dim", width)
+    if model_width != width:
+        raise ValueError(f"checkpoint action_dim={model_width}, reader width={width}; use a checkpoint trained with this representation")
     shift_action = float(getattr(getattr(architecture, "action_backbone", None), "shift_action", 5.0))
     shift_video = float(getattr(getattr(architecture, "video_backbone", None), "shift_video", shift_action))
     schedule = _make_sync_schedule(architecture, int(denoise_steps), shift_action, shift_video)
@@ -115,28 +119,35 @@ def run_open_loop(
     )
     elapsed = time.perf_counter() - started
 
-    prediction80 = _numpy(result["actions"]).astype(np.float32)
-    if prediction80.shape != (32, 80):
-        raise ValueError(f"model prediction must have shape (32, 80), got {prediction80.shape}")
-    if not np.isfinite(prediction80).all():
+    prediction_unified = _numpy(result["actions"]).astype(np.float32)
+    if prediction_unified.shape != tuple(sample["action"].shape):
+        raise ValueError(f"model prediction must match reader shape {tuple(sample['action'].shape)}, got {prediction_unified.shape}")
+    if not np.isfinite(prediction_unified).all():
         raise ValueError("model prediction contains non-finite values")
-    prediction20 = dataset.gather_unified_eef(prediction80).astype(np.float32)
+    prediction20 = dataset.gather_unified_eef(prediction_unified).astype(np.float32)
     prediction_physical = dataset.denormalize_eef(prediction20, stream="action")
 
-    gt80 = _numpy(sample["action"]).astype(np.float32)
-    gt20 = dataset.gather_unified_eef(gt80).astype(np.float32)
+    gt_unified = _numpy(sample["action"]).astype(np.float32)
+    gt20 = dataset.gather_unified_eef(gt_unified).astype(np.float32)
     gt_physical = dataset.denormalize_eef(gt20, stream="action")
     arrays = {
-        "prediction_normalized80": prediction80,
+        f"prediction_normalized{width}": prediction_unified,
         "prediction_normalized_eef20": prediction20,
         "prediction_physical_eef20": prediction_physical,
-        "gt_normalized80": gt80,
+        f"gt_normalized{width}": gt_unified,
         "gt_normalized_eef20": gt20,
         "gt_physical_eef20": gt_physical,
         "action_mask": _numpy(sample["action_mask"]).astype(bool),
-        "proprio_normalized80": _numpy(sample["proprio"]).astype(np.float32),
+        f"proprio_normalized{width}": _numpy(sample["proprio"]).astype(np.float32),
         "proprio_mask": _numpy(sample["proprio_mask"]).astype(bool),
     }
+    if width == 112:
+        head_mask = arrays["action_mask"][:, 94:112]
+        for prefix, values in (("prediction", prediction_unified), ("gt", gt_unified)):
+            arrays[f"{prefix}_normalized_head18"] = values[:, 94:112].copy()
+            physical = dataset.denormalize_head(values[:, 94:112], stream="action")
+            physical[~head_mask] = 0
+            arrays[f"{prefix}_physical_head18"] = physical
     for name, value in arrays.items():
         if value.dtype.kind == "f" and not np.isfinite(value).all():
             raise ValueError(f"{name} contains non-finite values")
@@ -149,12 +160,16 @@ def run_open_loop(
         "dataset_id": trace.get("dataset_id"),
         "episode_index": trace.get("episode_index"),
         "window_offset": trace.get("window_offset"),
+        "action_target_source": trace.get("action_target_source"),
+        "action_target_state_key": trace.get("action_target_state_key"),
+        "action_target_offset": trace.get("action_target_offset"),
+        "action_target_frame_indices": trace.get("action_target_frame_indices"),
         "sample_index": int(sample_index),
         "prompt": sample["prompt"],
         "seed": int(seed),
         "denoise_steps": int(denoise_steps),
         "elapsed_seconds": float(elapsed),
-        "prediction_shape": list(prediction80.shape),
+        "prediction_shape": list(prediction_unified.shape),
         "prediction_eef20_shape": list(prediction20.shape),
         "active_action_indices": active_action_mask.nonzero().flatten().tolist(),
         "stats_path": trace.get("stats_path"),

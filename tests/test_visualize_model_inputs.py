@@ -36,6 +36,10 @@ class _Dataset:
                 "window_offset": 3,
                 "raw_frame_indices": list(range(3, 36)),
                 "video_frame_indices": list(range(3, 36, 4)),
+                "action_target_source": "next_state",
+                "action_target_state_key": "observation.states.eef",
+                "action_target_offset": 1,
+                "action_target_frame_indices": list(range(4, 36)),
                 "raw_action_eef20": np.ones((32, 20), dtype=np.float32),
                 "normalized_action_eef20": np.zeros((32, 20), dtype=np.float32),
                 "unified_action80": np.zeros((32, 80), dtype=np.float32),
@@ -62,7 +66,12 @@ def test_render_profile_writes_forward_input_artifacts(tmp_path: Path, monkeypat
     assert json_path.is_file() and npz_path.is_file()
     manifest = json.loads(json_path.read_text(encoding="utf-8"))
     assert manifest["prompt"] == "Put the cup on the plate."
-    assert manifest["pipeline"] == ["parquet", "absolute EEF20", "source normalization", "scatter OpenWAM80", "model forward"]
+    assert manifest["pipeline"] == [
+        "parquet", "next-state absolute EEF20 (t+1)", "source normalization", "scatter OpenWAM80", "model forward"
+    ]
+    assert manifest["action_target_source"] == "next_state"
+    assert manifest["action_target_offset"] == 1
+    assert manifest["action_target_frame_indices"] == list(range(4, 36))
     assert manifest["shapes"]["action"] == [32, 80]
     assert manifest["active_action_indices"] == list(range(10)) + list(range(34, 44))
     arrays = np.load(npz_path)
@@ -98,3 +107,25 @@ def test_render_index_is_offline_and_links_existing_assets(tmp_path: Path):
     assert "demo_frames.png" in html
     assert "<svg" in html
     assert "http://" not in html and "https://" not in html
+
+
+def test_render_relative94_keeps_joint_arrays_and_labels(tmp_path, monkeypatch):
+    base = _Dataset()[0]
+    for key in ("action", "action_mask", "proprio", "proprio_mask"):
+        base[key] = torch.nn.functional.pad(base[key], (0, 14))
+    base["trace"]["raw_action_joint14"] = np.ones((32, 14), np.float32)
+    base["trace"]["raw_proprio_joint14"] = np.ones((1, 14), np.float32)
+    class Dataset:
+        def __len__(self):
+            return 1
+        def __getitem__(self, idx):
+            return base
+    profile = tmp_path / "profile.yaml"
+    OmegaConf.save(OmegaConf.create({"type": "canonical_eef_lerobot"}), profile)
+    monkeypatch.setattr(visualize, "build_dataset", lambda config, split: Dataset())
+    visualize.render_profile("relative", profile, tmp_path)
+    arrays = np.load(tmp_path / "relative.npz")
+    assert arrays["unified_action94"].shape == (32, 94)
+    assert arrays["raw_action_joint14"].shape == (32, 14)
+    manifest = json.loads((tmp_path / "relative.json").read_text())
+    assert "TCP-relative" in manifest["pipeline"][1]

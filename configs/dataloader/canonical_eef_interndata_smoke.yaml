@@ -1,9 +1,16 @@
 type: canonical_eef_lerobot
+action_representation: head_tcp_relative_joint112
+head_world_to_camera_key: observation.states.camera.world_to_camera
 dataset_id: interndata_genie1_smoke
 dataset_dir: /mnt/data/cpfs/b5big/pretrain_data_release/pretrain_datasetsV0_1/interndata_a1/pick_and_place_tasks/pick_and_place_part2/omniobject3d-lotus_root/genie1__parallel_gripper
-normalization_stats_path: /mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_alpha_data_examples/stats/interndata_genie1.npy
+normalization_stats_path: /mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_alpha_data_examples/stats/interndata_genie1_relative112.npy
 state_key: observation.states.eef
-action_key: actions.eef
+joint_state_key: observation.states.joint
+tcp_reference_to_world_key: states.robot_to_env_pose
+tcp_pose_keys:
+  left: states.left_tcp_to_robot_pose
+  right: states.right_tcp_to_robot_pose
+action_key: actions.eef  # provenance only; GT uses declared TCP/joint/gripper state columns at t+1
 head_camera: observation.images.cam_high
 left_wrist_camera: observation.images.cam_left_wrist
 right_wrist_camera: observation.images.cam_right_wrist
@@ -15,8 +22,44 @@ width: 320
 multiview: true
 normalize_mode: quantile
 unify_action: true
-unify_action_map: ["0-9", "34-43"]
+unify_action_map: ["0-9", "34-43", "80-93", "94-111"]
 episode_indices: [0, 1]
 max_episodes: 2
 max_windows: 8
 return_trace: false
+
+# FK auxiliary GT: native TCP in the matched URDF arm base; independent of head calibration.
+fk_supervision:
+  arms:
+    left:
+      urdf_path: /mnt/data/cpfs/b5big/pretrain_urdfs/interndata_a1/G1_120s/G1_120s.urdf
+      base_link: arm_base_link
+      target_link: arm_l_end_link
+      joint_names:
+      - idx21_arm_l_joint1
+      - idx22_arm_l_joint2
+      - idx23_arm_l_joint3
+      - idx24_arm_l_joint4
+      - idx25_arm_l_joint5
+      - idx26_arm_l_joint6
+      - idx27_arm_l_joint7
+      endpoint: tcp
+      endpoint_transform: [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0.22], [0, 0, 0, 1]]
+      gt_pose_key: states.left_tcp_to_left_armbase_pose
+      gt_frame: urdf_base
+    right:
+      urdf_path: /mnt/data/cpfs/b5big/pretrain_urdfs/interndata_a1/G1_120s/G1_120s.urdf
+      base_link: arm_base_link
+      target_link: arm_r_end_link
+      joint_names:
+      - idx61_arm_r_joint1
+      - idx62_arm_r_joint2
+      - idx63_arm_r_joint3
+      - idx64_arm_r_joint4
+      - idx65_arm_r_joint5
+      - idx66_arm_r_joint6
+      - idx67_arm_r_joint7
+      endpoint: tcp
+      endpoint_transform: [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0.22], [0, 0, 0, 1]]
+      gt_pose_key: states.right_tcp_to_right_armbase_pose
+      gt_frame: urdf_base

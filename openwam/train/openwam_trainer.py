@@ -156,6 +156,11 @@ class OpenWAMTrainer:
         # Loss weights from the training config
         self.lambda_video = float(t.lambda_video)
         self.lambda_action = float(t.lambda_action)
+        self.lambda_fk_position = float(cfg_get(t, "lambda_fk_position", 0.0))
+        self.lambda_fk_rotation = float(cfg_get(t, "lambda_fk_rotation", 0.0))
+        from openwam.model.fk_supervision import validate_fk_weights
+
+        validate_fk_weights(self.lambda_fk_position, self.lambda_fk_rotation, self.lambda_action)
 
         # Push forward-time training flags onto the architecture so prepare_inputs
         # is self-contained.
@@ -561,17 +566,27 @@ class OpenWAMTrainer:
         if self.lambda_action > 0 and inputs.get("actions") is None:
             raise ValueError("lambda_action > 0 but no action in data.")
 
+        auxiliary = {}
+        if getattr(self, "lambda_fk_position", 0) or getattr(self, "lambda_fk_rotation", 0):
+            auxiliary = dict(lambda_fk_position=self.lambda_fk_position, lambda_fk_rotation=self.lambda_fk_rotation)
         result = self.architecture.compute_loss(
             **inputs,
             lambda_video=self.lambda_video,
             lambda_action=self.lambda_action,
+            **auxiliary,
         )
 
-        return {
+        losses = {
             "total": result["loss"],
             "video": result.get("loss_video", torch.tensor(0.0)),
             "action": result.get("loss_action", torch.tensor(0.0)),
         }
+        for key in ("fk_position", "fk_rotation"):
+            if "loss_"+key in result:
+                losses[key] = result["loss_"+key]
+        if "fk_valid_count" in result:
+            losses["fk_valid_count"] = result["fk_valid_count"]
+        return losses
 
     # (10) Called each step in train()'s loop — progress bar, wandb log, debug loss-history CSV.
     def log_step(
@@ -591,6 +606,7 @@ class OpenWAMTrainer:
     ) -> None:
         """Update progress bar, log to wandb, and (debug) write the loss-history CSV row."""
         labels = [("action", "loss_action")]
+        labels.extend((name, "loss_"+name) for name in ("fk_position", "fk_rotation") if "loss_"+name in metrics)
         loss_total = metrics["loss_total"]
         loss_video = metrics["loss_video"]
         grad_norm = metrics["grad_norm"]
@@ -601,6 +617,8 @@ class OpenWAMTrainer:
                 postfix[name] = f"{metrics[key]:.4f}"
             postfix["lr"] = f"{lr:.2e}"
             postfix["epoch"] = epoch
+            if "fk_valid_count" in metrics:
+                postfix["fk_valid"] = metrics["fk_valid_count"]
             pbar.set_postfix(postfix)
             pbar.update(1)
 
@@ -616,6 +634,8 @@ class OpenWAMTrainer:
             }
             for name, key in labels:
                 log_dict[f"train/loss_{name}"] = metrics[key]
+            if "fk_valid_count" in metrics:
+                log_dict["train/fk_valid_count"] = metrics["fk_valid_count"]
             wandb_run.log(log_dict, step=global_step)
 
         if not debug:

@@ -676,8 +676,14 @@ class BaseWAMArchitecture(ABC, nn.Module):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         save_file(state_dict, path)
 
-    def load_checkpoint(self, path: str, strict: bool = True) -> None:
+    def load_checkpoint(
+        self, path: str, strict: bool = True, *, expand_action_dim_from_checkpoint: bool = False
+    ) -> None:
         """Load architecture state from a safetensors checkpoint.
+
+        ``expand_action_dim_from_checkpoint`` is an explicit training warm-start
+        migration: only known 80 -> 94, 80 -> 112, and 94 -> 112 projection axes are padded
+        with zeros. Default loading (including deployment) remains unchanged.
 
         VLM backbone weights are not stored in the safetensors file (they
         are saved as a separate directory). When a VLM backbone is present,
@@ -696,6 +702,14 @@ class BaseWAMArchitecture(ABC, nn.Module):
         from safetensors.torch import load_file
 
         state_dict = load_file(path)
+        if expand_action_dim_from_checkpoint:
+            from openwam.model.checkpoint_utils import expand_action_state_dict, infer_action_dimensions
+
+            target_shapes = {key: value.shape for key, value in self.state_dict().items()}
+            source_dim, target_dim = infer_action_dimensions(state_dict, target_shapes)
+            state_dict = expand_action_state_dict(
+                state_dict, target_shapes, source_dim=source_dim, target_dim=target_dim
+            )
         has_vlm = getattr(self, "vlm_backbone", None) is not None
         has_meta = any(p.device.type == "meta" for p in self.parameters())
         missing, unexpected = self.load_state_dict(state_dict, strict=False, assign=has_meta)
@@ -1004,6 +1018,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         if all_action_masks[0] is not None:
             inputs["action_is_pad"] = torch.stack([~m for m in all_action_masks], dim=0).to(device=_device)
+        if any(sample.get("fk_supervision") is not None for sample in samples):
+            inputs["fk_supervision"] = [sample.get("fk_supervision") for sample in samples]
         if all_video_masks[0] is not None:
             # ``latent[0]`` is a clean conditioning frame (and must be excluded
             # from the loss mask) when either:
@@ -1047,6 +1063,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
         actions: Optional[torch.Tensor] = None,
         lambda_video: float = 1.0,
         lambda_action: float = 1.0,
+        lambda_fk_position: float = 0.0,
+        lambda_fk_rotation: float = 0.0,
+        fk_supervision=None,
         **inputs,
     ) -> dict:
         """Compute joint video-action flow matching loss.
@@ -1071,6 +1090,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
         Returns:
             dict with keys: loss, loss_video, loss_action.
         """
+        from openwam.model.fk_supervision import add_fk_losses, validate_fk_weights
+
+        validate_fk_weights(lambda_fk_position, lambda_fk_rotation, lambda_action)
         vb = self.video_backbone
         action_scheduler = self.action_backbone.scheduler
         _dtype = self.dtype
@@ -1080,6 +1102,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
             actions = inputs.pop("actions", None)
         else:
             inputs.pop("actions", None)
+
+        if (lambda_fk_position or lambda_fk_rotation) and actions is None:
+            raise ValueError("FK supervision requires action targets")
 
         max_tb = int(inputs.pop("max_timestep_boundary", 1) * len(vb.scheduler.timesteps))
         min_tb = int(inputs.pop("min_timestep_boundary", 0) * len(vb.scheduler.timesteps))
@@ -1165,6 +1190,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
             _device,
         )
 
+        if (lambda_fk_position or lambda_fk_rotation) and action_noise_pred is None:
+            raise ValueError("FK supervision requires an action prediction")
         if lambda_action == 0 or action_noise_pred is None:
             return {
                 "loss": lambda_video * loss_video,
@@ -1193,7 +1220,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
             "loss_action": lambda_action * loss_action.detach(),
         }
 
-        return result
+        return add_fk_losses(result, noisy_actions, action_noise_pred, a_sigma_bc,
+                             fk_supervision, inputs.get("action_is_pad"),
+                             lambda_fk_position, lambda_fk_rotation)
 
     def _compute_video_loss(self, noise_pred, target, timestep_ids, inputs, device):
         """Per-sample weighted video MSE loss."""

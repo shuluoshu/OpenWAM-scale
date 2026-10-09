@@ -216,3 +216,12 @@ assets/*
 # Versioned RoboDojo score verification (see issue #23).
 !assets/robodojo_verification/
 !assets/robodojo_verification/**
+
+# Small, reviewable Mora relative94 normalization artifacts.
+!assets/openwam_alpha_data_examples/
+assets/openwam_alpha_data_examples/*
+!assets/openwam_alpha_data_examples/stats/
+assets/openwam_alpha_data_examples/stats/*
+!assets/openwam_alpha_data_examples/stats/*_relative94.npy
+
+!assets/openwam_alpha_data_examples/stats/*_relative112.npy

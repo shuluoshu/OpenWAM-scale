@@ -1,9 +1,13 @@
 type: canonical_eef_lerobot
+action_representation: head_tcp_relative_joint112
+head_world_to_camera_key: observation.states.camera.world_to_camera
 dataset_id: agibotworld_a2d_smoke
 dataset_dir: /mnt/data/cpfs/b5big/pretrain_data_release/pretrain_datasetsV0_1/agibotworld/task_512/a2d_gripper__dual_gripper__base__unmodified
-normalization_stats_path: /mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_alpha_data_examples/stats/agibotworld_a2d.npy
+normalization_stats_path: /mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_alpha_data_examples/stats/agibotworld_a2d_relative112.npy
 state_key: observation.states.eef
-action_key: actions.eef
+joint_state_key: observation.states.joint
+tcp_pose_keys: {}  # No declared TCP source; pose masked, joints/grippers retained.
+action_key: actions.eef  # provenance only; GT uses declared TCP/joint/gripper state columns at t+1
 head_camera: observation.images.cam_high
 left_wrist_camera: observation.images.cam_left_wrist
 right_wrist_camera: observation.images.cam_right_wrist
@@ -15,7 +19,7 @@ width: 320
 multiview: true
 normalize_mode: quantile
 unify_action: true
-unify_action_map: ["0-9", "34-43"]
+unify_action_map: ["0-9", "34-43", "80-93", "94-111"]
 episode_indices: [0, 1]
 max_episodes: 2
 max_windows: 8

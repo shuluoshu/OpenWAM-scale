@@ -1,4 +1,4 @@
-"""Strict LeRobot-v3 reader for already-materialized absolute EEF20 data."""
+"""Strict LeRobot-v3 reader using next observed absolute EEF20 states as actions."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from openwam.dataloader.bases.lerobot_v3_reader import LeRobotV3Reader
 from openwam.dataloader.utils import get_cfg
 from openwam.dataloader.utils.normalization import apply_normalization, load_stats_file, load_stats_metadata
 
-
 _MISSING = object()
 _ROT6D_SLICES = (slice(3, 9), slice(13, 19))
 
@@ -25,9 +24,13 @@ def canonical_schema_fingerprint(
     action_key: str,
     camera_keys: Iterable[str],
 ) -> str:
-    """Return a stable digest for the exact fields that define this reader."""
+    """Digest the consumed state/camera schema; ``action_key`` is legacy provenance.
 
-    keys = (state_key, action_key, *tuple(camera_keys))
+    Precomputed action fields can have a different temporal horizon and are not
+    read. Their presence or schema must not affect next-state targets.
+    """
+
+    keys = (state_key, *tuple(camera_keys))
     selected = {key: features[key] for key in keys}
     encoded = json.dumps(selected, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -47,14 +50,17 @@ def _inverse_normalization(arr: np.ndarray, stats: dict, mode: Optional[str]) ->
 
 
 class CanonicalEEFLerobotDataset(LeRobotV3Reader):
-    """Read absolute bimanual EEF20 fields and expose OpenWAM samples."""
+    """Build absolute action[k] = state[t+k+1] and proprio = state[t].
+
+    ``action_key`` identifies the superseded parquet field in provenance only;
+    target values always come from ``state_key``, before normalization/scatter.
+    """
 
     DATASET_NAME: ClassVar[str] = "CanonicalEEFLeRobot"
     ACTION_DIM: ClassVar[int] = 20
     DEFAULT_NORMALIZE_MODE: ClassVar[Optional[str]] = "quantile"
     NEEDED_COLS: ClassVar[tuple[str, ...]] = (
         "observation.states.eef",
-        "actions.eef",
         "task_index",
     )
 
@@ -99,7 +105,6 @@ class CanonicalEEFLerobotDataset(LeRobotV3Reader):
         features = info.get("features", {})
         required = (
             self._state_key,
-            self._action_key,
             self._head_camera_key,
             self._left_wrist_camera_key,
             self._right_wrist_camera_key,
@@ -110,13 +115,13 @@ class CanonicalEEFLerobotDataset(LeRobotV3Reader):
             raise ValueError(f"Canonical EEF fields/cameras missing from {info_path}: {missing}.{companion}")
         wrong_width = {
             key: features[key].get("shape")
-            for key in (self._state_key, self._action_key)
+            for key in (self._state_key,)
             if list(features[key].get("shape", [])) != [20]
         }
         if wrong_width:
-            raise ValueError(f"Canonical EEF state/action must be width 20, got {wrong_width}")
+            raise ValueError(f"Canonical EEF state must be width 20, got {wrong_width}")
 
-        self.NEEDED_COLS = (self._state_key, self._action_key, "task_index")
+        self.NEEDED_COLS = (self._state_key, "task_index")
         self._schema_fingerprint = canonical_schema_fingerprint(
             features,
             state_key=self._state_key,
@@ -163,11 +168,16 @@ class CanonicalEEFLerobotDataset(LeRobotV3Reader):
             "episode_indices": selected,
             "state_width": 20,
             "action_width": 20,
+            "action_target_source": "next_state",
+            "action_target_offset": 1,
             "schema_fingerprint": self._schema_fingerprint,
         }
         mismatches = {key: (metadata.get(key), value) for key, value in expected.items() if metadata.get(key) != value}
         if mismatches:
-            raise ValueError(f"normalization stats provenance mismatch for {self._stats_path}: {mismatches}")
+            raise ValueError(
+                f"normalization stats provenance mismatch for {self._stats_path}: {mismatches}. "
+                "Regenerate next-state stats with scripts/data/prepare_openwam_eef_smoke.py."
+            )
         self._stats_metadata = metadata
         self._state_stats = load_stats_file(
             self._stats_path,
@@ -197,12 +207,24 @@ class CanonicalEEFLerobotDataset(LeRobotV3Reader):
         return arr
 
     def _action_20d(self, win):
-        raw = self._validated_eef(win[self._action_key].tolist(), field=self._action_key)
+        # Source actions may already encode state[t+3]. Build exactly +1 from
+        # the observed state window instead of shifting those existing labels.
+        if len(win) < 2:
+            raise ValueError("next-state action targets require at least two real state rows")
+        raw = self._validated_eef(win[self._state_key].tolist(), field=self._state_key)[1:]
         normalized = apply_normalization(raw, self._normalization_stats, self._normalize_mode).astype(np.float32)
         if self._return_trace:
             self._trace_action_raw = raw
             self._trace_action_normalized = normalized
         return normalized
+
+    def _train_min_window_len(self) -> int:
+        """Exclude the terminal observation, which has no next-state target."""
+        return 2
+
+    def _finalize_action(self, action_20d, actual_raw_len):
+        """Pad/mask only real next-state targets without crossing episode ends."""
+        return super()._finalize_action(action_20d, max(0, actual_raw_len - 1))
 
     def _proprio_20d(self, win):
         raw = self._validated_eef(win[self._state_key].iloc[:1].tolist(), field=self._state_key)
@@ -239,6 +261,12 @@ class CanonicalEEFLerobotDataset(LeRobotV3Reader):
             "video_frame_indices": (offset + self._video_sample_indices).tolist(),
             "state_key": self._state_key,
             "action_key": self._action_key,
+            "action_target_source": "next_state",
+            "action_target_state_key": self._state_key,
+            "action_target_offset": 1,
+            "action_target_frame_indices": [
+                int(offset + i + 1) if i < n else None for i in range(self._num_frames - 1)
+            ],
             "raw_action_eef20": raw_action,
             "normalized_action_eef20": self.gather_unified_eef(sample["action"].numpy()),
             "unified_action80": sample["action"].numpy().copy(),
@@ -264,6 +292,13 @@ class CanonicalEEFLerobotDataset(LeRobotV3Reader):
 
     @classmethod
     def from_config(cls, config, split: str = "train") -> "CanonicalEEFLerobotDataset":
+        representation = get_cfg(config, "action_representation", "absolute_eef80")
+        if representation in {"tcp_relative_joint94", "head_tcp_relative_joint112"}:
+            from openwam.dataloader.mora_relative_lerobot import MoraRelativeJointDataset
+
+            return MoraRelativeJointDataset.from_config(config, split=split)
+        if representation != "absolute_eef80":
+            raise ValueError(f"unknown canonical action_representation={representation!r}")
         dataset_dir = get_cfg(config, "dataset_dir")
         stats_path = get_cfg(config, "normalization_stats_path")
         if dataset_dir is None:

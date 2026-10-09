@@ -78,22 +78,26 @@ def render_profile(
     npz_name = f"{name}.npz"
     _contact_sheet(sample["video"]).save(output_dir / image_name)
 
+    width = int(sample["action"].shape[-1])
     arrays = {
         "raw_action_eef20": _numpy(trace["raw_action_eef20"]).astype(np.float32),
         "normalized_action_eef20": _numpy(trace["normalized_action_eef20"]).astype(np.float32),
-        "unified_action80": _numpy(trace["unified_action80"]).astype(np.float32),
+        f"unified_action{width}": _numpy(sample["action"]).astype(np.float32),
         "raw_proprio_eef20": _numpy(trace["raw_proprio_eef20"]).astype(np.float32),
         "normalized_proprio_eef20": _numpy(trace["normalized_proprio_eef20"]).astype(np.float32),
-        "unified_proprio80": _numpy(trace["unified_proprio80"]).astype(np.float32),
+        f"unified_proprio{width}": _numpy(sample["proprio"]).astype(np.float32),
         "action_mask": _numpy(sample["action_mask"]).astype(bool),
         "proprio_mask": _numpy(sample["proprio_mask"]).astype(bool),
         "video_mask": _numpy(sample["video_mask"]).astype(bool),
     }
+    for key in ("raw_action_joint14", "raw_proprio_joint14", "raw_action_head18", "raw_proprio_head18"):
+        if key in trace:
+            arrays[key] = _numpy(trace[key]).astype(np.float32)
     if prediction_path is not None:
         prediction_path = Path(prediction_path).expanduser().resolve()
         predicted = np.load(prediction_path)
         for key in (
-            "prediction_normalized80",
+            f"prediction_normalized{width}",
             "prediction_normalized_eef20",
             "prediction_physical_eef20",
         ):
@@ -113,13 +117,18 @@ def render_profile(
         "prompt": sample["prompt"],
         "pipeline": [
             "parquet",
-            "absolute EEF20",
+            ({112: "next-state head-reference EE18 + TCP-local EEF20 + joint14 (t+1)",
+              94: "next-state TCP-relative EEF20 + joint14 (t+1)"}.get(width, "next-state absolute EEF20 (t+1)")),
             "source normalization",
-            "scatter OpenWAM80",
+            f"scatter OpenWAM{width}",
             "model forward",
         ],
         "raw_frame_indices": trace.get("raw_frame_indices"),
         "video_frame_indices": trace.get("video_frame_indices"),
+        "action_target_source": trace.get("action_target_source"),
+        "action_target_state_key": trace.get("action_target_state_key"),
+        "action_target_offset": trace.get("action_target_offset"),
+        "action_target_frame_indices": trace.get("action_target_frame_indices"),
         "shapes": {
             "video": [len(sample["video"]), 384, 320, 3],
             "action": list(_numpy(sample["action"]).shape),
@@ -192,7 +201,7 @@ def render_index(results: list[dict], output_dir: Path) -> Path:
 <html lang="en"><head><meta charset="utf-8"><title>OpenWAM-α forward-input report</title>
 <style>body{{font:15px system-ui;background:#111827;color:#e5e7eb;margin:2rem auto;max-width:1100px}}section{{background:#1f2937;padding:1rem;margin:1rem 0;border-radius:10px}}img{{width:100%;height:auto}}svg{{background:#0b1020;width:100%;border-radius:6px}}a{{color:#62d4ff}}.error{{color:#ff8080}}</style>
 </head><body><h1>OpenWAM-α model-forward inputs</h1>
-<p>parquet → absolute EEF20 → source normalization → OpenWAM80 scatter → model forward</p>
+<p>parquet states → next-state targets (t+1, representation in each manifest) → source normalization → unified scatter → model forward</p>
 {''.join(cards)}</body></html>"""
     page = output_dir / "index.html"
     page.write_text(document, encoding="utf-8")

@@ -782,6 +782,9 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
         actions: Optional[Tensor] = None,
         lambda_video: float = 1.0,
         lambda_action: float = 1.0,
+        lambda_fk_position: float = 0.0,
+        lambda_fk_rotation: float = 0.0,
+        fk_supervision=None,
         **inputs,
     ) -> dict:
         """IDM training loss with three branches and teacher-forcing mask.
@@ -792,6 +795,9 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
 
         Branch A/B timesteps are drawn independently with ``torch.randint``.
         """
+        from openwam.model.fk_supervision import add_fk_losses, validate_fk_weights
+
+        validate_fk_weights(lambda_fk_position, lambda_fk_rotation, lambda_action)
         vb = self.video_backbone
         ab = self.action_backbone
         action_scheduler = ab.scheduler
@@ -802,6 +808,8 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
             actions = inputs.pop("actions", None)
         else:
             inputs.pop("actions", None)
+        if (lambda_fk_position or lambda_fk_rotation) and actions is None:
+            raise ValueError("FK supervision requires action targets")
 
         max_tb = int(inputs.pop("max_timestep_boundary", 1) * len(vb.scheduler.timesteps))
         min_tb = int(inputs.pop("min_timestep_boundary", 0) * len(vb.scheduler.timesteps))
@@ -898,6 +906,8 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
             _device,
         )
 
+        if (lambda_fk_position or lambda_fk_rotation) and action_noise_pred is None:
+            raise ValueError("FK supervision requires an action prediction")
         if lambda_action == 0 or action_noise_pred is None:
             return {
                 "loss": lambda_video * loss_video,
@@ -920,11 +930,14 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
         else:
             loss = lambda_video * loss_video + lambda_action * loss_action
 
-        return {
+        result = {
             "loss": loss,
             "loss_video": lambda_video * loss_video.detach(),
             "loss_action": lambda_action * loss_action.detach(),
         }
+        return add_fk_losses(result, noisy_actions, action_noise_pred, a_sigma_bc,
+                             fk_supervision, inputs.get("action_is_pad"),
+                             lambda_fk_position, lambda_fk_rotation)
 
     # ------------------------------------------------------------------
     # Inference: two-stage generation
