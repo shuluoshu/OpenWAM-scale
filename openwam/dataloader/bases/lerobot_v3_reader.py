@@ -72,6 +72,7 @@ import torch
 from openwam.dataloader.bases.dataset import BaseDataset
 from openwam.dataloader.transforms.multiview import assemble_multiview_layout
 from openwam.dataloader.transforms.video import VideoColorJitter, color_jitter_enabled
+from openwam.dataloader.transforms.observation import ObservationAugmentation, TRACE_KEY
 from openwam.dataloader.utils.eef import (
     EEF_DIM,
     build_action_mask_2d,
@@ -207,6 +208,7 @@ class LeRobotV3Reader(BaseDataset):
         # (default). Truthy → enabled; a dict overrides
         # the per-channel strengths {brightness, contrast, saturation, hue}.
         color_jitter: Optional[Any] = None,
+        observation_augmentation: Optional[Any] = None,
         # Optional data-budget knobs (None = use the full bucket).
         max_hours: Optional[float] = None,
         subsample_seed: int = 42,
@@ -228,6 +230,12 @@ class LeRobotV3Reader(BaseDataset):
         self._camera_layout_param = list(camera_layout) if camera_layout else None
         self._max_hours = max_hours
         self._subsample_seed = int(subsample_seed)
+        self.observation_augmentation = ObservationAugmentation(observation_augmentation, training=split == "train")
+        if self.observation_augmentation.has_image_operations and not self._multiview:
+            raise ValueError("observation image augmentation currently requires multiview=true")
+        if (color_jitter_enabled(color_jitter) and self.observation_augmentation.enabled
+                and self.observation_augmentation.config["color_jitter"]["p"] > 0):
+            raise ValueError("choose legacy color_jitter or observation_augmentation.color_jitter, not both")
 
         # ── load-time video augmentation ──────────────────────────────────
         # Color jitter is applied in _getitem_impl to the decoded clip (same
@@ -637,15 +645,28 @@ class LeRobotV3Reader(BaseDataset):
                 self._dataset_dir, source_name=f"{self.DATASET_NAME}({self._dataset_id})"
             )
             return
-        # "task_index": meta/tasks.parquet, index=text, "task_index" column=int.
+        # "task_index": explicit "task" column or legacy text-in-index schema.
         tasks_path = self._dataset_dir / "meta" / "tasks.parquet"
         if not self.PROMPT_FILE_REQUIRED and not tasks_path.exists():
             self._task_idx_to_text: Dict[int, str] = {}
             return
         tasks_df = pd.read_parquet(tasks_path)  # FileNotFoundError if required + missing
         task_idx = tasks_df["task_index"].to_numpy()
-        task_str = tasks_df.index.to_numpy()
-        self._task_idx_to_text = dict(zip(task_idx.tolist(), task_str.tolist()))
+        task_str = tasks_df["task"].to_numpy() if "task" in tasks_df.columns else tasks_df.index.to_numpy()
+        task_idx_to_text = {}
+        for idx, text in zip(task_idx.tolist(), task_str.tolist()):
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError(
+                    f"{self.DATASET_NAME} {tasks_path}: task_index={idx} prompt must be a non-empty string; "
+                    f"got {text!r}. Data must be fixed upstream."
+                )
+            if idx in task_idx_to_text and task_idx_to_text[idx] != text:
+                raise ValueError(
+                    f"{self.DATASET_NAME} {tasks_path}: conflicting prompt strings for task_index={idx}. "
+                    "Data must be fixed upstream."
+                )
+            task_idx_to_text[idx] = text
+        self._task_idx_to_text = task_idx_to_text
 
     def _resolve_prompt(self, row, win: pd.DataFrame) -> str:
         """Resolve this window's prompt text according to ``PROMPT_SOURCE``.
@@ -878,7 +899,9 @@ class LeRobotV3Reader(BaseDataset):
 
         # 5) video — decode head (+ optional wrist) frames into the canvas
         real_local_indices = self._video_sample_indices[self._video_sample_indices < actual_raw_len]
-        if self._color_jitter is not None:
+        exclusion_masks = None
+        legacy_image_changed = False
+        if self._color_jitter is not None or self.observation_augmentation.has_image_operations:
             # Same jitter factors across the whole clip (temporal consistency).
             video, exclusion_masks = self._decode_window_video(
                 row,
@@ -888,15 +911,17 @@ class LeRobotV3Reader(BaseDataset):
                 idx,
                 return_missing_masks=True,
             )
-            jitter_input = {"video": video}
-            if exclusion_masks is not None:
-                jitter_input["video_jitter_exclusion_masks"] = exclusion_masks
-            video = self._color_jitter.apply(jitter_input)["video"]
+            if self._color_jitter is not None:
+                jitter_input = {"video": video}
+                if exclusion_masks is not None:
+                    jitter_input["video_jitter_exclusion_masks"] = exclusion_masks
+                video = self._color_jitter.apply(jitter_input)["video"]
+                legacy_image_changed = self._color_jitter.training and bool(video)
         else:
             video = self._decode_window_video(row, ep_local, offset, real_local_indices, idx)
         video_mask = torch.from_numpy(self._video_sample_indices < actual_raw_len)
 
-        return {
+        sample = {
             "video": video,
             "vace_video": None,
             "first_frame_image": [video[0]] if video else [],
@@ -907,6 +932,13 @@ class LeRobotV3Reader(BaseDataset):
             "proprio_mask": torch.from_numpy(proprio_mask),
             "prompt": prompt,
         }
+        sample = self.observation_augmentation.apply(sample, exclusion_masks)
+        if legacy_image_changed:
+            # Prepared-input caches must also bypass legacy RGB augmentation.
+            metadata = dict(sample.get(TRACE_KEY, {}))
+            metadata.update(image_changed=True, legacy_color_jitter=True)
+            sample[TRACE_KEY] = metadata
+        return sample
 
     # ----- action / proprio finalization -----------------------------------
 
@@ -1157,6 +1189,7 @@ class LeRobotV3Reader(BaseDataset):
         "unify_action_map",
         "unify_state_map",
         "color_jitter",
+        "observation_augmentation",
     )
 
     @classmethod

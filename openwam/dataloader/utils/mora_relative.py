@@ -11,6 +11,7 @@ import json
 
 import numpy as np
 from scipy.spatial.transform import Rotation
+from openwam.dataloader.utils.gripper import GripperCommands, ALIGNED_COMMAND, ALIGNED_VALID
 
 RAW_DIM = 34
 UNIFIED_DIM = 94
@@ -48,7 +49,7 @@ class MoraRelativeRepresentation:
 
     def __init__(self, info, *, state_key="observation.states.eef",
                  joint_state_key="observation.states.joint", tcp_pose_keys=None,
-                 tcp_from_eef=None, joint_indices=None):
+                 tcp_from_eef=None, joint_indices=None, gripper_command_sources=None):
         self.features = info.get("features", {})
         self.state_key = state_key
         self.joint_state_key = joint_state_key
@@ -106,7 +107,8 @@ class MoraRelativeRepresentation:
             self.columns.append(joint_state_key)
         elif joint_indices:
             raise ValueError(f"joint_indices supplied but {joint_state_key} is absent")
-        self.columns = list(dict.fromkeys(self.columns))
+        self.gripper_commands = GripperCommands(info, gripper_command_sources)
+        self.columns = list(dict.fromkeys([*self.columns, *self.gripper_commands.columns]))
         self.contract = {
             "representation": "tcp_relative_joint94", "action_target_source": "next_state",
             "action_target_offset": 1, "anchor": "window_start", "state_key": state_key,
@@ -114,7 +116,17 @@ class MoraRelativeRepresentation:
             "tcp_from_eef": {k: v.tolist() for k, v in self.tcp_from_eef.items()},
             "joint_indices": self.joint_indices, "raw_width": RAW_DIM, "unified_width": UNIFIED_DIM,
             "joint_target": "relative", "missing_tcp": "mask_pose", "gripper_target": "absolute",
+            "gripper_target_source": "controller_command",
+            "gripper_command_sources": self.gripper_commands.sources,
+            "gripper_command_timing": "cmd[t:t+H] alongside state[t+1:t+H+1]",
+            "missing_gripper_command": "mask_gripper_gt",
         }
+        if any(s.get("kind") == "human_openness_target" for s in self.gripper_commands.sources.values()):
+            self.contract.update(
+                gripper_target_source="controller_command_or_human_openness_target",
+                gripper_command_timing="robot cmd[t:t+H]; human stored action targets[t:t+H] (already future-aligned)",
+                missing_gripper_command="mask_unavailable_gripper_target",
+            )
         schema = {key: self.features[key] for key in self.columns}
         digest = json.dumps({"contract": self.contract, "schema": schema}, sort_keys=True).encode()
         self.contract["schema_fingerprint"] = hashlib.sha256(digest).hexdigest()
@@ -181,6 +193,12 @@ class MoraRelativeRepresentation:
             action[:, start + 3:start + 9] = _rot6d(reference @ rotations[1:])
         action[:, 20:] -= values[0, 20:]
         action_mask[:, 20:] &= valid[0, 20:]
+        if ALIGNED_COMMAND in columns:
+            commands, command_mask = columns[ALIGNED_COMMAND], columns[ALIGNED_VALID]
+        else:
+            commands, command_mask = self.gripper_commands.align(columns, len(values))
+        action[:, [9, 19]] = np.asarray(commands)[:-1]
+        action_mask[:, [9, 19]] = np.asarray(command_mask)[:-1]
         action[~action_mask] = 0
         return action, action_mask, values[:1], valid[:1]
 

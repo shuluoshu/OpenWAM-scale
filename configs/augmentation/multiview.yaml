@@ -1,0 +1,17 @@
+# Applied to the final resized/cropped L-shaped camera canvas.
+# One draw per sample; all temporal frames share factors, camera and rectangle.
+enabled: true
+color_jitter:
+  p: 0.8
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+patch_mask:
+  p: 0.5
+  area_range: [0.05, 0.20]  # fraction of the selected view, not the full canvas
+  aspect_range: [0.5, 2.0]
+view_dropout:
+  p: 0.1
+  keep_one_view: true
+state_dropout:
+  p: 0.1  # zero the whole input state and its input mask, preserve GT/FK

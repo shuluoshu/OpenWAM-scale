@@ -1,0 +1,21 @@
+# Mora gripper [0,1] implementation plan
+
+Goal: All Mora relative94/112 reader sources use clipped absolute gripper openness in [0,1], identically for state and action, independent of dataset/clip statistics. Preserve continuous values; mask nonfinite/missing labels. Other pose/joint dimensions retain their current normalization.
+
+User selected the direct [0,1] approach after reviewing quantile versus fixed scaling. Execute inline in the current workspace and preserve unrelated edits.
+
+- [x] Add regression cases to `tests/dataloader/test_mora_relative_reader.py` for both layouts and all existing normalization modes: negative ->0, 0.25 ->0.25, >1 ->1, constant1 ->1, nonfinite ->masked0, next-state alignment, state/action agreement, tail padding and reader inverse conversion.
+- [x] Run the new tests in `/root/miniconda3/envs/openwam` and confirm the current quantile behavior fails them.
+- [x] Modify `openwam/dataloader/mora_relative_lerobot.py`: normalize other dimensions normally, overwrite raw slots9/19 using `np.clip(raw[..., [9,19]],0,1)` before scatter; inverse EEF conversion preserves/clips these same slots. Report the effective rule in reader traces. Existing empirical statistics remain usable for non-gripper dimensions; do not modify historical files.
+- [x] Run relevant reader, relative representation and FK tests. Verify all6854 windows of the46 current clips: state/action gripper exactly matches clipped source; other dimensions and masks are unchanged.
+- [x] Start a separate1000-step experiment with the validated batch320/actionLR1e-4 using the same foundation initialization and previous frozen image cache. Persist the normalization rule with the new run; preserve old TensorBoard records. Verify actual finite optimizer updates and provide the active run name/link.
+
+Scope: Mora canonical relative94/112 ingestion used by this experiment and its reader inverse API. Do not silently change unrelated native robot action conventions in other reader classes. The existing curated mixture has per-clip pose/joint statistics and no single deploy normalizer; this change does not invent one.
+
+Verification: nine newly parameterized cases failed before the change; all27 reader/representation tests and28 canonical/FK tests passed afterward. `outputs/curated_train_20261011/gripper01_validation.json` records exhaustive comparisons of6854 windows against the pre-change reader, including identical non-gripper dimensions and masks. Native GT FK floors remain below1e-8 for the two verified Genie1 evaluation anchors. Raw source parquet/statistics files were not overwritten.
+
+Training: the old run completed1000steps before this change. New run `gripper01_lr0.0001_b320` starts from the foundation checkpoint, with batch320, action LR1e-4, projection LR1e-3, video LR1e-5, all four loss weights1 and target1000steps. Driver `outputs/curated_train_20261011/run_gripper01.py`, status `gripper01_status.json`. `label_contract.json` and saved config identify `clip_0_1`. TensorBoard continues at https://897628-proxy-18082.dsw-gateway-cn-shanghai.data.aliyuncs.com/#scalars . Historical curves retain their old normalization semantics.
+
+Startup verification: `metrics.jsonl` contains actual optimizer steps1–4; step4 total loss0.822910, action loss0.611893, FK position loss0.001903, batch320, peak allocated108.18GiB. This verifies successful startup, not completion or convergence of the new1000-step run. Launcher `launch_gripper01.py` invokes `supervise_gripper01.py`, which runs `torchrun --standalone --nproc_per_node=1 run_gripper01.py --name gripper01_lr0.0001_b320 --batch 320 --steps 1000 --lr 0.0001 --eval-every 25`.
+
+Source clarification: test values−0.2 and1.4 are synthetic fixture values in `tests/dataloader/test_mora_relative_reader.py`; they are not measured dataset examples and have no corresponding source video. The follow-up audit reads the46 source Parquet segments directly and records13,800 finite reader-selected state gripper values, all within[0,1]. Raw native position/legacy EEF fields can have different ranges and must not be conflated with the reader-selected source. Audit script: `outputs/curated_smoke_20261010/gripper_audit.py`; raw evidence: `outputs/curated_smoke_20261010/gripper_state_cmd_20261013/audit.json`.

@@ -1,0 +1,21 @@
+# MoraVLA / OpenWAM same-anchor comparison report
+
+**Goal:** Add the detailed code-grounded comparison to the existing local/browser HTML and show the same source frames through both image and trajectory processing paths.
+
+**Architecture:** Independent evidence drivers invoke real Mora image/pose transforms and current OpenWAM representation, write report-local PNG/NPZ/JSON assets, and feed a new HTML comparison section. Existing 46 videos remain available. No training or production reader semantics change.
+
+**Constraints:** Keep current OpenWAM32-step/112D configuration. Clearly label incompatible Mora YAML and isolated-transform execution. Do not silently change Mora endpoints or relabel EEF as TCP. Use identical source anchor/images for paired views. Use explicit stats provenance. Separate physical pre-normalization trajectories from clipped model targets. Retain local file-compatible HTML and relative assets. Do not commit/push.
+
+- [x] Image evidence: all46 source anchors; decode exact source frame, run real Mora longest-edge resize and local Qwen processor, reconstruct normalized patches with a roundtrip check; compare against existing OpenWAM canvas and record dimensions/hashes.
+- [x] GT evidence: all46 anchors, use actual source action rows through Mora pose transform vs current OpenWAM next-state TCP; validate pose recovery and masks, record endpoints and target frame mappings. For7 valid head-calibration clips render matched-anchor projections; for11 configured TCP clips render local curves. Unsupported geometry is labeled.
+- [x] HTML: append full time/image/GT/normalization/padding/mask/configuration analysis, add paired images and trajectory comparisons, visible coordinate-frame and endpoint legends, source links and scope limitations.
+- [x] Verification: verify original images at same source frame, processor patch roundtrip, pose matrix recovery, action target index examples, all local links, browser HTML/MP4 HTTP; inspect representative output images; independent review.
+- [x] Publish: rebuild main report, rebuild offline ZIP, verify served bytes and provide browser and local links.
+
+Completed: 46 image pairs / 110 camera streams; 11 relative trajectory plots; 7 paired fixed-anchor projection animations; original 46 videos preserved. All 2,490 HTML links resolved; 53 H264 MP4s decode and have faststart; ZIP CRC passes. Local HTTP HTML/media/archive are 200; public gateway returns 302 to Alibaba authenticated console. No full Mora training pipeline or model forward was claimed.
+
+Follow-up: added final visual-input organization for all 46 examples: actual OpenWAM bf16 pre-VAE pixels reconstructed as a complete 320x384 canvas, paired with independent Mora processed camera images. Mora concatenates patch sequences, not RGB canvases; per-camera grids and concatenated shapes are shown. Added the full nine-frame OpenWAM reader gallery. Rendering verifies native-resolution paste and records bf16 display quantization; no VAE/model forward or training was added.
+
+2026-10-11 ABC wrist diagnostic: four fixed-anchor videos added (33 displayed frames, t0 through t+32). Samples 08/10/11 use published QA-rejected wrist K/extrinsics solely for diagnostic projection; 09 has NaN wrist extrinsics and displays source images plus valid TCP-local curves without an invented overlay. Left/right trajectories and orientation axes are shown. Recovering world poses from T0 times TCP-local matrices agrees with stored absolute targets within 2.07e-7 maximum matrix element error. No training masks, TCP offsets or production reader code changed.
+
+2026-10-11 correction after user review: replaced the four ABC fixed-image reveal animations in the HTML with real moving wrist-camera videos (new abc_wrist_tcp_motion.mp4 filenames). Each is 75 decoded frames / 15 fps / 5 seconds; all eight camera streams have 75 distinct pre-overlay frame hashes. Camera K/extrinsics, current TCP anchor, and future32 local trajectories update at the identical source frame. Frame150 boundary shortens the future horizon. Diagnostic calibration status and training masks remain unchanged. Source-frame correspondence and world-pose recovery are recorded in abc_wrist_motion_source.json; first/middle/last contact sheets confirm visible camera motion.

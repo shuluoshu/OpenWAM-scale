@@ -9,8 +9,10 @@ import numpy as np
 from omegaconf import OmegaConf
 
 from openwam.dataloader.mora_relative_lerobot import MoraRelativeJointDataset
+from openwam.dataloader.bases.lerobot_v3_reader import _read_data_table_cached
 from openwam.dataloader.utils.lerobotv3 import parse_info_json
 from openwam.dataloader.utils.normalization import ROT6D_DIMS_EEF20, pin_rot6d_identity
+from openwam.dataloader.utils.gripper import ALIGNED_COMMAND, ALIGNED_VALID
 from scripts.data.prepare_openwam_eef_smoke import _read_table
 
 
@@ -39,6 +41,8 @@ class _StatsPopulation(MoraRelativeJointDataset):
 
 
 def prepare_relative_stats(config, *, split="train"):
+    # Preparation may follow a fixture rebuild at the same path.
+    _read_data_table_cached.cache_clear()
     cfg = OmegaConf.to_container(config, resolve=True) if OmegaConf.is_config(config) else dict(config)
     bucket = Path(cfg["dataset_dir"]).expanduser().resolve()
     output = Path(cfg["normalization_stats_path"]).expanduser().resolve()
@@ -59,21 +63,26 @@ def prepare_relative_stats(config, *, split="train"):
             raise ValueError(f"episode row range mismatch: {path}")
         columns = {k: np.stack(frame[k].tolist()) for k in rep.columns}
         columns["_rows"] = np.arange(len(frame))
-        n_starts = int(population._cum_n_starts[ep_local + 1] - population._cum_n_starts[ep_local])
-        for i in range(n_starts):
+        commands, valid, _, _ = population._episode_grippers(ep_local)
+        columns[ALIGNED_COMMAND], columns[ALIGNED_VALID] = commands, valid
+        first, last = population._cum_n_starts[ep_local:ep_local+2]
+        accepted = population._valid_source_indices
+        anchors = accepted[(accepted >= first) & (accepted < last)] - first
+        for i in anchors:
             start = int(population._ep_valid_start[ep_local]) + i * stride
             encoded = rep.encode_window({k: v[start:min(start + horizon, int(population._ep_valid_end[ep_local]))] for k, v in columns.items()})
             for part, arr in zip(parts, encoded):
                 part.append(arr)
-    if not parts[0]:
-        raise ValueError("no valid next-state windows")
-    action, action_mask, state, state_mask = [np.concatenate(part) for part in parts]
+    action, action_mask, state, state_mask = [
+        np.concatenate(part) if part else np.empty((0, rep.raw_dim), dtype=bool if i % 2 else np.float32)
+        for i, part in enumerate(parts)]
     payload = {"action": _summary(action, action_mask), "state": _summary(state, state_mask),
                "metadata": {**rep.contract, "dataset_dir": str(bucket),
                             "episode_indices": episodes.episode_index.astype(int).tolist(),
                             "num_frames": horizon, "window_stride": stride, "split": split,
                             "action_rows": len(action), "state_rows": len(state),
-                            "population": "all window anchors and their valid future rows; ignores max_windows"}}
+                            "gripper_filter_report": population.gripper_filter_report,
+                            "population": "all accepted window anchors and valid future rows; ignores max_windows"}}
     output.parent.mkdir(parents=True, exist_ok=True)
     temp = output.with_name(f".{output.name}.tmp.npy")
     np.save(temp, payload, allow_pickle=True)

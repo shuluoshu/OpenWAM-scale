@@ -44,6 +44,9 @@ var/
 wheels/
 share/python-wheels/
 references/
+# Keep the repository visualization skill's instructions and tool catalog.
+!skills/openwam-visualization/references/
+!skills/openwam-visualization/references/**
 # third_party/ holds submodules (currently cosmos-predict2.5). Build outputs
 # and bytecode that the submodule produces locally should not contaminate it.
 third_party/**/*.pyc

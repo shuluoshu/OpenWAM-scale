@@ -37,8 +37,9 @@ def test_local_pose_and_joint_delta_share_window_start_anchor():
     np.testing.assert_allclose(action[0, 3:9], [0, -1, 0, 1, 0, 0], atol=1e-6)
     np.testing.assert_array_equal(action[:, 20:], joints[1:] - joints[0])
     np.testing.assert_array_equal(state[0, 20:], joints[0])
-    np.testing.assert_array_equal(action[:, 9], np.array([.4, .6], dtype=np.float32))
-    assert mask.all() and state_mask.all()
+    assert not action[:, [9, 19]].any()  # No declared command in this fixture.
+    assert not mask[:, [9, 19]].any()
+    assert mask[:, [*range(9), *range(10, 19), *range(20, 34)]].all() and state_mask.all()
 
 
 def test_no_tcp_does_not_supervise_pose_but_keeps_joints_and_grippers():
@@ -50,7 +51,7 @@ def test_no_tcp_does_not_supervise_pose_but_keeps_joints_and_grippers():
     assert not mask[:, pose_dims].any()
     assert not state_mask[:, pose_dims].any()
     assert not action[:, pose_dims].any()
-    assert mask[:, [9, 19]].all() and mask[:, 20:].all()
+    assert not mask[:, [9, 19]].any() and state_mask[:, [9, 19]].all() and mask[:, 20:].all()
     assert np.isfinite(action).all() and np.isfinite(state).all()
 
 
