@@ -150,6 +150,12 @@ class OpenWAMTrainer:
         for name in self.architecture.freeze_modules(freeze_list):
             logger.info("Frozen: %s", name)
 
+        text_cache_cfg = cfg_get(t, "text_feature_cache", None)
+        if text_cache_cfg is not None:
+            from openwam.model.video_backbone.wan.text_feature_cache import configure_text_feature_cache
+
+            configure_text_feature_cache(self.architecture, text_cache_cfg)
+
         # Initialize all schedulers (video + action) inside architecture
         self.architecture.init_training_schedulers(1000)
 

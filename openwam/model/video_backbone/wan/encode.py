@@ -16,7 +16,7 @@ from openwam.model.video_backbone.wan.preprocess import preprocess_video as _pre
 from openwam.model.video_backbone.wan.preprocess import vae_output_to_video
 
 
-def encode_text(prompts: list, *, tokenizer, text_encoder, device) -> Tuple[Tensor, Tensor]:
+def encode_text(prompts: list, *, tokenizer, text_encoder, device, feature_cache=None) -> Tuple[Tensor, Tensor]:
     ids, mask = tokenizer(
         prompts,
         return_mask=True,
@@ -25,6 +25,8 @@ def encode_text(prompts: list, *, tokenizer, text_encoder, device) -> Tuple[Tens
         padding="max_length",
         truncation=True,
     )
+    if feature_cache is not None:
+        return feature_cache.encode(ids, mask, text_encoder=text_encoder, device=device)
     ids = ids.to(device)
     mask = mask.to(device)
     seq_lens = mask.gt(0).sum(dim=1).long()

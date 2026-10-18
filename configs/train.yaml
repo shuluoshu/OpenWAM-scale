@@ -39,6 +39,13 @@ training:
   initialize_model_on_cpu: false         # Load model on CPU, let DeepSpeed move to GPU
   offload_optimizer_device: none         # DeepSpeed ZeRO optimizer-state offload: none / cpu
 
+  # Frozen T5 outputs only; cache hits bypass T5, not trainable text/state projections.
+  # Enabling this keeps T5 in eval mode (no text dropout).
+  text_feature_cache:
+    enabled: false
+    directory: outputs/cache/t5
+    max_memory_mb: 512              # Per-rank CPU LRU; disk cache survives restarts
+
   # --- Loss weights ---
   lambda_video: 1.0               # Video flow-matching loss weight
   lambda_action: 1.0              # Action flow-matching loss weight

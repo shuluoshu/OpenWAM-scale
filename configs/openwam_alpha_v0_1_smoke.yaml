@@ -121,6 +121,10 @@ model:
     state_dim: 112
 
 training:
+  text_feature_cache:
+    enabled: true
+    directory: outputs/cache/t5
+    max_memory_mb: 512
   expand_action_dim_from_checkpoint: true
   debug: false
   learning_rate: 1.0e-4

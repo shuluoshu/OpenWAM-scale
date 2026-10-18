@@ -114,6 +114,13 @@ class WanBase(VideoBackbone):
         self._wan_blocks_compile_enabled = False
         self._wan_blocks_compile_kwargs: dict | None = None
         self._compiled_wan_blocks: dict[int, Callable[..., Tensor]] = {}
+        self._text_feature_cache = None
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if getattr(self, '_text_feature_cache', None) is not None:
+            self.text_encoder.eval()
+        return self
 
     # ================================================================
     # Internal properties
@@ -771,7 +778,8 @@ class WanBase(VideoBackbone):
 
         batch_size = len(frames)
         context, seq_lens = wan_encode.encode_text(
-            text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
+            text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device,
+            feature_cache=getattr(self, '_text_feature_cache', None),
         )
 
         all_input_videos = []
