@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - 基线：远程 `fork/codex/stage1-joint-task-subtask`，commit `1aaab2a0d83bcfda51626c6681ffcb1bb6ad5484`。实施前核对远程新提交，禁止覆盖其他人工作。
-- 本文件是实施计划；没有执行下述代码修改，也没有启动训练。
+- 本文件保留最初的实施步骤。2026-10-19 代码已实现并完成 450 项回归和最终 v4 单 GPU 两步验证；逐项证据与未完成的多卡/长训验收见 `docs/stage2_joint_training.md`，下方原始复选框不代表实时状态。
 - 在隔离 worktree 中逐项移植本地 Stage B 原型，不复制整个脏工作区，不把未验证原型标成 ready。
 - 不停止现有训练，不把旧 heatmap checkpoint 当作 patch checkpoint，不伪造 point_logits 兼容旧接口。
 - 保留 gripper clip `[0,1]`、机器人 command/人类 openness 监督、异常状态过滤、观测增强、相对 joint、FK position/rotation loss。
@@ -234,7 +234,7 @@ exec torchrun --standalone --nproc_per_node="${NPROC_PER_NODE:-1}" \
 - [ ] 文档写明两个 checkpoint 的用途、两个 YAML、启动与 resume 命令、global batch 算法、增强策略、mask、评估范围和已完成的验证等级。
 - [ ] 在隔离分支 review 全部 diff，提交至 `shuluoshu/OpenWAM-scale` 的同一功能分支，核对 remote SHA/tree；Stage 2 尚未到达验收等级时不把原 Stage 1 发布标成 Stage 2 ready。
 
-## 最终启动接口（计划交付，当前尚不存在）
+## 最终启动接口（原始设计示例；实际已交付，见训练指南）
 
 ```bash
 export STAGE1_GOAL_CHECKPOINT=/absolute/path/to/stage1/patch_goal.safetensors
@@ -246,7 +246,7 @@ bash scripts/launch_stage2.sh sample --preflight
 NPROC_PER_NODE=1 bash scripts/launch_stage2.sh sample --train
 ```
 
-3000h 切换 `STAGE2_SOURCE_YAML` 到 `pretrain_v0_3_curated_3000h.yaml` 并使用 `3000h` preset。上述路径是用户提供训练资产的位置参数，不是仓库自带权重；入口交付前不能执行这些命令。
+3000h 切换 `STAGE2_SOURCE_YAML` 到 `pretrain_v0_3_curated_3000h.yaml` 并使用 `3000h` preset。上述路径是用户提供训练资产的位置参数，不是仓库自带权重。实际启动还须设置匹配的 STAGE2_STATS_REGISTRY 和 PYTHON，完整命令及验证范围以 docs/stage2_joint_training.md 为准。
 
 ## Ready 定义
 

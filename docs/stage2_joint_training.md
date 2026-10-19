@@ -1,6 +1,19 @@
 # Stage 2 联合训练：接口、验证等级与短 smoke
 
-截至 2026-10-19，Stage 2 已完成 CPU 接口集成；最终 mask 修正的七组 focused/兼容回归为 **170 passed**。真实单 GPU/DeepSpeed fresh 已完成两次 optimizer updates，并完整保存 step 2 后按计划退出；`outputs/stage2_implementation_20261019/gpu_smoke/fresh.json` 为 `checkpoint_stop` 且 checks passed。独立进程实际恢复至 update 3（total loss 0.248719、grad norm 0.432078）；旧探针对 proprio 的检查失败：该 draw 的 deterministic state dropout 将 50 个有效观测维度全部清空，有限零梯度属预期，不能把动量导致的权重变化当作当前梯度证据。原始 `gpu_smoke/resume.json` 保留其失败检查，另附 source replay 判断；最终评估/保存完成状态仍以原始 JSON 为准。该 GPU 证据来自 mask 修正前的 v3 版本；最终 v4 bounded stats 重新准备、同 population 的 counts/quantiles 对比及修正后真实短 GPU 验证仍待完成，旧 GPU 报告不证明 v4 评估、resume contract 或连续 GPU baseline 等价。**双 GPU 和 500-update 学习趋势尚未执行**，Stage 2 ready 仍未验收。任务 7 接入前 root 另记录 focused CPU 回归 269 passed。
+截至 2026-10-19，Stage 2 代码集成完成，最终回归 **450 passed**（2 个已有 NumPy deprecation warnings）。验证范围如下；这不是大规模训练收敛声明。
+
+| 验证项 | 实际结果 | 边界 |
+| --- | --- | --- |
+| 最终 v4 原生数据与启动预检 | sample / 3000h 均通过；20 + 83 个归一化合同已重新准备 | 有界数组统计，不是全量视频逐帧审计 |
+| 最终 v4 单 GPU / DeepSpeed fresh | 两次真实 optimizer updates、完整 state 1/2 保存、按计划退出；checks passed | 未执行最终 v4 的完整 GPU resume |
+| 最终 v4 checkpoint 独立推理 | 独立进程 exit 0，step 2 complete manifest 与 26 个本地引用通过检查；两段 H.264 视频各 9 帧可解码 | 仅两个 diagnostic cases，不代表全部数据集质量 |
+| 历史 v3 独立进程 resume | 实际从 update 2 恢复至 3，完成最终评估与完整保存 | 旧探针因合法 state dropout 后 proprio 零梯度报错；原始失败 JSON 保留，另附重放判定，不作为 v4 resume 验收 |
+| CPU 完整恢复与迁移 | next-batch / next-update 精确等价，资产与监督合同校验通过 | 不证明 GPU bitwise 等价 |
+| 多 GPU / 500-update 学习趋势 | 未执行 | 分布式与规模训练仍待验收 |
+
+最终 v4 fresh 的 total loss 为 **0.639277 → 0.354449**，第二步 video/action loss 分别为 **0.351003 / 0.003446**。两个不同样本的 loss 不能作为学习趋势。第一步实际 FK valid count 为 18。video patch、action transformer、proprio、goal adapter 的代表参数均记录有限非零梯度和参数更新；全部约 5B goal 参数冻结、无梯度、版本不变且不在 optimizer 内。CUDA 峰值 allocated / reserved 约 **34.56 / 36.55 GiB**，训练计算分别约 **32.25 / 27.00 秒**；含模型加载、评估及完整状态保存的 fresh 总墙钟约 **19.4 分钟**。
+
+证据在原始工作区 `outputs/stage2_implementation_20261019/`：`final_regression.log`、`final_review.md`、`gpu_smoke_v4/fresh.json`、`gpu_smoke_v4_eval.log`、`resume_proprio_adjudication.json` 和汇总 `index.html`。最终 v4 run 为 `gpu_smoke_v4/checkpoints/2026-10-19_21-19-13/`；历史 v3 失败探针记录保持原样。
 
 ## 两种 checkpoint 和两份配置
 
@@ -24,9 +37,9 @@ Stage 2 永远以**预测 goal**为条件。未来像素、GT action/TCP、成�
 
 原始工作区 `outputs/stage2_implementation_20261019/` 保留证据：
 
-- `preflight_sample_v3/summary.json`：46 repos / 46 selected episodes 的完整选择 metadata 检查，20 normalization contracts，6900 selected frames；每类/每合同有界真实读取得到可人工检查的输入/GT HTML。`all_videos_audited=false`，不声称逐帧全审计。
-- `preflight_3000h_v3/summary.json`：5750 repos / 168467 episodes、323988246 selected frames 的完整选择 metadata 检查，83 normalization contracts；没有导出全部视频。此前 v2 的有界读取证据需与对应 summary 一起查看，不能据 metadata 全通过推断全部视频可解码。
-- 上述 v3 registry 为修正前的历史证据。最终修正增加 `stored_mask_policy=declared_eef_blocks_all_flags_finite_v2`，旧 registry 会因 contract mismatch 被拒绝；sample/3000h 均须重新进行有界统计准备并记录新 registry/summary，再用于训练或评估。不能静默复用可能受 `+inf` 有效性或 EEF10 mask 影响的统计 population；旧 run 打包的 normalization/resume contract 同样不自动兼容新策略。
+- `preflight_sample_v4/summary.json`：46 repos / 46 selected episodes 的完整选择 metadata 检查，20 normalization contracts，6900 selected frames；每类/每合同有界真实读取得到可人工检查的输入/GT HTML。`all_videos_audited=false`，不声称逐帧全审计。
+- `preflight_3000h_v4/summary.json`：5750 repos / 168467 episodes、323988246 selected frames 的完整选择 metadata 检查，83 normalization contracts；没有导出全部视频。有界统计读取 165 个 episode / 1320 个 window，不能据 metadata 全通过推断全部视频可解码。
+- 最终 `stored_mask_policy=declared_eef_blocks_all_flags_finite_v2` 对应 v4 registry；sample 有界读取 32 个 episode / 256 个 window。`statistics_v3_v4_comparison.json` 记录同一 population 的全部 20 + 83 个统计 entry（包括 counts/quantiles）完全一致。这只证明这些有界样本未受该修正影响；不能据此复用旧 contract。旧 registry 和旧 run 的 normalization/resume contract 会被严格拒绝。
 - CPU full-state 测试包括真实 CPU Accelerator/optimizer/scheduler/RNG/DataLoader 的 next-update 精确等价与 checkpoint 搬迁、冻结依赖身份校验。它们不证明 GPU bitwise 等价或 DeepSpeed shard 恢复。
 
 ## 普通启动与完整恢复
@@ -101,4 +114,4 @@ GPU JSON 会区分 failure 和完成，Python 异常保留 traceback；无法在
 /root/miniconda3/envs/openwam/bin/python scripts/eval_stage2.py --run-dir RUN --history-only
 ```
 
-当前剩余：原始 v3 continuation 的最终评估/保存 JSON、v4 sample/3000h 有界统计与 population/counts/quantiles 对比、修正后短 GPU 检查、图像/轨迹人工检查；双 GPU 采样/teacher placement/optimizer/评估 barrier/保存恢复防 hang；有明确预算后才启动固定每类 500-update 趋势验证。单 case loss 不严格单调不足以判失败，应结合有效监督数量与动作/视频趋势判断。没有执行这些项目之前，分布式入口、规模训练和学习质量保持未验收状态。
+当前剩余：最终 v4 完整 GPU resume、双 GPU 采样/teacher placement/optimizer/评估 barrier/保存恢复防 hang，以及有明确预算后的固定每类 500-update 趋势验证。历史 v3 已完成 backend continuation，不能替代最终策略的完整恢复验收。单 case loss 不严格单调不足以判失败，应结合有效监督数量与动作/视频趋势判断。分布式入口、规模训练和学习质量保持未验收状态。
