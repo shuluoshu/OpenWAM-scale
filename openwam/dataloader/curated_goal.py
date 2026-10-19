@@ -14,12 +14,8 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-
-HEAD_CAMERAS = {f: 'observation.images.' + c for f,c in {
-    'Genrobot':'cam_high','LightWheel':'head_left','abc_130k':'cam_high',
-    'egodex':'egocentric','egoverse':'front_1','interndata_a1':'cam_high',
-    'mecka':'egocentric','morphirobot0930':'cam_high','robochallenge_v1':'cam_high',
-    'robochallenge_v2':'cam_high','robomind_v1':'cam_front','robomind_v2':'camera_front'}.items()}
+from openwam.dataloader.native_cameras import HEAD_CAMERAS, resolve_native_cameras
+from openwam.model.goal.observation import OBSERVATION_MODES, VIEW_NAMES, clean_multiview
 
 
 def parse_curated_yaml(path, data_root=None):
@@ -94,13 +90,15 @@ def language_intervals(labels, task_mapping, annotations, length):
 
 class CuratedGoalDataset:
     def __init__(self,source_yaml,cache_dir,seed=42,subtask_probability=.5,
-                 max_cached_episodes=8,dtype=torch.bfloat16,data_root=None):
+                 max_cached_episodes=8,dtype=torch.bfloat16,data_root=None,observation_mode='head'):
+        if observation_mode not in OBSERVATION_MODES:raise ValueError(f'invalid observation_mode: {observation_mode}')
         if not 0<=subtask_probability<=1:raise ValueError('invalid subtask probability')
         if max_cached_episodes<1:raise ValueError('max_cached_episodes must be positive')
         self.selection=parse_curated_yaml(source_yaml,data_root);self.repos=self.selection['repos']
         self.cache_dir=Path(cache_dir);self.cache_dir.mkdir(parents=True,exist_ok=True)
         self.seed=int(seed);self.subtask_probability=subtask_probability;self.max_cached_episodes=max_cached_episodes
         self.dtype=getattr(torch,dtype) if isinstance(dtype,str) else dtype
+        self.observation_mode=observation_mode
         self._episodes=OrderedDict();self._evaluations=None;self._asset_slot=0;self._evaluating=False
         self._weights=np.array([r['weight'] for r in self.repos]);self._weights/=self._weights.sum()
 
@@ -112,6 +110,7 @@ class CuratedGoalDataset:
                     families=sorted({r['family'] for r in self.repos}),
                     selected_weight_sum=sum(r['weight'] for r in self.repos),
                     max_cached_episodes=self.max_cached_episodes,
+                    observation_mode=self.observation_mode,
                     goal_policy='original contiguous instruction end_exclusive-1; may extend curated observation range')
 
     def _episode(self,repo,episode):
@@ -124,6 +123,7 @@ class CuratedGoalDataset:
         root=Path(repo['path']);info=json.loads((root/'meta/info.json').read_text())
         head=HEAD_CAMERAS[repo['family']]
         if info['features'].get(head,{}).get('dtype')!='video':raise ValueError(f'unverified head camera schema: {head}')
+        cameras=resolve_native_cameras(repo['repo'],info) if self.observation_mode=='multiview' else [head,None,None]
         ep=read_episode(root,episode);length=int(ep['length'])
         data=root/info['data_path'].format(episode_index=episode,chunk_index=int(ep['data/chunk_index']),file_index=int(ep['data/file_index']))
         names=pq.ParquetFile(data).schema_arrow.names
@@ -145,7 +145,7 @@ class CuratedGoalDataset:
         tasks,subtasks=language_intervals(labels,mapping,annotations,length)
         for _,start,end in (s for s in repo['ranges'] if s[0]==episode):
             if end>length:raise ValueError('curated range exceeds original episode')
-        result=dict(root=root,info=info,ep=ep,length=length,data=data,head=head,tasks=tasks,subtasks=subtasks,annotation_file=str(ann) if has_annotations else None)
+        result=dict(root=root,info=info,ep=ep,length=length,data=data,head=head,cameras=cameras,tasks=tasks,subtasks=subtasks,annotation_file=str(ann) if has_annotations else None)
         self._episodes[key]=result
         while len(self._episodes)>self.max_cached_episodes:self._episodes.popitem(last=False)
         return result
@@ -199,9 +199,35 @@ class CuratedGoalDataset:
         from scripts.data.prepare_goal_labels import goal_camera
         from scripts.data.trajectory_projection import goal_source_tcp,project_goal_tcp
         from openwam.train.goal_overfit import prepare_overfit_images
-        prefix='videos/'+m['head']+'/'
-        video=m['root']/m['info']['video_path'].format(video_key=m['head'],chunk_index=int(m['ep'][prefix+'chunk_index']),file_index=int(m['ep'][prefix+'file_index']))
-        images,alignment=decode_frames(video,float(m['ep'][prefix+'from_timestamp']),float(m['info']['fps']),[anchor,goal],sequential=repo['family']=='mecka')
+        def decode(camera,indices):
+            prefix='videos/'+camera+'/'
+            try:
+                chunk,file,offset=(m['ep'][prefix+k] for k in ('chunk_index','file_index','from_timestamp'))
+                fps=float(m['info']['fps']);offset=float(offset)
+                if any(isinstance(v,bool) or int(v)!=v or v<0 for v in (chunk,file)):
+                    raise ValueError('invalid chunk/file index')
+                if not math.isfinite(offset) or offset<0 or not math.isfinite(fps) or fps<=0:
+                    raise ValueError('invalid timestamp/fps')
+                video=m['root']/m['info']['video_path'].format(video_key=camera,episode_index=episode,
+                    chunk_index=int(chunk),file_index=int(file))
+            except (KeyError,TypeError,ValueError,OverflowError) as exc:
+                raise ValueError(f'malformed present camera video metadata: {camera}: {exc}') from exc
+            if not video.is_file():raise FileNotFoundError(f'camera video missing: {camera}: {video}')
+            images,alignment=decode_frames(video,offset,fps,indices,sequential=repo['family']=='mecka')
+            return video,images,alignment
+        video,images,alignment=decode(m['head'],[anchor,goal])
+        frames=[images[anchor],None,None];view_valid=[True,False,False]
+        observed_views=dict(head=dict(camera=m['head'],available=True,mask_reason=None,
+            source_video=str(video),alignment=alignment[anchor]))
+        if self.observation_mode=='multiview':
+            for i,camera in enumerate(m['cameras'][1:],1):
+                if camera is None:
+                    observed_views[VIEW_NAMES[i]]=dict(camera=None,available=False,mask_reason='missing_camera_feature')
+                    continue
+                wrist_video,wrist_images,wrist_alignment=decode(camera,[anchor])
+                frames[i]=wrist_images[anchor];view_valid[i]=True
+                observed_views[VIEW_NAMES[i]]=dict(camera=camera,available=True,mask_reason=None,
+                    source_video=str(wrist_video),alignment=wrist_alignment[anchor])
         rows=pq.read_table(m['data'],filters=[('episode_index','=',episode),('frame_index','=',goal)]).to_pylist()
         if len(rows)!=1:raise ValueError('goal geometry source row not unique')
         endpoint=goal_source_tcp(repo['family'],rows[0],tcp_from_eef=recorded_tcp_transform(repo['family'],m['info']))
@@ -217,8 +243,13 @@ class CuratedGoalDataset:
         slot=('evaluation_'+ident if self._evaluating else 'sample_'+str(self._asset_slot % self.max_cached_episodes))
         if not self._evaluating:self._asset_slot+=1
         folder=self.cache_dir/slot;folder.mkdir(exist_ok=True)
-        for frame,name in ((anchor,'observed.png'),(goal,'goal.png')):
-            images[frame].resize((320,256),Image.Resampling.BILINEAR).save(folder/name)
+        images[goal].resize((320,256),Image.Resampling.BILINEAR).save(folder/'goal.png')
+        if self.observation_mode=='multiview':
+            canvas=clean_multiview(frames,torch.tensor(view_valid,dtype=torch.bool))
+            rgb=((canvas[:,0]+1)*127.5).round().byte().permute(1,2,0).numpy()
+            Image.fromarray(rgb).save(folder/'observed.png')
+        else:
+            images[anchor].resize((320,256),Image.Resampling.BILINEAR).save(folder/'observed.png')
         np.savez_compressed(folder/'targets.npz',**{k:projection[k] for k in ('uv','projection_valid','in_frame','visibility')})
         record=dict(id=ident,metric_key=ident,family=repo['family'],granularity=level,instruction=segment['text'],
             source_repo=str(m['root']),source_episode=episode,source_episode_length=m['length'],
@@ -230,6 +261,9 @@ class CuratedGoalDataset:
                 observed_video=alignment[anchor],goal_video=alignment[goal],goal_source_frame=goal,
                 endpoint=endpoint,camera=cam_meta,calibration_eligibility_record=qa,
                 goal_policy='original contiguous instruction end_exclusive-1; may extend curated observation range',geometry_review_status='pending_review'))
+        if self.observation_mode=='multiview':
+            record.update(observation_mode='multiview',view_valid=view_valid)
+            record['provenance']['observed_views']=observed_views
         record=clean_json(record)
         batch=prepare_overfit_images([record],device='cpu',dtype=self.dtype)[0]
         batch.update(instruction=record['instruction'],id=ident,family=repo['family'],granularity=level)

@@ -143,9 +143,9 @@ def validate_overfit_manifest(manifest, *, expected_families=12,
     return rows
 
 
-def _image_tensor(path, device, dtype):
+def _image_tensor(path, device, dtype, *, size=(320,256)):
     with Image.open(path) as image:
-        array = np.array(image.resize((320, 256), Image.Resampling.BILINEAR), copy=True)
+        array = np.array(image.convert('RGB').resize(size, Image.Resampling.BILINEAR), copy=True)
     return (torch.from_numpy(array).permute(2, 0, 1)[None, :, None].float() / 127.5 - 1).to(device=device, dtype=dtype)
 
 
@@ -161,8 +161,18 @@ def prepare_overfit_images(records, *, device, dtype):
                 torch.as_tensor(data['projection_valid'].copy(), device=device, dtype=torch.bool)[None],
                 torch.as_tensor(data['in_frame'].copy(), device=device, dtype=torch.bool)[None],
                 torch.as_tensor(data['visibility'].copy(), device=device, dtype=torch.int8)[None])
-        batches.append(dict(observed=_image_tensor(row['observed_image_path'], device, dtype),
-                            targets=targets, sources=[row['family']]))
+        mode=row.get('observation_mode','head')
+        if mode=='multiview':
+            from openwam.model.goal.observation import sanitize_canvas, validate_view_valid
+            valid=validate_view_valid(torch.as_tensor(row['view_valid'],device=device)[None],batch_size=1)
+            with Image.open(row['observed_image_path']) as image:
+                if image.size!=(320,384):raise ValueError('multiview observation asset must be W320 H384')
+            observed=sanitize_canvas(_image_tensor(row['observed_image_path'],device,dtype,size=(320,384)),valid)
+            batches.append(dict(observed=observed,observed_view_valid=valid,targets=targets,sources=[row['family']]))
+        elif mode=='head':
+            batches.append(dict(observed=_image_tensor(row['observed_image_path'], device, dtype),
+                                targets=targets, sources=[row['family']]))
+        else:raise ValueError(f'unsupported observation_mode: {mode}')
     return batches
 
 
@@ -186,6 +196,21 @@ def _display_image(tensor):
     return Image.fromarray(array.permute(1, 2, 0).numpy())
 
 
+def input_report_labels(card):
+    """Visible dimensions/view availability shared by preflight and input audit."""
+    multiview=card.get('observation_mode','head')=='multiview'
+    label='Current three-view input (H384 × W320)' if multiview else 'Current head input (H256 × W320)'
+    status=''
+    if multiview:
+        from openwam.model.goal.observation import VIEW_NAMES
+        valid=card['observed_view_valid'][0]
+        status=' · '.join(f'{name}: {"valid" if present else "missing"}' for name,present in zip(VIEW_NAMES,valid))
+    anchor=card.get('anchor_source_frame')
+    note='<p>'+html.escape(status)+'</p>' if status else ''
+    if anchor is not None:note+='<p>Same anchor source frame: '+html.escape(str(anchor))+'</p>'
+    return label,'Head-only endpoint GT (H256 × W320)',note
+
+
 def export_inputs(output_dir, records, batches):
     destination = Path(output_dir) / 'inputs'; destination.mkdir(exist_ok=True)
     cards = []
@@ -204,9 +229,19 @@ def export_inputs(output_dir, records, batches):
                       in_frame=target.in_frame.cpu().numpy(), visibility=target.visibility.cpu().numpy(),
                       context=batch['context'].detach().float().cpu().numpy(),
                       original_image_dtype=str(target.image.dtype))
+        view_metadata={}
+        if 'observed_view_valid' in batch:
+            from openwam.model.goal.observation import observation_token_mask
+            mask=batch['observed_view_valid'].detach().cpu()
+            arrays['observed_view_valid']=mask.numpy()
+            arrays['observation_token_valid']=observation_token_mask(mask).numpy()
+            view_metadata=dict(observation_mode='multiview',observed_view_valid=mask.tolist(),
+                               observed_shape=list(batch['observed'].shape),
+                               valid_observation_tokens=arrays['observation_token_valid'].sum(axis=1).tolist())
         # Float32 conversion is exact for every BF16 value. Raw bits are also retained.
-        if target.image.dtype == torch.bfloat16:
+        if batch['observed'].dtype == torch.bfloat16:
             arrays['observed_bfloat16_bits'] = batch['observed'].detach().cpu().view(torch.uint16).numpy()
+        if target.image.dtype == torch.bfloat16:
             arrays['target_bfloat16_bits'] = target.image.detach().cpu().view(torch.uint16).numpy()
         np.savez_compressed(destination / f'{name}.npz', **arrays)
         reasons = []
@@ -221,10 +256,21 @@ def export_inputs(output_dir, records, batches):
             provenance['manifest_id'] = row['id']
         # Real manifests may already carry id, visibility, or other report fields.
         # Computed report values win without duplicate keyword arguments.
-        cards.append({**row, 'id': name, 'valid_points': valid, 'mask_reasons': reasons,
+        cards.append({**row, **view_metadata, 'id': name, 'valid_points': valid, 'mask_reasons': reasons,
                       'visibility': target.visibility[0].cpu().tolist(), 'provenance': provenance,
                       'target_uv_pixels': [point if ok else None for point, ok in zip(uv, valid)]})
     _write_json(destination / 'manifest.json', cards)
+    panels=[]
+    for card in cards:
+        name=card['id']
+        observed_label,target_label,note=input_report_labels(card)
+        panels.append('<article><h2>'+html.escape(card['family'])+'</h2><p>'+html.escape(card['instruction'])+
+            '</p>'+note+'<div class="images"><figure><figcaption>'+observed_label+'</figcaption><img src="'+name+'_observed.png"></figure>'+
+            '<figure><figcaption>'+target_label+'</figcaption><img src="'+name+'_target_points.png"></figure></div>'+
+            '<a href="'+name+'.npz">Exact input tensors and masks (NPZ)</a><details><summary>Source and same-anchor provenance</summary><pre>'+html.escape(json.dumps(card,ensure_ascii=False,indent=2))+'</pre></details></article>')
+    (destination/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>Actual model inputs</title>'+
+        '<style>body{font:16px system-ui;margin:24px}.images{display:flex;gap:16px;align-items:flex-start}figure{margin:0}img{width:320px;height:auto}pre{white-space:pre-wrap}</style>'+
+        '<h1>Actual model inputs and view masks</h1><p>Unaugmented current frames; goals and TCP remain in the head view. Float32 NPZ values exactly preserve BF16 values; raw BF16 bits are included when used.</p>'+''.join(panels))
     return cards
 
 

@@ -1,0 +1,6 @@
+# Explicit v1 warm-start uses --init-goal-checkpoint; optimizer always starts fresh.
+base_config: stage1_joint_3000h.yaml
+observation_mode: multiview
+dataset:
+  observation_mode: multiview
+  cache_dir: outputs/stage1_multiview_3000h/cache

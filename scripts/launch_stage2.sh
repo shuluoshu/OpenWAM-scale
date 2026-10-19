@@ -7,6 +7,12 @@ if [[ "$preset" != sample && "$preset" != 3000h ]] || [[ "$mode" != --preflight 
   exit 2
 fi
 shift 2
+goal_input="${STAGE2_GOAL_INPUT:-head}"
+case "$goal_input" in
+  head) config_prefix=stage2_joint ;;
+  multiview) config_prefix=stage2_multiview ;;
+  *) echo 'STAGE2_GOAL_INPUT must be head or multiview' >&2; exit 2 ;;
+esac
 : "${STAGE1_GOAL_CHECKPOINT:?Set STAGE1_GOAL_CHECKPOINT to the Stage1 patch bundle}"
 : "${STAGE2_BASELINE_CHECKPOINT:?Set STAGE2_BASELINE_CHECKPOINT to baseline weights/run directory}"
 : "${STAGE2_OUTPUT_DIR:?Set STAGE2_OUTPUT_DIR to the new run output directory}"
@@ -20,7 +26,7 @@ export STAGE2_SOURCE_YAML="${STAGE2_SOURCE_YAML:-$default_source}"
 export PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}"
 cd "$repo_root"
 python_bin="${PYTHON:-python}"
-common=(--config-name "goal/stage2_joint_${preset}" "goal.checkpoint=${STAGE1_GOAL_CHECKPOINT}" "training.finetune_ckpt_path=${STAGE2_BASELINE_CHECKPOINT}" "dataloader.source_yaml=${STAGE2_SOURCE_YAML}" "project.output_dir=${STAGE2_OUTPUT_DIR}")
+common=(--config-name "goal/${config_prefix}_${preset}" "goal.checkpoint=${STAGE1_GOAL_CHECKPOINT}" "training.finetune_ckpt_path=${STAGE2_BASELINE_CHECKPOINT}" "dataloader.source_yaml=${STAGE2_SOURCE_YAML}" "project.output_dir=${STAGE2_OUTPUT_DIR}")
 # Both paths validate assets/source contracts before constructing any full model.
 "$python_bin" scripts/train.py "${common[@]}" "$@" goal.preflight=true
 if [[ "$mode" == --preflight ]]; then exit 0; fi

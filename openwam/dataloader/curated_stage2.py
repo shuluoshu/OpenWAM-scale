@@ -169,6 +169,10 @@ class CuratedStage2Dataset(Dataset):
             video_mask[i] &= frame_valid[i*4]
         while len(canvases)<9:canvases.append(canvases[-1].copy());missing.append(missing[-1].copy())
         view_mask &= video_mask[:,None]
+        from openwam.model.goal.observation import clean_multiview
+        current_mask = torch.from_numpy(view_mask[0].copy())
+        clean_canvas = (clean_multiview([views[0].get(c) for c in m['profile']['cameras']],current_mask)
+                        if current_mask.any() else torch.full((3,1,384,320),-1.))
         instruction=option['instruction']
         seed_material=[self.seed,repo['repo'],episode,anchor,instruction['text']]
         goal_seed=int(fingerprint(seed_material)[:15],16)
@@ -181,7 +185,7 @@ class CuratedStage2Dataset(Dataset):
             proprio=torch.from_numpy(proprio),proprio_mask=torch.from_numpy(proprio_mask),
             prompt=instruction['text'],instruction=instruction['text'],granularity=level,
             instruction_start=instruction['start'],instruction_end_exclusive=instruction['end_exclusive'],
-            goal_observed_head=clean,goal_head_valid=head is not None and bool(frame_valid[0]),goal_seed=goal_seed,
+            goal_observed_head=clean,goal_observed_multiview=clean_canvas,goal_view_valid=current_mask,goal_head_valid=head is not None and bool(frame_valid[0]),goal_seed=goal_seed,
             report_target=dict(goal_source_frame=instruction['end_exclusive']-1,label_kind=level+'_end',success_verified=False),
             trace=dict(identity=identity,draw_id=draw_id,source_repo=str(m['root']),episode=episode,anchor=anchor,last_source=option['last_source'],
                 source_parquet=str(m['data']),info_sha256=m['info_hash'],profile_id=m['profile']['profile_id'],

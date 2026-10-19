@@ -26,27 +26,43 @@ def main(argv=None):
     parser.add_argument('--steps',type=int)
     parser.add_argument('--seed',type=int,default=42)
     parser.add_argument('--tokenizer-path',help='explicit tokenizer directory override')
+    parser.add_argument('--init-goal-checkpoint',help='explicit checked v1 head -> multiview initialization; fresh optimizer')
     args=parser.parse_args(argv)
     import torch
-    from openwam.train.goal_curated import load_config,require_single_process,preflight,train_curated,TextContextCache
+    from openwam.train.goal_curated import load_config,require_single_process,preflight,train_curated,TextContextCache,initialize_goal_checkpoint
     require_single_process();torch.set_num_threads(2)
     if args.source_yaml and not Path(args.source_yaml).is_absolute():parser.error('--source-yaml must be absolute')
+    if args.init_goal_checkpoint and args.preflight:parser.error('--init-goal-checkpoint requires --train or --smoke')
+    config=load_config(args.config,source_yaml=args.source_yaml,data_root=args.data_root)
+    observation_mode=config.get('observation_mode','head')
+    flow_settings=dict(shift=config.get('shift',5.),lambda_image=config.get('lambda_image',.5),
+                       lambda_tcp=config.get('lambda_tcp',1.))
+    if args.init_goal_checkpoint and observation_mode!='multiview':
+        parser.error('--init-goal-checkpoint requires a multiview config')
     output=Path(args.output_dir)
     if output.exists() and any(output.iterdir()):raise ValueError('nonempty output directory; choose a new run')
     if args.smoke:
         from openwam.train.goal_patch import make_smoke_data
-        expert,batches,records=make_smoke_data(args.device or 'cpu')
+        from openwam.model.goal.patch_expert import PatchGoalExpert
+        expert,batches,records=make_smoke_data(args.device or 'cpu',observation_mode=observation_mode)
+        fingerprint=hashlib.sha256(batches[0]['context'].cpu().numpy().tobytes()).hexdigest()
+        if args.init_goal_checkpoint:
+            expert=initialize_goal_checkpoint(args.init_goal_checkpoint,vae=expert.codec.vae,dit_config=expert.dit_config,
+                observation_mode=observation_mode,text_dim=expert.dit.text_embedding[0].in_features,
+                precomputed_text_fingerprint=fingerprint,device=args.device or 'cpu',**flow_settings)
+        else:
+            expert=PatchGoalExpert(expert.dit,expert.codec,dit_config=expert.dit_config,
+                observation_mode=observation_mode,**flow_settings)
         records[0].update(metric_key='synthetic:task:0',granularity='task')
         class SyntheticDataset:
             def evaluation_samples(self):return list(zip(records,batches))
             def sample(self,step):return records[0],batches[0]
-            def scope_summary(self):return dict(synthetic=True,families=['synthetic'])
+            def scope_summary(self):return dict(synthetic=True,families=['synthetic'],observation_mode=observation_mode)
         result=train_curated(expert,dataset=SyntheticDataset(),context_cache=None,output_dir=output,
             steps=args.steps if args.steps is not None else 2,eval_every=500,sampling_steps=2,learning_rate=.001,seed=args.seed,
-            precomputed_text_fingerprint=hashlib.sha256(batches[0]['context'].cpu().numpy().tobytes()).hexdigest(),
-            training_metadata=dict(synthetic_diagnostic=True,real_wan_blocks=True))
+            precomputed_text_fingerprint=fingerprint,
+            training_metadata=dict(synthetic_diagnostic=True,real_wan_blocks=True,config=config))
     else:
-        config=load_config(args.config,source_yaml=args.source_yaml,data_root=args.data_root)
         from openwam.dataloader.curated_goal import CuratedGoalDataset
         dataset_config=dict(config['dataset'])
         cache_root=Path(dataset_config.pop('cache_dir',output.parent/'data_cache'))
@@ -70,11 +86,23 @@ def main(argv=None):
             _seed(args.seed)
             # CPU bootstrap avoids temporary full T5 occupancy on the accelerator.
             original,text_encoder,tokenizer=bootstrap_components(config,device='cpu',dtype=dtype)
-            expert=PatchGoalExpert(original.dit,original.codec,dit_config=original.dit_config,
-                shift=config.get('shift',5.),lambda_image=config.get('lambda_image',.5),lambda_tcp=config.get('lambda_tcp',1.),
-                use_gradient_checkpointing=config.get('gradient_checkpointing',True)).to(device=device,dtype=dtype)
+            if args.init_goal_checkpoint:
+                # Release the baseline DiT before constructing the checkpoint DiT.
+                # Initialize on CPU alongside the shared text/VAE dependencies,
+                # then place the expert and VAE on their training device.
+                vae,dit_config=original.codec.vae,original.dit_config
+                del original
+                expert=initialize_goal_checkpoint(args.init_goal_checkpoint,vae=vae,dit_config=dit_config,
+                    observation_mode=observation_mode,text_encoder=text_encoder,tokenizer=tokenizer,dtype=dtype,
+                    use_gradient_checkpointing=config.get('gradient_checkpointing',True),**flow_settings)
+                expert.to(device=device,dtype=dtype)
+            else:
+                expert=PatchGoalExpert(original.dit,original.codec,dit_config=original.dit_config,
+                    **flow_settings,
+                    use_gradient_checkpointing=config.get('gradient_checkpointing',True),
+                    observation_mode=observation_mode).to(device=device,dtype=dtype)
+                del original
             expert.codec.vae.to(device=device,dtype=dtype).eval().requires_grad_(False)
-            del original
             text_device=config.get('text_device','cpu')
             text_encoder.to(device=text_device,dtype=dtype).eval().requires_grad_(False)
             identities=dependency_identity(expert.codec.vae,text_dim=expert.dit.text_embedding[0].in_features,

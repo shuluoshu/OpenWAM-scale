@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+  - stage2_joint_3000h
+  - _self_
+goal:
+  format: openwam.goal.patch.v2
+  input_policy: clean_multiview
+  observation_mode: multiview
+project:
+  name: openwam-stage2-multiview-3000h

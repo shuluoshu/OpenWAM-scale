@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import numpy as np
-from openwam.dataloader.curated_goal import HEAD_CAMERAS
+from openwam.dataloader.native_cameras import HEAD_CAMERAS, resolve_native_cameras
 from openwam.dataloader.utils.gripper import GripperCommands
 
 VERSION = 'native_mora112_v1'
@@ -25,12 +25,8 @@ def resolve_native_profile(repo, info):
     if family not in HEAD_CAMERAS:raise ValueError(f'{repo}: unsupported_family')
     robot=m.get('robot_type',m.get('canonical_robot_type',m.get('embodiment',family)))
     reasons=[]
-    head=HEAD_CAMERAS[family]
-    head=head if f.get(head,{}).get('dtype')=='video' else None
-    def wrist(side):
-        candidates=[f'observation.images.cam_{side}_wrist',f'observation.images.camera_{side}',f'observation.images.{side}_wrist',f'observation.images.cam_{side}']
-        return next((k for k in candidates if f.get(k,{}).get('dtype')=='video'),None)
-    cameras=[head,wrist('left'),wrist('right')]
+    cameras=resolve_native_cameras(repo,info)
+    head=cameras[0]
     joint_key='observation.state' if family in {'abc_130k','robomind_v1','robomind_v2'} else 'observation.states.joint'
     if family in HUMANS or family=='Genrobot':joint_key='__unavailable_robot_joint__'
     indices={s:[] for s in SIDES}; j=f.get(joint_key)

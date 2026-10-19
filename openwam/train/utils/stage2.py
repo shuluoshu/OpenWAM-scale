@@ -108,8 +108,10 @@ def build_stage2_parameter_groups(architecture,training):
 
 
 def validate_stage2_config(cfg):
-    required={'goal.enabled':True,'goal.format':'openwam.goal.patch.v1','goal.conditioning':'image_memory',
-        'goal.input_policy':'clean_head','goal.mode':'predicted','goal.num_steps':20,
+    from openwam.model.goal.runtime import goal_observation_mode
+    goal_observation_mode(OmegaConf.to_container(cfg.goal,resolve=True))
+    required={'goal.enabled':True,'goal.conditioning':'image_memory',
+        'goal.mode':'predicted','goal.num_steps':20,
         'model.architecture.action_dim':112,'model.architecture.state_dim':112,
         'model.architecture.use_proprioception':True,'model.architecture.attention_mask_mode':'mutual',
         'model.architecture.video_attention_mask_mode':'first_frame_causal',
@@ -157,6 +159,9 @@ def validate_stage2_launch(cfg,*,metadata_only=False):
     baseline_cfg = OmegaConf.load(str(Path(directory)/'config.yaml'))
     goal_directory = directory if is_stage2(baseline_cfg) else None
     if goal_directory:
+        from openwam.model.goal.runtime import goal_observation_mode
+        if goal_observation_mode(OmegaConf.to_container(cfg.goal,resolve=True)) != goal_observation_mode(OmegaConf.to_container(baseline_cfg.goal,resolve=True)):
+            raise ValueError('Stage2 configured goal policy/mode disagrees with saved checkpoint')
         from omegaconf import open_dict
         with open_dict(cfg):
             cfg.goal = baseline_cfg.goal
@@ -182,7 +187,13 @@ def validate_stage2_launch(cfg,*,metadata_only=False):
     if not goal.is_file():raise FileNotFoundError('STAGE1_GOAL_CHECKPOINT must name a patch bundle')
     with safe_open(str(goal),framework='pt',device='cpu') as handle:
         metadata=json.loads((handle.metadata() or {}).get('patch_goal_bundle','{}'))
-    if metadata.get('format')!='openwam.goal.patch.v1':raise ValueError('Stage1 patch bundle metadata format mismatch')
+    from openwam.model.goal.runtime import goal_observation_mode
+    from openwam.model.goal.observation import observation_metadata
+    mode=goal_observation_mode(OmegaConf.to_container(cfg.goal,resolve=True))
+    if metadata.get('format')!=cfg.goal.format:raise ValueError('Stage1 patch bundle metadata format mismatch')
+    if metadata.get('observation_mode', 'head')!=mode:raise ValueError('Stage1 patch bundle observation mode mismatch')
+    if mode=='multiview' and metadata.get('observation')!=json.loads(json.dumps(observation_metadata(mode))):
+        raise ValueError('Stage1 patch bundle multiview observation contract mismatch')
     if metadata.get('codec',{}).get('latent_shape')!=[48,1,16,20]:raise ValueError('Stage1 patch bundle codec mismatch')
     if not metadata.get('dependencies'):raise ValueError('Stage1 patch bundle dependencies missing')
     for key in ('action_dim','state_dim','attention_mask_mode','video_attention_mask_mode'):

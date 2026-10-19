@@ -14,11 +14,13 @@ from openwam.model.goal.codec import GoalCodec
 from openwam.model.goal.dependencies import dependency_identity, module_identity, precomputed_identity, text_identity
 from openwam.model.goal.heads import point_mask, target_uv_pixels
 from openwam.model.goal.patch_expert import PatchGoalExpert
+from openwam.model.goal.observation import OBSERVATION_MODES, observation_metadata
 from openwam.model.video_backbone.wan.models.dit import WanModel
 from openwam.train.goal_overfit import FP32MasterAdamW, _write_json, _display_image, export_inputs
 from openwam.train.goal_trainer import _seed, overlay_goal_targets
 
 FORMAT = 'openwam.goal.patch.v1'
+MULTIVIEW_FORMAT = 'openwam.goal.patch.v2'
 REFERENCE = dict(repository='https://github.com/Awomo-WestlakeDI/Awomo-0.5',
     commit='d22dda9aae0f9ae8096e95580a140a784a17b513', paper='https://arxiv.org/html/2609.25961v1',
     adaptation='Wan latent patch width 192; one TCP patch, 48 repeats per coordinate; independent encoded-space Gaussian noise as paper, unlike released 05I low-dimensional noisy-action encoding')
@@ -31,8 +33,10 @@ def save_patch_bundle(expert, checkpoint, *, training_metadata=None, dependency_
         text_dim=expert.dit.text_embedding[0].in_features,
         precomputed_text_fingerprint=precomputed_text_fingerprint)
     root=Path(__file__).resolve().parents[2]
-    files=['openwam/model/goal/patch_expert.py','openwam/train/goal_patch.py','scripts/train_goal_patch.py','openwam/dataloader/mixed_goal.py','openwam/train/mixed_metrics.py','openwam/train/goal_history.py']
-    metadata=dict(format=FORMAT,dit_config=expert.dit_config,codec=expert.codec.metadata(),
+    files=['openwam/model/goal/observation.py','openwam/model/goal/patch_expert.py','openwam/train/goal_patch.py','scripts/train_goal_patch.py','openwam/dataloader/mixed_goal.py','openwam/train/mixed_metrics.py','openwam/train/goal_history.py']
+    metadata=dict(format=FORMAT if expert.observation_mode == 'head' else MULTIVIEW_FORMAT,
+        observation_mode=expert.observation_mode, observation=observation_metadata(expert.observation_mode),
+        dit_config=expert.dit_config,codec=expert.codec.metadata(),
         shift=expert.shift,lambda_image=expert.lambda_image,lambda_tcp=expert.lambda_tcp,
         dependencies={**identities,'reconstruction':dependency_metadata or {}},
         training=training_metadata or {},reference=REFERENCE,
@@ -40,6 +44,8 @@ def save_patch_bundle(expert, checkpoint, *, training_metadata=None, dependency_
         tcp_codec=dict(order=['uL','vL','uR','vR'],normalization='2*uv-1',repeats=48,
                        patch_width=192,decode='group mean; (x+1)/2; no clamp'),
         sampling=dict(method='joint Euler',noise='independent image / 192D TCP',return_latent='final_z0'))
+    if hasattr(expert, 'initialization_metadata'):
+        metadata['initialization'] = dict(expert.initialization_metadata)
     temporary=checkpoint.with_suffix('.pending.safetensors')
     save_file({k:v.detach().cpu().contiguous() for k,v in expert.state_dict().items()},str(temporary),
               metadata={'patch_goal_bundle':json.dumps(metadata,sort_keys=True)})
@@ -49,12 +55,35 @@ def save_patch_bundle(expert, checkpoint, *, training_metadata=None, dependency_
 
 
 def load_patch_bundle(checkpoint, *, vae, text_encoder=None,tokenizer=None,text_dim=None,
-                      precomputed_text_fingerprint=None,device='cpu',dtype=torch.float32):
+                      precomputed_text_fingerprint=None,device='cpu',dtype=torch.float32,
+                      observation_mode=None,warm_start=False):
+    """Load the saved mode, or explicitly initialize multiview from a v1 bundle.
+
+    warm_start=True only permits v1 head -> multiview, preserves all DiT weights,
+    and applies the same strict frozen dependency identity checks as normal load.
+    The returned expert stays frozen until train_stage_a() is requested.
+    """
+    if observation_mode is not None and observation_mode not in OBSERVATION_MODES:
+        raise ValueError(f'unsupported observation_mode: {observation_mode}')
     with safe_open(str(checkpoint),framework='pt',device='cpu') as file:
         raw=(file.metadata() or {}).get('patch_goal_bundle')
         if raw is None: raise ValueError('missing patch goal bundle metadata')
         meta=json.loads(raw)
-        if meta.get('format')!=FORMAT: raise ValueError('unsupported patch goal format')
+        if meta.get('format') not in (FORMAT, MULTIVIEW_FORMAT):
+            raise ValueError('unsupported patch goal format')
+        saved_mode = 'head' if meta['format'] == FORMAT else 'multiview'
+        if meta.get('observation_mode', 'head') != saved_mode:
+            raise ValueError('patch bundle format/observation mode mismatch')
+        if saved_mode == 'multiview' or 'observation' in meta:
+            expected = json.loads(json.dumps(observation_metadata(saved_mode)))
+            if meta.get('observation') != expected:
+                raise ValueError('incompatible patch observation contract')
+        requested_mode = saved_mode if observation_mode is None else observation_mode
+        if warm_start:
+            if saved_mode != 'head' or requested_mode != 'multiview':
+                raise ValueError('warm_start requires explicit v1 head -> multiview mode')
+        elif requested_mode != saved_mode:
+            raise ValueError('observation mode mismatch; v1 -> multiview requires explicit warm_start=True')
         dep=meta['dependencies']
         if getattr(text_encoder,'dim',text_dim)!=dep['text_dim']: raise ValueError('incompatible text dimension')
         actual=text_identity(text_encoder,tokenizer) if text_encoder is not None else precomputed_identity(precomputed_text_fingerprint)
@@ -62,9 +91,15 @@ def load_patch_bundle(checkpoint, *, vae, text_encoder=None,tokenizer=None,text_
         if module_identity(vae)!=dep['vae']: raise ValueError('incompatible VAE dependency')
         if json.loads(json.dumps(GoalCodec(vae).metadata()))!=meta['codec']: raise ValueError('incompatible codec')
         expert=PatchGoalExpert(WanModel(**meta['dit_config']),GoalCodec(vae),dit_config=meta['dit_config'],
-            shift=meta['shift'],lambda_image=meta['lambda_image'],lambda_tcp=meta['lambda_tcp'])
+            shift=meta['shift'],lambda_image=meta['lambda_image'],lambda_tcp=meta['lambda_tcp'],
+            observation_mode=requested_mode)
         expert.load_state_dict({k:file.get_tensor(k) for k in file.keys()},strict=True)
     expert.to(device=device,dtype=dtype).freeze(); expert.bundle_metadata=meta
+    if warm_start:
+        expert.initialization_metadata = dict(source_format=meta['format'], source_mode=saved_mode,
+                                              observation_mode=requested_mode, trained_multiview=False)
+    elif 'initialization' in meta:
+        expert.initialization_metadata = dict(meta['initialization'])
     for module in (vae,text_encoder):
         if isinstance(module,torch.nn.Module):
             for tensor in list(module.parameters())+list(module.buffers()):
@@ -107,7 +142,7 @@ def evaluate_patch(expert,batches,output_dir,*,step=0,seed=42,num_steps=20):
     cards=[]; metrics={}; aggregate=[[],[]]; maes=[]
     for index,b in enumerate(batches):
         if b['observed'].shape[0]!=1: raise ValueError('one case per batch required')
-        prediction=expert.generate(b['observed'],b['context'],seed=seed+index,num_steps=num_steps,context_lens=b.get('context_lens'))
+        prediction=expert.generate(b['observed'],b['context'],seed=seed+index,num_steps=num_steps,context_lens=b.get('context_lens'),observed_view_valid=b.get('observed_view_valid'))
         decoded=expert.codec.decode(prediction.latent)
         if not torch.isfinite(decoded).all(): raise FloatingPointError('nonfinite generated image')
         uv=prediction.uv.float(); target=b['targets']; valid=point_mask(target)[0].cpu().tolist()
@@ -123,6 +158,8 @@ def evaluate_patch(expert,batches,output_dir,*,step=0,seed=42,num_steps=20):
         overlay_goal_targets(goal,gt_px,valid).save(output_dir/f'{name}_target_points.png')
         mae=float(np.abs(np.asarray(image,dtype=np.float32)-np.asarray(goal,dtype=np.float32)).mean()); maes.append(mae)
         cards.append(dict(id=name,source=b['sources'][0],target_point_valid=valid,
+            observed_shape=list(b['observed'].shape),
+            observed_view_valid=b['observed_view_valid'].detach().cpu().tolist() if 'observed_view_valid' in b else None,
             target_uv_px=[p if v else None for p,v in zip(gt_px,valid)],predicted_uv_px=pred_px,
             predicted_in_frame=[bool(0<=x<=319 and 0<=y<=255) for x,y in pred_px],image_mae_uint8=mae,
             family=b.get('family',b['sources'][0]),granularity=b.get('granularity','task'),instruction=b.get('instruction',''),
@@ -198,7 +235,7 @@ def train_patch(expert,*,batches,records,output_dir,steps=5000,eval_every=500,sa
         for step in range(1,steps+1):
             _seed(seed+step);expert.train_stage_a();optimizer.zero_grad()
             index=schedule[step-1] if schedule is not None else (step-1)%len(batches);b=batches[index]; tick=time.monotonic()
-            out=expert(b['observed'],b['context'],b['targets'],context_lens=b.get('context_lens'))
+            out=expert(b['observed'],b['context'],b['targets'],context_lens=b.get('context_lens'),observed_view_valid=b.get('observed_view_valid'))
             if not torch.isfinite(out['loss']):raise FloatingPointError('nonfinite training loss')
             out['loss'].backward()
             norm=torch.nn.utils.clip_grad_norm_(expert.parameters(),1.,error_if_nonfinite=True,foreach=False)
@@ -222,11 +259,19 @@ def train_patch(expert,*,batches,records,output_dir,steps=5000,eval_every=500,sa
     return summary
 
 
-def make_smoke_data(device='cpu'):
+def make_smoke_data(device='cpu',*,observation_mode='head'):
     from openwam.train.goal_trainer import TINY_DIT_CONFIG,_DiagnosticVAE,synthetic_smoke_batch
     _seed(42)
-    expert=PatchGoalExpert(WanModel(**TINY_DIT_CONFIG),GoalCodec(_DiagnosticVAE()),dit_config=TINY_DIT_CONFIG).to(device)
+    expert=PatchGoalExpert(WanModel(**TINY_DIT_CONFIG),GoalCodec(_DiagnosticVAE()),dit_config=TINY_DIT_CONFIG,
+                           observation_mode=observation_mode).to(device)
     obs,ctx,target=synthetic_smoke_batch(device)
     record=dict(family='synthetic',source_repo='synthetic',source_episode=0,source_episode_length=2,
         anchor_source_frame=0,goal_source_frame=1,clip_start=0,clip_end_exclusive=2,instruction='synthetic smoke',provenance={})
-    return expert,[dict(observed=obs,context=ctx,targets=target,sources=['synthetic'])],[record]
+    batch=dict(observed=obs,context=ctx,targets=target,sources=['synthetic'])
+    if observation_mode=='multiview':
+        from openwam.model.goal.observation import sanitize_canvas
+        mask=torch.tensor([[True,True,False]],device=device)
+        batch['observed']=sanitize_canvas(torch.cat((obs,obs[:,:,:,:128]),dim=3),mask)
+        batch['observed_view_valid']=mask
+        record.update(observation_mode=observation_mode,view_valid=mask[0].cpu().tolist())
+    return expert,[batch],[record]

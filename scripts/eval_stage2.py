@@ -55,8 +55,10 @@ def main(argv=None):
     else:steps=sorted(set(args.steps))
     cases=build_fixed_cases(config,output);architecture=None
     seed=int(config.project.seed);num_steps=int(OmegaConf.select(config,'evaluation.num_steps',default=20))
+    from openwam.model.goal.runtime import goal_observation_mode
+    observation_mode=goal_observation_mode(OmegaConf.to_container(config.goal,resolve=True))
     for step in steps:
-        if completed_evaluation(output,cases,step=step,seed=seed,num_steps=num_steps):continue
+        if completed_evaluation(output,cases,step=step,seed=seed,num_steps=num_steps,observation_mode=observation_mode):continue
         weights=run/f'checkpoint_step_{step}.safetensors'
         if not weights.is_file():raise FileNotFoundError(f'exact saved checkpoint required: {weights}')
         if architecture is None:

@@ -23,23 +23,28 @@ def clean(value):
 def write(path,value):path.write_text(json.dumps(value,ensure_ascii=False,indent=2,default=clean)+'\n')
 
 
-def export_sample(dataset,repo,episode,m,option,anchor,level,folder):
+def export_sample(dataset,repo,episode,m,option,anchor,level,folder,*,observation_mode='head'):
     from PIL import Image
     folder.mkdir(parents=True,exist_ok=True)
     sample=dataset._sample_selected(repo,episode,m,option,anchor,level)
     views,_=dataset._decode_views(m,[anchor]);head=views[0].get(m['profile']['cameras'][0])
     if head is not None:head.save(folder/'source_observed.png')
-    if sample['goal_observed_head'] is not None:
-        rgb=sample['goal_observed_head'][:,0].permute(1,2,0).add(1).mul(127.5).clamp(0,255).byte().numpy()
+    observed=sample['goal_observed_multiview'] if observation_mode=='multiview' else sample['goal_observed_head']
+    if observed is not None:
+        rgb=observed[:,0].permute(1,2,0).add(1).mul(127.5).clamp(0,255).byte().numpy()
         Image.fromarray(rgb).save(folder/'goal_input.png')
     for i,image in enumerate(sample['video']):image.save(folder/f'canvas_{i:02d}.png')
-    np.savez_compressed(folder/'supervision.npz',action=sample['action'].numpy(),action_mask=sample['action_mask'].numpy(),
+    goal_tensors=({'goal_observed_multiview':observed.numpy(),'goal_view_valid':sample['goal_view_valid'].numpy()}
+                  if observation_mode=='multiview' else {})
+    np.savez_compressed(folder/'supervision.npz',**goal_tensors,action=sample['action'].numpy(),action_mask=sample['action_mask'].numpy(),
         proprio=sample['proprio'].numpy(),proprio_mask=sample['proprio_mask'].numpy(),video_mask=sample['video_mask'].numpy(),
         video_view_mask=sample['video_view_mask'].numpy(),raw_action=sample['trace']['raw_action'],raw_state=sample['trace']['raw_state'])
     report={k:sample[k] for k in ('trace','report_target','granularity','prompt','goal_seed','goal_head_valid')}
+    report['goal_observation_mode']=observation_mode
+    if observation_mode=='multiview':report['goal_view_valid']=sample['goal_view_valid'].tolist()
     report['fk_supervision']=sample.get('fk_supervision');report['augmentation']=sample.get('_observation_augmentation')
     import hashlib
-    report['preprocessing']=dict(goal=dict(dtype='float32',range=[-1,1],shape=[3,1,256,320]),
+    report['preprocessing']=dict(goal=dict(dtype='float32',range=[-1,1],shape=[3,1,384 if observation_mode=='multiview' else 256,320]),
         canvas=dict(dtype='PIL uint8 RGB',range=[0,255],shape=[9,384,320,3],resize='bilinear stretch per view'),
         action=dict(dtype='float32',shape=[32,112],normalization='native profile quantile; gripper physical clip[0,1]'))
     report['source_code_sha256']={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest()
@@ -78,6 +83,8 @@ def main():
     parser.add_argument('--skip-video-export',action='store_true',help='Report bounded native-array/statistics audit without video claims')
     args=parser.parse_args();output=Path(args.output_dir);output.mkdir(parents=True,exist_ok=True)
     full_config=load_config(args.config)
+    from openwam.model.goal.runtime import goal_observation_mode
+    observation_mode=goal_observation_mode(full_config.get('goal',{}))
     config=full_config.get('dataloader',full_config)
     config=dict(config)
     if args.scope_only or args.prepare_stats:config['metadata_only']=True
@@ -107,7 +114,7 @@ def main():
                     for level in ('task','subtask'):
                         if level in found or not dataset._options(m,ranges,level):continue
                         option,anchor,_=dataset._choose(m,ranges,np.random.default_rng(dataset.seed),level)
-                        exports.append(export_sample(dataset,repo,episode,m,option,anchor,level,output/f'{number:03d}_{repo["family"]}_{level}'));found.add(level)
+                        exports.append(export_sample(dataset,repo,episode,m,option,anchor,level,output/f'{number:03d}_{repo["family"]}_{level}',observation_mode=observation_mode));found.add(level)
                 except Exception as exc:failures.append(dict(repo=name,episode=episode,error=f'{type(exc).__name__}: {exc}'))
                 if len(found)==2:break
             if len(found)==2 or attempts>=args.max_export_episodes_per_profile:break

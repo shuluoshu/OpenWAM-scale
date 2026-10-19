@@ -104,16 +104,41 @@ def preserve_evaluation_state(architecture):
         if cuda is not None: torch.cuda.set_rng_state_all(cuda)
 
 
-def generation_conditions(sample, *, seed, num_steps):
+def generation_conditions(sample, *, seed, num_steps, observation_mode='head', observation_dtype=None):
     """An explicit allowlist: no future mask, target, interval or geometry is read."""
     active = torch.as_tensor(sample['_eval']['active_action_mask'], dtype=torch.bool)
-    head = sample['goal_observed_head']
-    return dict(first_frame_image=sample['first_frame_image'], num_frames=9, action_num_frames=33,
+    head = sample.get('goal_observed_head') if observation_mode=='head' else None
+    result = dict(first_frame_image=sample['first_frame_image'], num_frames=9, action_num_frames=33,
         height=384, width=320, seed=int(seed), num_inference_steps=int(num_steps),
         proprio=sample['proprio'].unsqueeze(0),
         _proprio_sample_mask=sample['proprio_mask'].unsqueeze(0), active_action_mask=active,
         goal_observed_head=None if head is None else head.unsqueeze(0),
         goal_head_valid=bool(sample['goal_head_valid']), goal_seed=int(sample['goal_seed']), decode_video=True)
+    if observation_mode == 'multiview':
+        observed, valid = _clean_multiview_condition(sample)
+        if observation_dtype is not None:observed=observed.to(dtype=observation_dtype)
+        result.update(goal_observed_head=None,goal_observed_multiview=observed.unsqueeze(0),
+                      goal_view_valid=valid.unsqueeze(0))
+    elif observation_mode != 'head':
+        raise ValueError('unsupported goal observation mode')
+    return result
+
+
+def _clean_multiview_condition(sample):
+    from openwam.model.goal.observation import sanitize_canvas
+    if sample.get('goal_view_valid') is None or sample.get('goal_observed_multiview') is None:
+        raise ValueError('multiview evaluation requires explicit clean canvas and view mask')
+    valid=torch.as_tensor(sample['goal_view_valid'])
+    observed=sample['goal_observed_multiview']
+    if valid.dtype != torch.bool or valid.shape != (3,):
+        raise ValueError('evaluation goal_view_valid must be bool [3]')
+    if bool(valid[0]) != bool(sample['goal_head_valid']):
+        raise ValueError('evaluation view mask disagrees with head_valid')
+    if not isinstance(observed,torch.Tensor) or tuple(observed.shape)!=(3,1,384,320):
+        raise ValueError('evaluation clean canvas must be [3,1,384,320]')
+    # Missing-head rows never invoke the expert and have wholly invalid memory.
+    clean=sanitize_canvas(observed.unsqueeze(0),valid.unsqueeze(0))[0] if valid[0] else torch.full_like(observed,-1.)
+    return clean, valid
 
 
 def _conditions_sha(sample, kwargs):
@@ -122,11 +147,16 @@ def _conditions_sha(sample, kwargs):
     for key in ('proprio','_proprio_sample_mask','active_action_mask','goal_observed_head'):
         value=kwargs[key]
         if value is not None: digest.update(np.ascontiguousarray(_array(value)).tobytes())
+    if 'goal_observed_multiview' in kwargs:
+        from openwam.model.goal.runtime import MULTIVIEW_PREPROCESSING_VERSION
+        digest.update(_json(['multiview',MULTIVIEW_PREPROCESSING_VERSION,str(kwargs['goal_observed_multiview'].dtype)]).encode())
+        for key in ('goal_observed_multiview','goal_view_valid'):
+            digest.update(np.ascontiguousarray(_array(kwargs[key])).tobytes())
     for image in kwargs['first_frame_image']: digest.update(image.tobytes())
     return digest.hexdigest()
 
 
-def _validate_sample(sample):
+def _validate_sample(sample, *, observation_mode='head'):
     if not isinstance(sample['prompt'], str) or not sample['prompt']: raise ValueError('empty fixed prompt')
     for key, shape in [('action',(32,112)),('action_mask',(32,112)),('proprio',(1,112)),('proprio_mask',(1,112)),
                        ('video_mask',(9,)),('video_view_mask',(9,3))]:
@@ -137,8 +167,9 @@ def _validate_sample(sample):
         raise ValueError('observed canvas shape mismatch')
     if _array(sample['_eval']['active_action_mask']).shape!=(112,): raise ValueError('structural support must be width112')
     if not np.isfinite(_array(sample['proprio'])).all(): raise ValueError('nonfinite observed proprio')
-    head=sample['goal_observed_head']
-    if head is not None and (tuple(head.shape)!=(3,1,256,320) or not torch.isfinite(head).all()):
+    if observation_mode == 'multiview':_clean_multiview_condition(sample)
+    head=sample.get('goal_observed_head')
+    if observation_mode == 'head' and head is not None and (tuple(head.shape)!=(3,1,256,320) or not torch.isfinite(head).all()):
         raise ValueError('invalid clean observed goal head')
     if not np.isfinite(_array(sample['action'])[_array(sample['action_mask']).astype(bool)]).all():
         raise ValueError('nonfinite valid action target')
@@ -311,12 +342,20 @@ def _asset_hashes(folder):
     return {p.relative_to(folder).as_posix():_sha(p) for p in sorted(folder.rglob('*')) if p.is_file() and p.name!='manifest.json'}
 
 
-def _fixed_assets(sample, folder):
+def _fixed_assets(sample, folder, *, observation_mode='head', actual_goal_inputs=None):
     """Input/GT snapshot is written once; later steps must have identical source bytes."""
     folder.mkdir(parents=True,exist_ok=True)
-    head=sample['goal_observed_head']
+    head=sample.get('goal_observed_head')
     images={'observation.png':sample['first_frame_image'][0]}
-    if head is not None:images['goal_input.png']=_pil_goal(head.unsqueeze(0))
+    observed=None; valid=None
+    if observation_mode=='multiview':
+        observed,valid=_clean_multiview_condition(sample)
+        if actual_goal_inputs is not None:
+            observed=actual_goal_inputs['goal_observed_multiview'][0]
+            valid=actual_goal_inputs['goal_view_valid'][0]
+        pixels=_array(observed)[:,0].transpose(1,2,0)
+        images['goal_input.png']=Image.fromarray(np.clip((pixels+1)*127.5,0,255).astype(np.uint8))
+    elif head is not None:images['goal_input.png']=_pil_goal(head.unsqueeze(0))
     if sample['_eval'].get('report_goal') is not None: images['goal_gt.png']=sample['_eval']['report_goal']
     identity=hashlib.sha256()
     for name,image in sorted(images.items()):identity.update(name.encode()+image.tobytes())
@@ -324,6 +363,8 @@ def _fixed_assets(sample, folder):
     for key in ('action','action_mask','video_mask','video_view_mask','proprio','proprio_mask'):identity.update(_array(sample[key]).tobytes())
     trace_identity={k:v for k,v in sample['trace'].items() if k!='stats_registry'}
     identity.update(_json([trace_identity,sample['report_target'],sample['prompt'],sample['goal_seed']]).encode())
+    if observation_mode=='multiview':
+        identity.update(b'multiview'+str(observed.dtype).encode()+_array(observed).tobytes()+_array(valid).tobytes())
     signature=identity.hexdigest();manifest=folder/'manifest.json'
     if manifest.exists():
         saved=json.loads(manifest.read_text())
@@ -335,10 +376,19 @@ def _fixed_assets(sample, folder):
     for name,image in images.items():image.save(folder/name)
     for i,image in enumerate(sample['video']):image.save(folder/f'video_gt_{i:02d}.png')
     tensors={key:_array(sample[key]) for key in ('action','action_mask','video_mask','video_view_mask','proprio','proprio_mask')}
-    if head is not None:tensors['goal_observed_head']=_array(head)
+    if observation_mode=='multiview':
+        tensors['goal_observed_multiview']=_array(observed)
+        if observed.dtype==torch.bfloat16:
+            tensors['goal_observed_multiview_bfloat16_bits']=observed.detach().cpu().contiguous().view(torch.uint16).numpy()
+        tensors['goal_view_valid']=_array(valid)
+        from openwam.model.goal.observation import observation_token_mask
+        tensors['goal_observation_token_valid']=(_array(observation_token_mask(valid[None])[0]) if valid[0] else np.zeros(120,bool))
+    elif head is not None:tensors['goal_observed_head']=_array(head)
     tensors['active_action_mask']=_array(sample['_eval']['active_action_mask'])
     np.savez_compressed(folder/'supervision.npz',**tensors)
-    _write_json(folder/'trace.json',dict(trace=sample['trace'],report_target=sample['report_target'],prompt=sample['prompt'],goal_seed=sample['goal_seed']))
+    trace=dict(trace=sample['trace'],report_target=sample['report_target'],prompt=sample['prompt'],goal_seed=sample['goal_seed'])
+    if observation_mode=='multiview':trace.update(goal_observation_mode=observation_mode,goal_view_valid=_array(valid).tolist(),goal_input_shape=list(observed.shape),goal_input_dtype=str(observed.dtype))
+    _write_json(folder/'trace.json',trace)
     _write_json(manifest,dict(schema=SCHEMA,identity=signature,assets=_asset_hashes(folder)))
 
 
@@ -403,7 +453,7 @@ def _step_html(folder, report):
     for case in report['cases']:
         name=case['name'];fixed=f'../fixed_inputs/{name}'
         body+=f'<section><h2>{html.escape(case["family"])} / {html.escape(case["granularity"])}</h2><p>{html.escape(case["prompt"])}</p><div class="inputs">'
-        for file,label in [(f'{fixed}/goal_input.png','Actual Stage1 clean head'),(f'{fixed}/observation.png','Stage2 observed canvas'),(f'{fixed}/goal_gt.png','GT instruction endpoint'),(f'{name}/goal_uv.png','Predicted goal + UV')]:
+        for file,label in [(f'{fixed}/goal_input.png','Actual Stage1 clean '+report.get('goal_observation_mode','head')),(f'{fixed}/observation.png','Stage2 observed canvas'),(f'{fixed}/goal_gt.png','GT instruction endpoint'),(f'{name}/goal_uv.png','Predicted goal + UV')]:
             if (folder/file).exists():body+=f'<figure><figcaption>{label}</figcaption><img src="{file}"></figure>'
             else:body+=f'<figure>{label}: unavailable</figure>'
         body+='</div><p>Endpoint: '+html.escape(str(case['report_target'].get('goal_source_frame')))+'; '+html.escape(case['goal_visibility'])+'</p>'+_metric_table(case['metrics'])
@@ -457,6 +507,7 @@ def evaluate_stage2(architecture,cases,output_dir,*,step,seed,num_steps=20):
     """
     root=Path(output_dir);final=root/f'eval_step_{int(step):06d}';rank=_rank()
     if not _distributed() and final.exists():raise FileExistsError(final)
+    observation_mode=getattr(architecture.goal_expert,'observation_mode','head')
     error=None
     try:
         if int(step)<0 or int(num_steps)<1 or len(cases)<1:raise ValueError('nonnegative step, positive denoise steps and nonempty cases required')
@@ -464,7 +515,7 @@ def evaluate_stage2(architecture,cases,output_dir,*,step,seed,num_steps=20):
     except Exception as exc:error=f'{type(exc).__name__}: {exc}'
     _agree_error(error,'setup')
     descriptors=getattr(cases,'descriptors',None)
-    _same(_json(dict(count=len(cases),descriptors=descriptors,step=int(step),seed=int(seed),num_steps=int(num_steps))))
+    _same(_json(dict(count=len(cases),descriptors=descriptors,step=int(step),seed=int(seed),num_steps=int(num_steps),goal_observation_mode=observation_mode)))
     work=root/f'.eval_step_{int(step):06d}-{uuid.uuid4().hex}' if rank==0 else None
     rows=[];error=None
     if rank==0:
@@ -477,8 +528,9 @@ def evaluate_stage2(architecture,cases,output_dir,*,step,seed,num_steps=20):
         for index in range(len(cases)):
             sample=None;kwargs=None;error=None
             try:
-                sample=cases[index];_validate_sample(sample)
-                kwargs=generation_conditions(sample,seed=int(seed)+index,num_steps=num_steps)
+                sample=cases[index];_validate_sample(sample,observation_mode=observation_mode)
+                kwargs=generation_conditions(sample,seed=int(seed)+index,num_steps=num_steps,observation_mode=observation_mode,
+                    observation_dtype=getattr(architecture,'dtype',None))
             except Exception as exc:error=f'{type(exc).__name__}: {exc}'
             _agree_error(error,f'case {index} validation')
             condition_sha=_conditions_sha(sample,kwargs);_same(condition_sha)
@@ -503,10 +555,14 @@ def evaluate_stage2(architecture,cases,output_dir,*,step,seed,num_steps=20):
                     diagnostics=architecture.goal_diagnostics
                     goal_image=_pil_goal(architecture.goal_expert.codec.decode(diagnostics['predicted_latent']))
                     metrics=prediction_metrics(result,diagnostics,goal_image,sample)
-                    name=f'case_{index:03d}';_fixed_assets(sample,root/'fixed_inputs'/name)
+                    name=f'case_{index:03d}';_fixed_assets(sample,root/'fixed_inputs'/name,observation_mode=observation_mode,actual_goal_inputs=kwargs)
                     _case_assets(work/name,result,diagnostics,goal_image,sample)
                     rows.append(dict(name=name,family=sample['_eval']['family'],granularity=sample['granularity'],
                         prompt=sample['prompt'],goal_seed=int(sample['goal_seed']),generation_seed=int(seed)+index,
+                        goal_observation_mode=observation_mode,
+                        goal_view_valid=(_array(kwargs['goal_view_valid'])[0].tolist() if observation_mode=='multiview' else None),
+                        goal_input_dtype=(str(kwargs['goal_observed_multiview'].dtype) if observation_mode=='multiview' else None),
+                        goal_input_shape=(list(kwargs['goal_observed_multiview'].shape) if observation_mode=='multiview' else [1,3,1,256,320]),
                         condition_sha256=condition_sha,report_target=sample['report_target'],
                         valid_supervision=dict(action_elements=int(_array(sample['action_mask']).sum()),
                             future_frames=int(_array(sample['video_mask'])[1:].sum()),future_views=int((_array(sample['video_view_mask'])[1:]&_array(sample['video_mask'])[1:,None]).sum())),
@@ -519,7 +575,7 @@ def evaluate_stage2(architecture,cases,output_dir,*,step,seed,num_steps=20):
             try:
                 coverage=getattr(cases,'coverage',dict(mode='explicit supplied cases',selected_cases=len(cases)))
                 report=dict(schema=SCHEMA,step=int(step),seed=int(seed),num_steps=int(num_steps),coverage=coverage,sample_count=len(rows),
-                    metric_rank_policy='rank0 authoritative; same cases generated on all ranks',cases=rows,aggregate=_aggregate(rows))
+                    goal_observation_mode=observation_mode,metric_rank_policy='rank0 authoritative; same cases generated on all ranks',cases=rows,aggregate=_aggregate(rows))
                 report['by_family_granularity']={f'{family}/{level}':_aggregate([r for r in rows if r['family']==family and r['granularity']==level])
                     for family,level in sorted({(r['family'],r['granularity']) for r in rows})}
                 _write_json(work/'metrics.json',report);_step_html(work,report)
@@ -533,7 +589,7 @@ def evaluate_stage2(architecture,cases,output_dir,*,step,seed,num_steps=20):
     return final/'index.html'
 
 
-def completed_evaluation(run_dir, cases, *, step, seed, num_steps):
+def completed_evaluation(run_dir, cases, *, step, seed, num_steps, observation_mode='head'):
     """Resume may reuse only a verified, matching published step, never overwrite it."""
     root=Path(run_dir);folder=root/f'eval_step_{int(step):06d}'
     if not folder.exists():return False
@@ -547,6 +603,8 @@ def completed_evaluation(run_dir, cases, *, step, seed, num_steps):
         if not path.resolve().is_relative_to(folder.resolve()) or not path.is_file() or _sha(path)!=digest:
             raise ValueError('corrupt published evaluation asset')
     report=json.loads((folder/'metrics.json').read_text())
+    if report.get('goal_observation_mode','head')!=observation_mode:
+        raise ValueError('published evaluation goal observation mode mismatch')
     expected=dict(step=int(step),seed=int(seed),num_steps=int(num_steps))
     if any(report.get(k)!=v for k,v in expected.items()) or len(report['cases'])!=len(cases):
         raise ValueError('published evaluation step/seed/case budget mismatch')

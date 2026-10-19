@@ -1,0 +1,6 @@
+# New run only: current three-view observation, head-only image/TCP goal.
+base_config: stage1_joint_sample.yaml
+observation_mode: multiview
+dataset:
+  observation_mode: multiview
+  cache_dir: outputs/stage1_multiview_sample/cache

@@ -34,6 +34,10 @@ def load_config(path, *, source_yaml=None, data_root=None):
             config=OmegaConf.merge(read(filename.parent/base,seen|{filename}),config)
         return config
     config=OmegaConf.to_container(read(path,set()),resolve=True)
+    from openwam.model.goal.observation import OBSERVATION_MODES
+    mode=config.get('observation_mode','head')
+    if mode not in OBSERVATION_MODES or config.get('dataset',{}).get('observation_mode','head')!=mode:
+        raise ValueError('Stage1 observation_mode must agree with dataset.observation_mode')
     if source_yaml is not None:config.setdefault('dataset',{})['source_yaml']=str(source_yaml)
     if data_root is not None:config.setdefault('dataset',{})['data_root']=str(data_root)
     for section,keys in ((config,('baseline_checkpoint',)),(config.get('dataset',{}),('source_yaml','cache_dir','data_root'))):
@@ -46,6 +50,44 @@ def load_config(path, *, source_yaml=None, data_root=None):
         value=Path(os.path.expandvars(os.path.expanduser(token['name'])))
         token['name']=str(value if value.is_absolute() else ROOT/value)
     return config
+
+
+def initialize_goal_checkpoint(checkpoint,*,vae,dit_config,observation_mode,
+                               text_encoder=None,tokenizer=None,text_dim=None,
+                               precomputed_text_fingerprint=None,device='cpu',dtype=torch.float32,
+                               use_gradient_checkpointing=True,shift=None,lambda_image=None,lambda_tcp=None):
+    """Checked v1 -> multiview initialization with fresh optimizer and flow settings.
+
+    Omitted flow settings retain the source bundle values. Overrides rebuild the
+    validated scheduler through PatchGoalExpert without copying the loaded DiT.
+    """
+    from safetensors import safe_open
+    from openwam.train.goal_patch import load_patch_bundle
+    from openwam.model.goal.patch_expert import PatchGoalExpert
+    if observation_mode!='multiview':
+        raise ValueError('--init-goal-checkpoint requires observation_mode=multiview')
+    with safe_open(str(checkpoint),framework='pt',device='cpu') as file:
+        meta=json.loads((file.metadata() or {}).get('patch_goal_bundle','{}'))
+    if meta.get('dit_config')!=json.loads(json.dumps(dit_config)):
+        raise ValueError('initialization checkpoint architecture differs from configured baseline')
+    expert=load_patch_bundle(checkpoint,vae=vae,text_encoder=text_encoder,tokenizer=tokenizer,text_dim=text_dim,
+        precomputed_text_fingerprint=precomputed_text_fingerprint,device=device,dtype=dtype,
+        observation_mode=observation_mode,warm_start=True)
+    loaded=expert
+    expert=PatchGoalExpert(loaded.dit,loaded.codec,dit_config=loaded.dit_config,
+        observation_mode=loaded.observation_mode,
+        shift=loaded.shift if shift is None else shift,
+        lambda_image=loaded.lambda_image if lambda_image is None else lambda_image,
+        lambda_tcp=loaded.lambda_tcp if lambda_tcp is None else lambda_tcp,
+        use_gradient_checkpointing=use_gradient_checkpointing).freeze()
+    expert.bundle_metadata=loaded.bundle_metadata
+    expert.initialization_metadata=loaded.initialization_metadata
+    digest=hashlib.sha256()
+    with Path(checkpoint).open('rb') as stream:
+        for block in iter(lambda:stream.read(1024*1024),b''):digest.update(block)
+    expert.initialization_metadata.update(source_checkpoint=str(Path(checkpoint).resolve()),
+        source_checkpoint_sha256=digest.hexdigest(),optimizer='fresh FP32-master AdamW')
+    return expert
 
 
 def require_single_process():
@@ -75,6 +117,8 @@ def prepare_batch(record,batch,*,device,dtype,context_cache=None):
     """Copy metadata and transfer this singleton only; retain FP32 UV precision."""
     result=dict(batch)
     result['observed']=batch['observed'].to(device=device,dtype=dtype)
+    if 'observed_view_valid' in batch:
+        result['observed_view_valid']=batch['observed_view_valid'].to(device=device)
     target=batch['targets'].to(device=device)
     result['targets']=replace(target,image=target.image.to(dtype=dtype))
     if context_cache is not None:
@@ -117,10 +161,18 @@ def preflight(dataset,output_dir):
     summary=dict(mode='curated_preflight',model_loaded=False,scope=dataset.scope_summary(),
                  cases=len(cards),evaluation_split='train',success_verified=False)
     _write_json(output/'summary.json',summary)
-    body=''.join('<article><h2>'+html.escape(str(c['family']))+' · '+html.escape(c.get('granularity','task'))+
-        '</h2><p>'+html.escape(c['instruction'])+'</p><img src="inputs/'+c['id']+'_observed.png">'+
-        '<img src="inputs/'+c['id']+'_target_points.png"><pre>'+html.escape(json.dumps(c,ensure_ascii=False,indent=2))+'</pre></article>' for c in cards)
-    (output/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>Curated preflight</title><h1>Actual model inputs and weak image/TCP targets</h1><p>CPU data audit; no model weights loaded. Labels are weak and success is not verified. Left/right GT red/blue; invalid points masked. Evaluation cases are bounded training examples.</p><pre>'+html.escape(json.dumps(summary,ensure_ascii=False,indent=2))+'</pre>'+body)
+    from openwam.train.goal_overfit import input_report_labels
+    articles=[]
+    for card in cards:
+        observed_label,target_label,note=input_report_labels(card)
+        name=card['id']
+        articles.append('<article><h2>'+html.escape(str(card['family']))+' · '+html.escape(card.get('granularity','task'))+
+            '</h2><p>'+html.escape(card['instruction'])+'</p>'+note+
+            '<div class="images"><figure><figcaption>'+observed_label+'</figcaption><img src="inputs/'+name+'_observed.png"></figure>'+
+            '<figure><figcaption>'+target_label+'</figcaption><img src="inputs/'+name+'_target_points.png"></figure></div>'+
+            '<a href="inputs/'+name+'.npz">Exact input tensors and masks (NPZ)</a><details><summary>Source and same-anchor provenance</summary><pre>'+html.escape(json.dumps(card,ensure_ascii=False,indent=2))+'</pre></details></article>')
+    body='<style>body{font:16px system-ui;margin:24px}.images{display:flex;gap:16px;align-items:flex-start}figure{margin:0}img{width:320px;height:auto}pre{white-space:pre-wrap}</style>'+''.join(articles)
+    (output/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>Curated preflight</title><h1>Actual model inputs and weak image/TCP targets</h1><a href="inputs/index.html">Exact inputs, view masks and NPZ</a><p>CPU data audit; no model weights loaded. Labels are weak and success is not verified. Left/right GT red/blue; invalid points masked. Evaluation cases are bounded training examples.</p><pre>'+html.escape(json.dumps(summary,ensure_ascii=False,indent=2))+'</pre>'+body)
     return summary
 
 
@@ -145,6 +197,7 @@ def train_curated(expert,*,dataset,context_cache,output_dir,steps=5000,eval_ever
     _seed(seed)
     summary=dict(**(training_metadata or {}))
     summary.update(mode='stage1_joint_curated_streaming',status='running',steps=steps,completed_steps=0,
+        observation_mode=expert.observation_mode,initialization=getattr(expert,'initialization_metadata',None),
         eval_every=eval_every,sampling_steps=sampling_steps,seed=seed,learning_rate=learning_rate,
         evaluations=[],scope=dataset.scope_summary(),evaluation_split='train',formal_generalization=False,
         success_verified=False,optimizer='FP32-master AdamW',single_process=True,
@@ -163,7 +216,7 @@ def train_curated(expert,*,dataset,context_cache,output_dir,steps=5000,eval_ever
             timeline=output/'timeline.html'
             timeline.write_text(timeline.read_text().replace('href="../index.html"','href="index.html"').replace('href="../g1_concept_and_plan.html"','href="method.html"'))
     (output/'method.html').write_text('<!doctype html><meta charset="utf-8"><h1>Stage A joint flow</h1><p>Clean observation and instruction condition shared Wan blocks. Terminal image and ordered TCP patch receive independent Gaussian noise and share sigma. TCP coordinates repeat 48 times; group means decode continuous UV without clamping. Both task/subtask supervision is weak. Frozen text uses a bounded CPU LRU. Single-process only; checkpoint reload/resume training is not implemented.</p>')
-    (output/'index.html').write_text('<!doctype html><meta charset="utf-8"><h1>Curated Stage A diagnostics</h1><a href="timeline.html">All evaluation steps</a> · <a href="inputs/manifest.json">Input provenance</a> · <a href="summary.json">Scope/config</a> · <a href="method.html">Method</a><p>Fixed bounded training examples; no held-out performance or task-success claim.</p>')
+    (output/'index.html').write_text('<!doctype html><meta charset="utf-8"><h1>Curated Stage A diagnostics</h1><a href="timeline.html">All evaluation steps</a> · <a href="inputs/index.html">Actual inputs and view masks</a> · <a href="inputs/manifest.json">Input provenance</a> · <a href="summary.json">Scope/config</a> · <a href="method.html">Method</a><p>Fixed bounded training examples; no held-out performance or task-success claim.</p>')
     def evaluate(step):
         event('evaluation_started',step=step)
         directory=f'eval_step_{step:06d}'
@@ -181,7 +234,8 @@ def train_curated(expert,*,dataset,context_cache,output_dir,steps=5000,eval_ever
             _seed(seed+step);expert.train_stage_a();optimizer.zero_grad()
             record,cpu_batch=dataset.sample(step-1)
             batch=prepare_batch(record,cpu_batch,device=device,dtype=dtype,context_cache=context_cache)
-            out=expert(batch['observed'],batch['context'],batch['targets'],context_lens=batch.get('context_lens'))
+            out=expert(batch['observed'],batch['context'],batch['targets'],context_lens=batch.get('context_lens'),
+                       observed_view_valid=batch.get('observed_view_valid'))
             if not torch.isfinite(out['loss']):raise FloatingPointError('nonfinite training loss')
             out['loss'].backward()
             norm=torch.nn.utils.clip_grad_norm_(expert.parameters(),1.,error_if_nonfinite=True,foreach=False)

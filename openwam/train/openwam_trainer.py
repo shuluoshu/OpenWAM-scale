@@ -395,11 +395,11 @@ class OpenWAMTrainer:
     def stage2_sampling_state(self):
         """Committed state only; safe to persist on an optimizer boundary."""
         from openwam.train.utils.stage2 import stage2_resume_contract
+        from openwam.model.goal.runtime import goal_prediction_policy
         identity = self.dataset.normalization_identity()
         return dict(training_contract=stage2_resume_contract(self.cfg),version='openwam.stage2.trainer.v1',
             goal_asset_sha256=self.architecture.goal_asset_identity,
-            goal_prediction=dict(num_steps=int(self.architecture.goal_config.get('num_steps', 20)),
-                                 input_policy='clean_head', mode='predicted'),
+            goal_prediction=goal_prediction_policy(self.architecture),
             progress=self._stage2_progress.state_dict(),
             sampler=self._stage2_sampler.state_dict(committed_offset=self._stage2_progress.epoch_offset),
             normalization=dict(selection_sha256=identity['selection_sha256'],
@@ -415,8 +415,8 @@ class OpenWAMTrainer:
             raise ValueError('Stage2 resume training/scheduler/augmentation contract mismatch; use warm-start')
         if state.get('goal_asset_sha256') != self.architecture.goal_asset_identity:
             raise ValueError('Stage2 resume frozen goal identity mismatch')
-        prediction = dict(num_steps=int(self.architecture.goal_config.get('num_steps', 20)),
-                          input_policy='clean_head', mode='predicted')
+        from openwam.model.goal.runtime import goal_prediction_policy
+        prediction = goal_prediction_policy(self.architecture)
         if state.get('goal_prediction') != prediction:
             raise ValueError('Stage2 resume goal prediction policy mismatch')
         identity = self.dataset.normalization_identity()
@@ -445,7 +445,8 @@ class OpenWAMTrainer:
             cases = self._stage2_eval_cases
             seed = int(self.cfg.project.seed)
             num_steps = int(getattr(self.cfg.evaluation, 'num_steps', 20))
-            complete = completed_evaluation(output_path, cases, step=opt_step, seed=seed, num_steps=num_steps)
+            complete = completed_evaluation(output_path, cases, step=opt_step, seed=seed, num_steps=num_steps,
+                observation_mode=getattr(self.architecture.goal_expert,'observation_mode','head'))
         except Exception as exc:
             error = f'{type(exc).__name__}: {exc}'
         _agree_error(error, 'fixed-case construction/resume')

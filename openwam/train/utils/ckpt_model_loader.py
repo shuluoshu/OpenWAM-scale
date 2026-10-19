@@ -257,6 +257,10 @@ def build_architecture_from_ckpt_dir(ckpt_dir: str, *, weights_required: bool, o
     if override_cfg is not None and OmegaConf.select(override_cfg, 'goal.enabled', default=False):
         from openwam.train.utils.stage2 import validate_stage2_checkpoint, validate_stage2_config
         validate_stage2_config(override_cfg)
+        if OmegaConf.select(ckpt_cfg,'goal.enabled',default=False):
+            from openwam.model.goal.runtime import goal_observation_mode
+            if goal_observation_mode(OmegaConf.to_container(override_cfg.goal,resolve=True)) != goal_observation_mode(OmegaConf.to_container(ckpt_cfg.goal,resolve=True)):
+                raise ValueError('Stage2 configured goal policy/mode disagrees with saved checkpoint')
         if weights_required:
             validate_stage2_checkpoint(override_cfg, explicit_weights or find_latest_weights(ckpt_dir))
     resolved_arch = resolve_architecture_config(model_cfg)

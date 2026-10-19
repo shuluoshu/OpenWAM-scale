@@ -1,6 +1,6 @@
 """Frozen Stage A patch expert inference for Stage2 predicted conditioning.
 
-Only clean, observed head RGB and instruction context enter this runtime. Goal
+Only clean current observation RGB and instruction context enter this runtime. Goal
 labels and future frames are deliberately absent from the inference/cache API.
 """
 from collections import OrderedDict
@@ -11,6 +11,35 @@ from .patch_expert import PatchGoalExpert, PatchGoalPrediction
 from .types import GoalCondition
 
 PREPROCESSING_VERSION = 'openwam.goal.clean_head.rgb320x256.v1'
+MULTIVIEW_PREPROCESSING_VERSION = 'openwam.goal.clean_multiview.rgb320x384.v2'
+
+
+def goal_observation_mode(config):
+    """Validate paired policy/version; absent fields retain historical v1 defaults."""
+    pair = (config.get('format', 'openwam.goal.patch.v1'), config.get('input_policy', 'clean_head'))
+    contracts = {('openwam.goal.patch.v1', 'clean_head'): 'head',
+                 ('openwam.goal.patch.v2', 'clean_multiview'): 'multiview'}
+    if pair not in contracts:
+        raise ValueError('goal format/input_policy contract mismatch')
+    mode = contracts[pair]
+    if config.get('observation_mode', mode) != mode:
+        raise ValueError('goal observation_mode disagrees with format/input_policy contract')
+    return mode
+
+
+def goal_prediction_policy(architecture):
+    """Keep old head resume serialization while binding v2 to its actual policy."""
+    config = architecture.goal_config
+    mode = goal_observation_mode(config)
+    if getattr(getattr(architecture, 'goal_expert', None), 'observation_mode', mode) != mode:
+        raise ValueError('goal configured mode disagrees with loaded expert')
+    result = dict(num_steps=int(config.get('num_steps',20)),
+                  input_policy='clean_multiview' if mode == 'multiview' else 'clean_head', mode='predicted')
+    if mode == 'multiview':
+        result.update(format='openwam.goal.patch.v2', observation_mode=mode,
+                      preprocessing_version=MULTIVIEW_PREPROCESSING_VERSION)
+    return result
+
 
 
 def goal_asset_sha256(path):
@@ -85,16 +114,20 @@ def _tensor_hash(tensor):
 
 
 def goal_cache_key(*, observed, context, context_len, prompt, seed, num_steps,
-                   asset_identity, shift, preprocessing_version=PREPROCESSING_VERSION):
+                   asset_identity, shift, preprocessing_version=PREPROCESSING_VERSION,
+                   observation_mode='head', observed_view_valid=None):
     value=dict(version=preprocessing_version,image=_tensor_hash(observed),
         context=_tensor_hash(context),context_len=None if context_len is None else int(context_len),
         prompt=prompt,seed=int(seed),steps=int(num_steps),asset=asset_identity,shift=float(shift))
+    if observation_mode != 'head':
+        value.update(observation_mode=observation_mode, view_valid=_tensor_hash(observed_view_valid))
     return hashlib.sha256(json.dumps(value,sort_keys=True).encode()).hexdigest()
 
 
 @torch.no_grad()
 def predict_goals(*, expert, observed, context, context_lens, seeds, num_steps,
-                  cache, asset_identity, prompts, augmented, microbatch_size=1):
+                  cache, asset_identity, prompts, augmented, microbatch_size=1,
+                  observed_view_valid=None):
     """Generate detached goals with per-row seeds; augmented inputs bypass cache."""
     if not isinstance(microbatch_size,int) or microbatch_size<1:
         raise ValueError('goal microbatch_size must be positive')
@@ -104,6 +137,13 @@ def predict_goals(*, expert, observed, context, context_lens, seeds, num_steps,
     if context_lens is not None:
         context_lens=torch.as_tensor(context_lens,device=context.device)
         if context_lens.shape!=(count,): raise ValueError('context_lens must be [B]')
+    mode = getattr(expert, 'observation_mode', 'head')
+    if mode == 'multiview':
+        from .observation import sanitize_canvas, validate_view_valid
+        observed_view_valid = validate_view_valid(observed_view_valid, batch_size=count, device=observed.device)
+        observed = sanitize_canvas(observed, observed_view_valid)
+    elif observed_view_valid is not None:
+        raise ValueError('head goal expert does not accept a view mask')
     expert.freeze()
     results=[None]*count; keys=[None]*count; pending=[]
     for i in range(count):
@@ -111,7 +151,9 @@ def predict_goals(*, expert, observed, context, context_lens, seeds, num_steps,
             keys[i]=goal_cache_key(observed=observed[i],context=context[i],
                 context_len=None if context_lens is None else int(context_lens[i]),
                 prompt=prompts[i],seed=seeds[i],num_steps=num_steps,
-                asset_identity=asset_identity,shift=expert.shift)
+                asset_identity=asset_identity,shift=expert.shift,observation_mode=mode,
+                observed_view_valid=None if observed_view_valid is None else observed_view_valid[i],
+                preprocessing_version=MULTIVIEW_PREPROCESSING_VERSION if mode=='multiview' else PREPROCESSING_VERSION)
             hit=cache.get(keys[i])
             if hit is not None:
                 results[i]=GoalCondition(hit.latent.to(device=observed.device),
@@ -121,7 +163,8 @@ def predict_goals(*, expert, observed, context, context_lens, seeds, num_steps,
         ids=pending[start:start+microbatch_size]
         pred=to_goal_condition(expert.generate(observed[ids],context[ids],
             seed=[seeds[i] for i in ids],num_steps=num_steps,
-            context_lens=None if context_lens is None else context_lens[ids]))
+            context_lens=None if context_lens is None else context_lens[ids],
+            **({'observed_view_valid': observed_view_valid[ids]} if mode=='multiview' else {})))
         for row,i in enumerate(ids):
             results[i]=GoalCondition(*(getattr(pred,name)[row:row+1] for name in
                                       ('latent','image_token_valid','uv')))
@@ -141,6 +184,7 @@ def configure_goal(architecture, cfg, *, checkpoint_dir=None):
         return
     if config.get('mode', 'predicted') != 'predicted':
         raise ValueError('Stage2 requires predicted goals')
+    mode = goal_observation_mode(config)
     vb = architecture.video_backbone
     driver = architecture.mot_driver
     if driver.attention_mask_mode != 'mutual' or vb.video_attention_mask_mode != 'first_frame_causal':
@@ -157,6 +201,8 @@ def configure_goal(architecture, cfg, *, checkpoint_dir=None):
         tokenizer=getattr(vb,'_tokenizer',None), text_dim=vb.text_dim,
         device=placement.device, dtype=placement.dtype,
         precomputed_text_fingerprint=config.get('precomputed_text_fingerprint'))
+    if getattr(expert, 'observation_mode', 'head') != mode:
+        raise ValueError('goal configured mode disagrees with loaded expert mode')
     if {id(p) for p in expert.dit.parameters()} & {id(p) for p in vb.dit.parameters()}:
         raise ValueError('goal and video DiT Parameters must be independent')
     architecture.goal_expert = expert
@@ -171,7 +217,8 @@ def configure_goal(architecture, cfg, *, checkpoint_dir=None):
 
 @torch.no_grad()
 def prepare_goal_inputs(architecture, goal_observed_head, prompts, context, *,
-                        head_valid, seeds, context_lens=None):
+                        head_valid, seeds, context_lens=None,
+                        goal_observed_multiview=None, goal_view_valid=None):
     """Condition only on explicit clean same-anchor RGB, never a canvas crop.
 
     Missing head rows are masked without invoking the teacher on black images.
@@ -183,10 +230,27 @@ def prepare_goal_inputs(architecture, goal_observed_head, prompts, context, *,
         raise ValueError('head_valid must be bool [B]')
     if len(seeds)!=count or len(prompts)!=count:
         raise ValueError('explicit per-example seeds and prompts required')
-    if goal_observed_head is None:
-        if valid.any(): raise ValueError('valid heads require explicit clean RGB')
-    elif tuple(goal_observed_head.shape)!=(count,3,1,256,320):
-        raise ValueError('clean goal_observed_head must be [B,3,1,256,320]')
+    mode = getattr(architecture.goal_expert, 'observation_mode', 'head')
+    observed = goal_observed_head
+    view_valid = None
+    if mode == 'multiview':
+        if goal_view_valid is None:
+            raise ValueError('multiview goal requires explicit goal_view_valid mask')
+        view_valid = torch.as_tensor(goal_view_valid, device=context.device)
+        if view_valid.dtype != torch.bool or view_valid.shape != (count,3):
+            raise ValueError('goal_view_valid must be bool [B,3]')
+        if not torch.equal(view_valid[:,0],valid):
+            raise ValueError('goal view mask head must agree with head_valid')
+        observed = goal_observed_multiview
+        shape = (count,3,1,384,320)
+        name = 'goal_observed_multiview'
+    else:
+        shape = (count,3,1,256,320)
+        name = 'goal_observed_head'
+    if observed is None:
+        if valid.any(): raise ValueError(f'valid heads require explicit clean {name} RGB')
+    elif tuple(observed.shape) != shape:
+        raise ValueError(f'clean {name} must be {list(shape)}')
     latent = context.new_zeros((count,48,1,16,20))
     tokens = torch.zeros(count,80,dtype=torch.bool,device=context.device)
     uv = torch.full((count,2,2),float('nan'),device=context.device)
@@ -194,15 +258,17 @@ def prepare_goal_inputs(architecture, goal_observed_head, prompts, context, *,
     if ids.numel():
         config = architecture.goal_config
         pred,_ = predict_goals(expert=architecture.goal_expert,
-            observed=goal_observed_head[ids],context=context[ids],
+            observed=observed[ids],context=context[ids],
             context_lens=None if context_lens is None else torch.as_tensor(context_lens,device=context.device)[ids],
             seeds=[seeds[i] for i in ids.tolist()],prompts=[prompts[i] for i in ids.tolist()],
             num_steps=int(config.get('num_steps',20)),cache=architecture.goal_cache,
             asset_identity=architecture.goal_asset_identity,augmented=False,
-            microbatch_size=int(config.get('microbatch_size',1)))
+            microbatch_size=int(config.get('microbatch_size',1)),
+            **({'observed_view_valid':view_valid[ids]} if mode=='multiview' else {}))
         latent[ids]=pred.latent.to(latent); tokens[ids]=pred.image_token_valid; uv[ids]=pred.uv
     architecture.goal_diagnostics = {'predicted_uv':uv.detach(),
-        'predicted_latent':latent.detach(), 'image_token_valid':tokens.detach()}
+        'predicted_latent':latent.detach(), 'image_token_valid':tokens.detach(), 'observation_mode':mode,
+        'observed_view_valid':None if view_valid is None else view_valid.detach()}
     return {'goal_latent':latent.detach(),'goal_token_valid':tokens.detach()}
 
 
@@ -236,6 +302,7 @@ def save_goal_assets(architecture, output_dir, cfg):
     from omegaconf import OmegaConf, open_dict
     if getattr(architecture, 'goal_expert', None) is None:
         return
+    goal_prediction_policy(architecture)
     source = Path(architecture.goal_asset_source)
     target = Path(output_dir) / 'goal/expert.safetensors'
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -272,9 +339,19 @@ def clean_goal_head(image):
 
 @torch.no_grad()
 def prepare_inference_goal_inputs(architecture, goal_observed_head, prompts, context, *,
-                                  head_valid, seeds, context_lens=None):
+                                  head_valid, seeds, context_lens=None,
+                                  goal_observed_multiview=None, goal_view_valid=None):
     """Inference uses the exact training condition builder and explicit row seeds."""
     from PIL import Image
+    mode = getattr(architecture.goal_expert, 'observation_mode', 'head')
+    if mode == 'multiview':
+        if goal_observed_multiview is not None:
+            if not isinstance(goal_observed_multiview, torch.Tensor):
+                raise TypeError('goal_observed_multiview must be a normalized tensor')
+            goal_observed_multiview = goal_observed_multiview.to(device=context.device,dtype=architecture.dtype)
+        return prepare_goal_inputs(architecture, None, prompts, context,
+            head_valid=head_valid,seeds=seeds,context_lens=context_lens,
+            goal_observed_multiview=goal_observed_multiview,goal_view_valid=goal_view_valid)
     if isinstance(goal_observed_head, Image.Image):
         goal_observed_head = clean_goal_head(goal_observed_head).unsqueeze(0)
     if goal_observed_head is not None:

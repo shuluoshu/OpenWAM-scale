@@ -1019,26 +1019,36 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         if getattr(self, 'goal_expert', None) is not None:
             from openwam.model.goal.runtime import prepare_goal_inputs
+            mode = getattr(self.goal_expert, 'observation_mode', 'head')
+            key = 'goal_observed_multiview' if mode == 'multiview' else 'goal_observed_head'
+            shape = (3,1,384,320) if mode == 'multiview' else (3,1,256,320)
+            observations = []; masks = []
             for sample in batch:
-                if not all(key in sample for key in ('goal_observed_head', 'goal_head_valid', 'goal_seed')):
-                    raise ValueError('goal training requires explicit clean goal_observed_head, goal_head_valid and goal_seed')
-            heads = []
-            for sample in batch:
-                head = sample['goal_observed_head']
-                valid = bool(sample['goal_head_valid'])
-                if head is None:
-                    if valid:
+                if not all(name in sample for name in (key, 'goal_head_valid', 'goal_seed')):
+                    raise ValueError(f'goal training requires explicit clean {key}, goal_head_valid and goal_seed')
+                observed = sample[key]
+                if observed is None:
+                    if bool(sample['goal_head_valid']):
                         raise ValueError('valid head requires explicit clean RGB')
-                    head = torch.zeros(3, 1, 256, 320)
-                head = torch.as_tensor(head, device=_device, dtype=_dtype)
-                if tuple(head.shape) != (3, 1, 256, 320):
-                    raise ValueError('sample clean head must be [3,1,256,320]')
-                heads.append(head)
-            preprocessed.update(prepare_goal_inputs(self, torch.stack(heads), all_prompts,
+                    observed = torch.zeros(shape)
+                observed = torch.as_tensor(observed, device=_device, dtype=_dtype)
+                if tuple(observed.shape) != shape:
+                    raise ValueError(f'sample clean {key} must be {shape}')
+                observations.append(observed)
+                if mode == 'multiview':
+                    if 'goal_view_valid' not in sample:
+                        raise ValueError('multiview training requires explicit goal_view_valid mask')
+                    mask = torch.as_tensor(sample['goal_view_valid'], device=_device)
+                    if mask.dtype != torch.bool or mask.shape != (3,):
+                        raise ValueError('sample goal_view_valid must be bool [3]')
+                    masks.append(mask)
+            kwargs = ({'goal_observed_multiview':torch.stack(observations),
+                       'goal_view_valid':torch.stack(masks)} if mode == 'multiview' else {})
+            preprocessed.update(prepare_goal_inputs(self, None if mode == 'multiview' else torch.stack(observations), all_prompts,
                 preprocessed['context'], context_lens=preprocessed.get('seq_lens'),
                 head_valid=torch.tensor([sample['goal_head_valid'] for sample in batch],
                     dtype=torch.bool, device=_device),
-                seeds=[int(sample['goal_seed']) for sample in batch]))
+                seeds=[int(sample['goal_seed']) for sample in batch], **kwargs))
 
         action_data = torch.cat(all_actions, dim=0) if all_actions[0] is not None else None
 
@@ -1499,6 +1509,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
         cfg_merge: bool = False,
         active_action_mask: Optional[Tensor] = None,
         goal_observed_head=None,
+        goal_observed_multiview=None,
+        goal_view_valid=None,
         goal_head_valid: bool = True,
         goal_seed: Optional[int] = None,
         **extra_pipeline_inputs: Any,
@@ -1517,6 +1529,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 ``num_frames`` for datasets whose video/action rates match.
             goal_observed_head: Explicit clean head RGB PIL image or normalized
                 ``[1,3,1,256,320]`` tensor. Required for a valid Stage2 head.
+            goal_observed_multiview: For v2, explicit clean normalized tensor
+                [B,3,1,384,320] before observation augmentation.
+            goal_view_valid: For v2, explicit bool [B,3] in head/left/right order.
             goal_head_valid: Missing-head flag; false masks the 80 memory tokens.
             goal_seed: Per-example predicted-goal seed, defaults to ``seed``.
                 Evaluation should pass the dataset sample's ``goal_seed``.
@@ -1589,6 +1604,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
             from openwam.model.goal.runtime import prepare_inference_goal_inputs
             inputs_shared.update(prepare_inference_goal_inputs(self, goal_observed_head,
                 [prompt], inputs_shared['context'], head_valid=[goal_head_valid],
+                goal_observed_multiview=goal_observed_multiview, goal_view_valid=goal_view_valid,
                 seeds=[seed if goal_seed is None else goal_seed],
                 context_lens=inputs_shared.get('seq_lens', inputs_shared.get('context_lens'))))
 
