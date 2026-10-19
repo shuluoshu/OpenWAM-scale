@@ -74,6 +74,7 @@ def list_registered_datasets():
 
 def _register_builtins():
     """Register all built-in dataset classes."""
+    from openwam.dataloader.curated_stage2 import CuratedStage2Dataset
     from openwam.dataloader.agibotworld import MultiAgiBotWorldDataset
     from openwam.dataloader.canonical_eef_lerobot import CanonicalEEFLerobotDataset
     from openwam.dataloader.ebench import EBenchDataset
@@ -89,6 +90,7 @@ def _register_builtins():
     from openwam.dataloader.robotwin import MultiTaskRoboTwinDataset
     from openwam.dataloader.vlabench import VLABenchDataset
 
+    register_dataset("curated_stage2")(CuratedStage2Dataset)
     register_dataset("robotwin")(MultiTaskRoboTwinDataset)
     register_dataset("canonical_eef_lerobot")(CanonicalEEFLerobotDataset)
     register_dataset("robodojo")(MultiTaskRoboDojoDataset)

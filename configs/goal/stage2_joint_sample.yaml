@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+  - stage2_joint_base
+  - _self_
+dataloader:
+  source_yaml: ${oc.env:STAGE2_SOURCE_YAML,../../pretrain/launch/moravla/train_files/pretrain_v0_3_curated_smoke.yaml}
+training:
+  max_steps: 5000
+project:
+  name: openwam-stage2-sample

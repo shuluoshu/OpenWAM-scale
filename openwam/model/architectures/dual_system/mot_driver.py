@@ -161,6 +161,8 @@ class DualSystemMoTDriver:
         astate: "ActionState",
         attn_mask: Optional[Tensor] = None,
         *,
+        goal_key: Optional[Tensor] = None,
+        goal_value: Optional[Tensor] = None,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
     ) -> Tuple["BlockLoopState", "ActionState"]:
@@ -184,9 +186,9 @@ class DualSystemMoTDriver:
         """
         if use_gradient_checkpointing and self.ab.training:
             return self._step_checkpointed(
-                layer_id, vstate, astate, attn_mask=attn_mask, offload=use_gradient_checkpointing_offload
+                layer_id, vstate, astate, attn_mask=attn_mask, offload=use_gradient_checkpointing_offload, goal_key=goal_key, goal_value=goal_value
             )
-        return self._step_impl(layer_id, vstate, astate, attn_mask=attn_mask)
+        return self._step_impl(layer_id, vstate, astate, attn_mask=attn_mask, goal_key=goal_key, goal_value=goal_value)
 
     def _step_impl(
         self,
@@ -196,6 +198,8 @@ class DualSystemMoTDriver:
         attn_mask: Optional[Tensor] = None,
         *,
         suppress_inner_attn_ckpt: bool = False,
+        goal_key: Optional[Tensor] = None,
+        goal_value: Optional[Tensor] = None,
     ) -> Tuple["BlockLoopState", "ActionState"]:
         """Unwrapped per-layer body. See :meth:`step` for the public entry point.
 
@@ -233,6 +237,9 @@ class DualSystemMoTDriver:
         q_cat = torch.cat([q_v, q_a], dim=1)
         k_cat = torch.cat([k_v, k_a], dim=1)
         v_cat = torch.cat([v_v, v_a], dim=1)
+        if goal_key is not None:
+            k_cat = torch.cat((k_cat, goal_key), dim=1)
+            v_cat = torch.cat((v_cat, goal_value), dim=1)
         # Contract: `run_joint_loop` pre-builds ``attn_mask`` once per forward and
         # passes it in for every layer. _step_impl does NOT rebuild the mask
         # itself; any direct caller must pass the same pre-built mask.
@@ -257,6 +264,8 @@ class DualSystemMoTDriver:
         *,
         attn_mask: Optional[Tensor],
         offload: bool,
+        goal_key: Optional[Tensor] = None,
+        goal_value: Optional[Tensor] = None,
     ) -> Tuple["BlockLoopState", "ActionState"]:
         """Run :meth:`_step_impl` under ``torch.utils.checkpoint``.
 
@@ -280,14 +289,14 @@ class DualSystemMoTDriver:
         """
         outer_payload = astate.payload
 
-        def _run(vx: Tensor, ax: Tensor) -> Tuple[Tensor, Tensor]:
+        def _run(vx: Tensor, ax: Tensor, gk, gv) -> Tuple[Tensor, Tensor]:
             local_vstate = copy.copy(vstate)
             local_astate = copy.copy(astate)
             local_payload = copy.copy(outer_payload)
             local_astate.payload = local_payload
             local_vstate.hidden_states = vx
             local_payload.x_action = ax
-            self._step_impl(layer_id, local_vstate, local_astate, attn_mask=attn_mask, suppress_inner_attn_ckpt=True)
+            self._step_impl(layer_id, local_vstate, local_astate, attn_mask=attn_mask, suppress_inner_attn_ckpt=True, goal_key=gk, goal_value=gv)
             return local_vstate.hidden_states, local_payload.x_action
 
         vx0 = vstate.hidden_states
@@ -295,9 +304,9 @@ class DualSystemMoTDriver:
 
         if offload:
             with torch.autograd.graph.save_on_cpu():
-                new_vx, new_ax = torch.utils.checkpoint.checkpoint(_run, vx0, ax0, use_reentrant=False)
+                new_vx, new_ax = torch.utils.checkpoint.checkpoint(_run, vx0, ax0, goal_key, goal_value, use_reentrant=False)
         else:
-            new_vx, new_ax = torch.utils.checkpoint.checkpoint(_run, vx0, ax0, use_reentrant=False)
+            new_vx, new_ax = torch.utils.checkpoint.checkpoint(_run, vx0, ax0, goal_key, goal_value, use_reentrant=False)
 
         vstate.hidden_states = new_vx
         outer_payload.x_action = new_ax
@@ -308,6 +317,9 @@ class DualSystemMoTDriver:
         vstate: "BlockLoopState",
         astate: "ActionState",
         *,
+        goal_keys: Optional[Tensor] = None,
+        goal_values: Optional[Tensor] = None,
+        goal_token_valid: Optional[Tensor] = None,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
     ) -> Tuple["BlockLoopState", "ActionState"]:
@@ -348,12 +360,20 @@ class DualSystemMoTDriver:
         # handles the resulting rectangular mask.
         attn_mask = widen_mask_for_prefix_kv(attn_mask, vstate)
 
+        if goal_keys is not None:
+            from openwam.model.goal.conditioning import append_goal_mask
+            if self.attention_mask_mode != "mutual" or self.vb.video_attention_mask_mode != "first_frame_causal":
+                raise ValueError("goal memory requires mutual + first_frame_causal")
+            attn_mask = append_goal_mask(attn_mask, goal_token_valid, self._video_tokens_per_frame(vstate))
+
         for layer_id in range(self.num_layers):
             vstate, astate = self.step(
                 layer_id,
                 vstate,
                 astate,
                 attn_mask=attn_mask,
+                goal_key=None if goal_keys is None else goal_keys[layer_id],
+                goal_value=None if goal_values is None else goal_values[layer_id],
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             )

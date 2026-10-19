@@ -63,3 +63,11 @@ class GoalPrediction:
     latent: torch.Tensor
     point_logits: torch.Tensor
     token_valid: torch.Tensor
+
+
+@dataclass
+class GoalCondition:
+    """Detached predicted terminal image and ordered continuous TCP UV."""
+    latent: torch.Tensor  # [B,48,1,16,20]
+    image_token_valid: torch.Tensor  # bool [B,80], excludes the TCP token
+    uv: torch.Tensor  # FP32 [B,2,2], normalized left/right, unclamped

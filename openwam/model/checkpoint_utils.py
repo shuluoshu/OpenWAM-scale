@@ -73,3 +73,23 @@ def expand_action_state_dict(
         padded.narrow(axis, 0, source_dim).copy_(value)
         expanded[key] = padded
     return expanded
+
+
+GOAL_EXPERT_PREFIX = 'goal_expert.'
+
+
+def exclude_frozen_goal(state_dict):
+    """Unified export retains every adapter tensor; only the teacher is separate."""
+    return {k: v for k, v in state_dict.items() if not k.startswith(GOAL_EXPERT_PREFIX)}
+
+
+def validate_goal_unified_keys(architecture, state_dict):
+    """Never permit unified weights to overwrite the independent frozen asset."""
+    injected = [k for k in state_dict if k.startswith(GOAL_EXPERT_PREFIX)]
+    if injected:
+        raise RuntimeError(f'Unified checkpoint must exclude goal_expert: {injected[:4]}')
+    if getattr(architecture, 'goal_adapter', None) is not None:
+        required = {'goal_adapter.' + k for k in architecture.goal_adapter.state_dict()}
+        missing = sorted(required - state_dict.keys())
+        if missing:
+            raise RuntimeError(f'Strict goal_adapter restore failed: missing={missing}')

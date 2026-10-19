@@ -62,6 +62,7 @@ def load_from_checkpoint_dir(
     ckpt_dir: str,
     device: str = "cuda",
     ckpt_name: Optional[str] = None,
+    normalization_profile: Optional[str] = None,
 ) -> Tuple[DictConfig, BaseWAMArchitecture]:
     """Load full model from a self-contained checkpoint directory.
 
@@ -84,6 +85,10 @@ def load_from_checkpoint_dir(
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"config.yaml not found in {ckpt_dir}")
     cfg = OmegaConf.load(config_path)
+    if normalization_profile is not None:
+        from omegaconf import open_dict
+        with open_dict(cfg):
+            OmegaConf.update(cfg, "dataloader.normalization_profile", normalization_profile, force_add=True)
 
     # 2. Resolve checkpoint file
     if ckpt_name is not None:
@@ -202,8 +207,14 @@ def load_from_checkpoint_dir(
         resolved_arch.canonical.variant,
     )
 
-    # 4. Load all weights from checkpoint
+    # 4. Adapter before unified restore, frozen teacher after borrowed VAE/T5.
+    stage2 = bool(OmegaConf.select(cfg, 'goal.enabled', default=False))
+    if stage2:
+        from openwam.model.goal.runtime import configure_goal_adapter, configure_goal
+        configure_goal_adapter(architecture)
     architecture.load_checkpoint(ckpt_path)
+    if stage2:
+        configure_goal(architecture, cfg, checkpoint_dir=ckpt_dir)
 
     # 5. Move to device and set eval mode — top-down: architecture → video_backbone → submodules.
     _mp = OmegaConf.select(cfg, "training.mixed_precision", default="bf16")
@@ -229,6 +240,10 @@ def load_from_checkpoint_dir(
     # actually using (normalizer stats selection, binary dims, torso masking all derive from the
     # training cfg at this point).
     architecture.repr_contract = repr_contract_from_cfg(cfg)
+    native_contract = getattr(architecture.normalizer, "native_contract", None)
+    if native_contract is not None:
+        architecture.repr_contract = dict(native_contract,
+            normalization_profile=architecture.normalizer.normalization_profile)
 
     logger.info("Model loaded successfully on %s", device)
     return cfg, architecture
@@ -516,6 +531,8 @@ def _build_normalizer(cfg: DictConfig, ckpt_dir: str):
     compact RoboCasa365's state19 and action15 to use distinct raw widths while
     preserving the symmetric map used by older datasets.
     """
+    if OmegaConf.select(cfg, 'dataloader.type') == 'curated_stage2':
+        return _build_native_normalizer(cfg, ckpt_dir)
     inner = _build_inner_normalizer(cfg, ckpt_dir)
 
     unify_on = bool(OmegaConf.select(cfg, "dataloader.unify_action", default=False))
@@ -559,3 +576,50 @@ def _build_normalizer(cfg: DictConfig, ckpt_dir: str):
         unify_dim,
         state_dst_index=state_dst_index,
     )
+
+
+class _NativeGripperNormalizer:
+    """Native 52D contract uses separate state/action stats, and [0,1] grippers."""
+    def __init__(self, inner, action_counts, state_counts):
+        self.inner = inner
+        self.stats = inner.stats
+        self.action_valid = np.asarray(action_counts) > 0
+        self.state_valid = np.asarray(state_counts) > 0
+
+    def normalize(self, x):
+        x = np.asarray(x, dtype=np.float32)
+        if x.shape[-1] != 52:
+            raise ValueError('Native proprio must use the raw 52D relative head/TCP contract')
+        y = self.inner.normalize(x)
+        y[..., [9, 19]] = np.clip(x[..., [9, 19]], 0, 1)
+        y[..., ~self.state_valid] = 0
+        return y
+
+    def unnormalize(self, x):
+        x = np.asarray(x, dtype=np.float32)
+        y = self.inner.unnormalize(x)
+        y[..., [9, 19]] = np.clip(x[..., [9, 19]], 0, 1)
+        y[..., ~self.action_valid] = 0
+        return y
+
+
+def _build_native_normalizer(cfg, ckpt_dir):
+    from openwam.train.utils.stage2_assets import load_native_normalization
+    from openwam.dataloader.transforms.normalize import Normalizer
+    from openwam.dataloader.utils.mora_relative import MoraHeadTCPRepresentation
+    manifest, registry = load_native_normalization(ckpt_dir)
+    profile = OmegaConf.select(cfg, 'dataloader.normalization_profile')
+    if not profile or profile not in registry['entries']:
+        raise ValueError('Native deployment requires explicit dataloader.normalization_profile '
+                         '(registry entry fingerprint); available: ' + ', '.join(registry['entries']))
+    entry = registry['entries'][profile]
+    stats = {k: np.asarray(v, dtype=np.float32) for k, v in entry['action'].items() if k != 'count'}
+    stats['_normalize_stats'] = {k: np.asarray(v, dtype=np.float32)
+                                for k, v in entry['state'].items() if k != 'count'}
+    inner = _NativeGripperNormalizer(Normalizer(mode='q99', stats=stats),
+                                     entry['action']['count'], entry['state']['count'])
+    normalizer = _UnifyAwareNormalizer(inner, MoraHeadTCPRepresentation.scatter, 112)
+    normalizer._dst_index = MoraHeadTCPRepresentation.scatter[inner.action_valid]
+    normalizer.native_contract = entry['contract']
+    normalizer.normalization_profile = profile
+    return normalizer

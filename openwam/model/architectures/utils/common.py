@@ -41,12 +41,14 @@ def downsample_video_mask_to_latent(
     *,
     temporal_factor: int = VAE_TEMPORAL_FACTOR,
     skip_first: bool = True,
+    strict: bool = False,
 ) -> torch.Tensor:
     """Downsample frame-level padding mask to VAE latent temporal dimension.
 
     Wan2pt1-family causal VAEs encode frame 0 into latent[0] alone, then
     group the remaining tail frames by ``temporal_factor``. A latent step is
-    padded only if ALL frames in the group are padded.
+    padded only if ALL frames in the group are padded by default. Stage2
+    uses ``strict=True`` to exclude any group containing padded RGB targets.
 
     Modes:
       - ``skip_first=True`` (FastWAM / Wan TI2V): latent[0] is the conditioning
@@ -86,11 +88,41 @@ def downsample_video_mask_to_latent(
         pad_block = torch.ones((*leading_shape, pad_len), dtype=torch.bool, device=tail_is_pad.device)
         tail_is_pad = torch.cat([tail_is_pad, pad_block], dim=-1)
     grouped = tail_is_pad.view(*tail_is_pad.shape[:-1], -1, temporal_factor)
-    tail_latent_mask = grouped.all(dim=-1)
+    tail_latent_mask = grouped.any(dim=-1) if strict else grouped.all(dim=-1)
 
     if skip_first:
         return tail_latent_mask
     return torch.cat([first_latent_mask, tail_latent_mask], dim=-1)
+
+
+def stage2_latent_view_mask(video_valid, view_valid, latent_hw, *,
+                            temporal_factor, skip_first):
+    """Valid latent cells for the fixed head/left-wrist/right-wrist L canvas.
+
+    Source camera availability is supervision metadata, separate from observation
+    view-drop augmentation. The 384x320 canvas has head rows0:256, then two
+    128x160 wrist views. Tail compression groups containing any unavailable RGB
+    frame are excluded. This does not estimate the VAE's spatial receptive field.
+    """
+    if (video_valid.dtype != torch.bool or video_valid.ndim != 1
+            or view_valid.dtype != torch.bool
+            or view_valid.shape != (video_valid.shape[0], 3)):
+        raise ValueError('Stage2 video/view validity must be bool [T] and [T,3]')
+    height, width = latent_hw
+    if height <= 0 or width <= 0 or height % 3 or width % 2:
+        raise ValueError('Stage2 latent grid must align with the fixed L canvas')
+    if temporal_factor < 1:
+        raise ValueError('temporal_factor must be positive')
+    source_valid = view_valid.to(video_valid.device) & video_valid[:, None]
+    per_view = ~downsample_video_mask_to_latent(~source_valid.T,
+        temporal_factor=temporal_factor, skip_first=skip_first, strict=True)
+    mask = torch.zeros(per_view.shape[1], height, width,
+                       dtype=torch.bool, device=video_valid.device)
+    head_end, wrist_mid = height * 2 // 3, width // 2
+    mask[:, :head_end] = per_view[0, :, None, None]
+    mask[:, head_end:, :wrist_mid] = per_view[1, :, None, None]
+    mask[:, head_end:, wrist_mid:] = per_view[2, :, None, None]
+    return mask
 
 
 def resolve_bridge_layers(cfg: Any, *, num_layers: Optional[int] = None) -> tuple:

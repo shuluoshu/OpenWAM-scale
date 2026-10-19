@@ -15,7 +15,7 @@ from openwam.dataloader.utils.mora_relative import MoraHeadTCPRepresentation, Mo
 from openwam.dataloader.utils.normalization import apply_normalization, materialize_eef_stats
 from openwam.dataloader.utils.gripper import ALIGNED_COMMAND, ALIGNED_VALID, filter_config, gripper_state_outliers
 
-SOURCE_KEYS = ("state_key", "joint_state_key", "tcp_pose_keys", "tcp_from_eef", "joint_indices", "gripper_command_sources")
+SOURCE_KEYS = ("state_key", "joint_state_key", "tcp_pose_keys", "tcp_from_eef", "joint_indices", "gripper_command_sources", "gripper_state_sources")
 logger = logging.getLogger(__name__)
 
 
@@ -111,7 +111,8 @@ class MoraRelativeJointDataset(CanonicalEEFLerobotDataset):
         n = int(row.length)
         rep = self.representation
         keys = list(dict.fromkeys([*rep.gripper_commands.columns,
-                                  *([rep.state_key] if rep.state_key in rep.features else [])]))
+                                  *([rep.state_key] if rep.state_key in rep.features else []),
+                                  *(rep.gripper_states.columns if rep.gripper_states is not None else [])]))
         columns = {}
         if keys:
             path = self._dataset_dir / self._data_path_template.format(
@@ -122,14 +123,7 @@ class MoraRelativeJointDataset(CanonicalEEFLerobotDataset):
                 raise ValueError(f"gripper episode row range mismatch: {path}, episode {row.episode_index}")
             columns = {key: frame[key].tolist() for key in keys}
         commands, valid = rep.gripper_commands.align(columns, n)
-        measured = np.full((n, 2), np.nan, np.float32)
-        if rep.state_key in columns:
-            eef = np.asarray(columns[rep.state_key], np.float32)
-            for side, index in enumerate((9, 19)):
-                if eef.shape[1] > index:
-                    measured[:, side] = eef[:, index]
-        # Compare exactly the clipped physical values used as model inputs.
-        clipped = np.where(np.isfinite(measured), np.clip(measured, 0, 1), np.nan)
+        clipped = rep.measured_grippers(columns, n)
         controller_valid = rep.gripper_commands.controller_valid(valid)
         bad, reasons = gripper_state_outliers(clipped, commands, controller_valid, self.gripper_state_filter)
         result = (commands, valid, bad, reasons)

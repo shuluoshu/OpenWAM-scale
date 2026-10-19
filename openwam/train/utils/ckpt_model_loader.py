@@ -5,7 +5,9 @@ the trainer builds the architecture from that checkpoint source alone:
 module skeletons from the component specs saved in its ``config.yaml``,
 weights from either the requested ``checkpoint_step_*.safetensors`` file or
 the latest weights in the directory (finetune), or from accelerate's
-``load_state`` after prepare (resume). The original pretrained backbone
+``load_state`` after prepare (legacy resume). Stage2 resume first reads the
+SHA-pinned unified weights paired with its full state, then independently loads
+the frozen goal bundle, before Accelerate restores all state. The original pretrained backbone
 directory (``model.video_backbone.model_path``) does not need to exist on the
 training host.
 
@@ -221,11 +223,12 @@ def build_architecture_from_ckpt_dir(ckpt_dir: str, *, weights_required: bool, o
     ``<ckpt_dir>/tokenizer/``). With ``weights_required=True`` (finetune) either
     the explicit safetensors source or latest ``checkpoint_step_*.safetensors``
     in the source dir is loaded here; with
-    ``weights_required=False`` (resume) safetensors are skipped entirely —
-    accelerate's ``load_state`` restores a strict superset (module weights
-    incl. frozen params) after prepare, and reading the latest safetensors
-    would crash on a file truncated by a mid-save kill even though the run
-    is still recoverable from its accel state.
+    ``weights_required=False`` skips unified weights for legacy resume.
+    Stage2 requires the exact SHA-pinned unified weights paired with the full
+    state, so borrowed VAE/T5 dependencies and adapter are populated before
+    validating the independent goal bundle. Missing/corrupt unified weights
+    explicitly block Stage2 resume. The teacher is loaded once; Accelerate
+    subsequently restores the native full state (including its teacher copy).
 
     ``override_cfg`` is the live run config (finetune). When given, its ``model``
     section is layered over the ckpt's via :func:`merge_ckpt_model_cfg` and the
@@ -251,6 +254,11 @@ def build_architecture_from_ckpt_dir(ckpt_dir: str, *, weights_required: bool, o
             f"training.{'finetune' if weights_required else 'resume'}_ckpt_path at a run directory "
             "written by this trainer (its config.yaml carries the model section and the component specs)."
         )
+    if override_cfg is not None and OmegaConf.select(override_cfg, 'goal.enabled', default=False):
+        from openwam.train.utils.stage2 import validate_stage2_checkpoint, validate_stage2_config
+        validate_stage2_config(override_cfg)
+        if weights_required:
+            validate_stage2_checkpoint(override_cfg, explicit_weights or find_latest_weights(ckpt_dir))
     resolved_arch = resolve_architecture_config(model_cfg)
     params = dict(resolved_arch.params)
 
@@ -279,7 +287,21 @@ def build_architecture_from_ckpt_dir(ckpt_dir: str, *, weights_required: bool, o
     logger.info("[%s] building architecture from self-contained ckpt dir: %s", tag, ckpt_dir)
     architecture = build_architecture(resolved_arch.registry_name, params)
 
-    if weights_required:
+    stage2_checkpoint = bool(OmegaConf.select(ckpt_cfg, 'goal.enabled', default=False))
+    if stage2_checkpoint:
+        from openwam.model.goal.runtime import configure_goal_adapter, configure_goal
+        configure_goal_adapter(architecture)
+    if stage2_checkpoint and not weights_required:
+        from openwam.train.utils.checkpointing import find_latest_accel_state, validate_stage2_full_state
+        import json
+        state_dir = find_latest_accel_state(ckpt_dir)
+        if state_dir is None:
+            raise ValueError('Stage2 resume requires full states; use warm-start')
+        with open(os.path.join(state_dir, 'trainer_state.json')) as stream:
+            metadata = json.load(stream)
+        validate_stage2_full_state(state_dir, metadata)
+        explicit_weights = os.path.join(ckpt_dir, metadata['unified_weights'])
+    if weights_required or stage2_checkpoint:
         weights = explicit_weights or find_latest_weights(ckpt_dir)
         logger.info("[%s] loading pretrained weights: %s", tag, weights)
         # Plain print so the warm-start is visible on the launch terminal even
@@ -293,6 +315,11 @@ def build_architecture_from_ckpt_dir(ckpt_dir: str, *, weights_required: bool, o
         else:
             architecture.load_checkpoint(weights)
         print(f"[{tag}] pretrained weights loaded OK", flush=True)
+    if stage2_checkpoint:
+        configure_goal(architecture, ckpt_cfg, checkpoint_dir=ckpt_dir)
+        if override_cfg is not None:
+            with open_dict(override_cfg):
+                override_cfg.goal = ckpt_cfg.goal
     return resolved_arch, architecture, ckpt_cfg
 
 

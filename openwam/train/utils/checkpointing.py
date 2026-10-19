@@ -44,6 +44,10 @@ def save_normalization_stats(output_dir: str, dataset) -> None:
     """
     import shutil
 
+    if getattr(dataset, 'registry_path', None):
+        from openwam.train.utils.stage2_assets import save_native_normalization
+        save_native_normalization(output_dir, dataset)
+        return
     dst = os.path.join(output_dir, "normalization_stats.npy")
     if os.path.exists(dst):
         logger.info(
@@ -147,6 +151,10 @@ def verify_resume_normalization_stats(output_dir: str, dataset) -> None:
     """
     import pickle
 
+    if getattr(dataset, 'registry_path', None):
+        from openwam.train.utils.stage2_assets import verify_native_normalization
+        verify_native_normalization(output_dir, dataset)
+        return
     import numpy as np
 
     src = getattr(dataset, "normalization_stats_path", None)
@@ -217,7 +225,7 @@ def save_weights(accelerator, architecture, output_path: str, global_step: int, 
     tqdm.write(msg)
 
 
-def save_full_state(accelerator, output_path: str, global_step: int, opt_step: int, epoch: int) -> None:
+def save_full_state(accelerator, output_path: str, global_step: int, opt_step: int, epoch: int, *, trainer_metadata=None) -> None:
     """Write full Accelerate state to ``accel_state_step_N/`` for resume.
 
     ALL ranks enter (DeepSpeed shards optimizer state per-rank). rank-0 writes the
@@ -226,14 +234,48 @@ def save_full_state(accelerator, output_path: str, global_step: int, opt_step: i
     """
     import json
 
+    if trainer_metadata and set(trainer_metadata) & {'global_step', 'opt_step', 'epoch'}:
+        raise ValueError('trainer_metadata cannot override checkpoint counters')
     state_dir = os.path.join(output_path, f"accel_state_step_{global_step}")
     if accelerator.is_main_process:
         os.makedirs(state_dir, exist_ok=True)
+        # An interrupted rewrite must never retain a stale completion marker.
+        marker = os.path.join(state_dir, 'trainer_state.json')
+        if os.path.exists(marker):
+            os.unlink(marker)
     accelerator.wait_for_everyone()
     accelerator.save_state(state_dir)
+    if trainer_metadata and 'stage2' in trainer_metadata:
+        # Accelerate catches RNG restoration errors; Stage2 must fail explicitly.
+        import random
+        import numpy as np
+        import torch
+        rng = dict(python=random.getstate(), numpy=np.random.get_state(), cpu=torch.get_rng_state())
+        if torch.cuda.is_initialized():
+            rng['cuda'] = torch.cuda.get_rng_state_all()
+        torch.save(rng, os.path.join(state_dir, f'stage2_rng_{accelerator.process_index}.pt'))
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         meta = {"global_step": int(global_step), "opt_step": int(opt_step), "epoch": int(epoch)}
+        if trainer_metadata:
+            meta.update(trainer_metadata)
+        if 'stage2' in meta:
+            from pathlib import Path
+            # Native Accelerate state intentionally includes the registered frozen
+            # teacher. Unified exports exclude it. This preserves backend-native
+            # strict restoration, including DeepSpeed optimizer partition layouts.
+            meta['full_state_files'] = {str(p.relative_to(state_dir)): p.stat().st_size
+                for p in Path(state_dir).rglob('*') if p.is_file()
+                and p.name not in ('trainer_state.json', 'trainer_state.json.tmp')}
+            meta['frozen_goal_in_full_state'] = True
+            meta['accelerate_objects'] = {name: len(getattr(accelerator, '_' + name, []))
+                                          for name in ('models', 'optimizers', 'schedulers')}
+            from openwam.model.goal.runtime import goal_asset_sha256
+            unified = Path(output_path) / f'checkpoint_step_{global_step}.safetensors'
+            if not unified.is_file():
+                raise ValueError('Stage2 full resume requires matching unified weights')
+            meta['unified_weights'] = unified.name
+            meta['unified_sha256'] = goal_asset_sha256(unified)
         meta_path = os.path.join(state_dir, "trainer_state.json")
         tmp_path = meta_path + ".tmp"
         with open(tmp_path, "w") as f:
@@ -241,19 +283,39 @@ def save_full_state(accelerator, output_path: str, global_step: int, opt_step: i
         os.replace(tmp_path, meta_path)
 
 
-def load_full_state(accelerator, state_dir: str) -> dict:
+def load_full_state(accelerator, state_dir: str, *, require_stage2=False) -> dict:
     """Restore optimizer/scheduler/RNG/model from ``state_dir`` (call AFTER prepare).
 
     Returns the ``trainer_state.json`` contents (global_step / opt_step / epoch).
     """
     import json
 
-    accelerator.load_state(state_dir)
     meta_path = os.path.join(state_dir, "trainer_state.json")
+    meta = {"global_step": 0, "opt_step": 0, "epoch": 0}
     if os.path.isfile(meta_path):
         with open(meta_path) as f:
-            return json.load(f)
-    return {"global_step": 0, "opt_step": 0, "epoch": 0}
+            meta = json.load(f)
+    elif require_stage2:
+        raise ValueError('Stage2 full-state completion marker missing; use warm-start')
+    if require_stage2:
+        validate_stage2_full_state(state_dir, meta)
+        counts = {name: len(getattr(accelerator, '_' + name, []))
+                  for name in ('models', 'optimizers', 'schedulers')}
+        if meta.get('accelerate_objects') != counts:
+            raise ValueError('Stage2 full state model/optimizer/scheduler registration mismatch')
+    accelerator.load_state(state_dir)
+    if require_stage2:
+        import random
+        import numpy as np
+        import torch
+        rng = torch.load(os.path.join(state_dir, f'stage2_rng_{accelerator.process_index}.pt'),
+                         map_location='cpu', weights_only=False)
+        random.setstate(rng['python'])
+        np.random.set_state(rng['numpy'])
+        torch.set_rng_state(rng['cpu'])
+        if 'cuda' in rng:
+            torch.cuda.set_rng_state_all(rng['cuda'])
+    return meta
 
 
 # --- Discovery (locate latest step) ---
@@ -388,3 +450,28 @@ def finalize_keep_weights_only(output_dir: str, keep_last_k: int = 1):
         if os.path.isfile(old):
             os.remove(old)
             logger.info("Removed old checkpoint after training completion: %s", old)
+
+
+def validate_stage2_full_state(state_dir, meta):
+    """Reject warm starts, missing backend files and mismatched independent assets."""
+    from pathlib import Path
+    from openwam.model.goal.runtime import goal_asset_sha256
+    state = meta.get('stage2', {})
+    if state.get('version') != 'openwam.stage2.trainer.v1' or not meta.get('full_state_files'):
+        raise ValueError('Stage2 full state metadata missing; use warm-start')
+    for relative, size in meta['full_state_files'].items():
+        path = Path(relative)
+        if path.is_absolute() or '..' in path.parts:
+            raise ValueError('Invalid full state file path')
+        path = Path(state_dir) / path
+        if not path.is_file() or path.stat().st_size != size:
+            raise ValueError(f'Stage2 full state missing/truncated: {relative}')
+    asset = Path(state_dir).parent / 'goal/expert.safetensors'
+    if state.get('goal_asset_sha256') != goal_asset_sha256(asset):
+        raise ValueError('Stage2 full state frozen goal SHA256 mismatch')
+
+    unified = Path(state_dir).parent / f"checkpoint_step_{meta['global_step']}.safetensors"
+    if meta.get('unified_weights') != unified.name or not unified.is_file():
+        raise ValueError('Stage2 resume requires matching unified weights; use warm-start')
+    if goal_asset_sha256(unified) != meta.get('unified_sha256'):
+        raise ValueError('Stage2 resume unified weights SHA256 mismatch')

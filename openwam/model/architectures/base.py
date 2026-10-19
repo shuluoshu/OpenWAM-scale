@@ -188,6 +188,19 @@ class BaseWAMArchitecture(ABC, nn.Module):
         if cfg is not None:
             self._init_video_backbone(cfg)
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if (getattr(self, 'goal_expert', None) is not None
+                or getattr(self, '_frozen_dependencies_eval', False)):
+            for name in ('text_encoder', 'vae'):
+                dependency = getattr(self.video_backbone, name, None)
+                if isinstance(dependency, nn.Module):
+                    dependency.eval().requires_grad_(False)
+            expert = getattr(self, 'goal_expert', None)
+            if expert is not None:
+                expert.freeze()
+        return self
+
     @staticmethod
     def _cfg_get(cfg, key, default=None):
         if cfg is None:
@@ -630,6 +643,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
             proprio_encoder.to(dtype=dtype, device=device)
         for bb in self.backbones.values():
             bb.set_dtype_device(dtype, device)
+        for name in ('goal_expert', 'goal_adapter'):
+            module = getattr(self, name, None)
+            if module is not None:
+                module.to(dtype=dtype, device=device)
 
     # --- Normalizer (deployment) ---
 
@@ -663,7 +680,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
     # --- Checkpoint save / load ---
 
     def save_checkpoint(self, path: str, *, state_dict: dict | None = None) -> None:
-        """Save architecture state to safetensors. VLM params excluded (saved separately).
+        """Save unified weights; VLM and frozen goal teacher are separate assets.
 
         ``state_dict`` defaults to ``self.state_dict()`` (deploy export); the
         trainer passes a gathered state_dict (ZeRO/DDP all-gather) instead.
@@ -672,7 +689,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         if state_dict is None:
             state_dict = self.state_dict()
-        state_dict = _exclude_vlm_from_state_dict(state_dict)
+        from openwam.model.checkpoint_utils import exclude_frozen_goal
+        state_dict = exclude_frozen_goal(_exclude_vlm_from_state_dict(state_dict))
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         save_file(state_dict, path)
 
@@ -702,6 +720,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
         from safetensors.torch import load_file
 
         state_dict = load_file(path)
+        from openwam.model.checkpoint_utils import validate_goal_unified_keys, GOAL_EXPERT_PREFIX
+        validate_goal_unified_keys(self, state_dict)
         if expand_action_dim_from_checkpoint:
             from openwam.model.checkpoint_utils import expand_action_state_dict, infer_action_dimensions
 
@@ -713,6 +733,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
         has_vlm = getattr(self, "vlm_backbone", None) is not None
         has_meta = any(p.device.type == "meta" for p in self.parameters())
         missing, unexpected = self.load_state_dict(state_dict, strict=False, assign=has_meta)
+        # The independently loaded teacher is the only additional excluded prefix.
+        missing = [k for k in missing if not k.startswith(GOAL_EXPERT_PREFIX)]
         if strict and not has_vlm:
             if missing or unexpected:
                 raise RuntimeError(f"Strict load failed: missing={missing}, unexpected={unexpected}")
@@ -847,6 +869,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
         """
         for bb in self.backbones.values():
             bb.save_deploy_assets(output_dir, cfg)
+        from openwam.model.goal.runtime import save_goal_assets
+        save_goal_assets(self, output_dir, cfg)
 
     # --- Training: preprocessing ---
 
@@ -973,6 +997,15 @@ class BaseWAMArchitecture(ABC, nn.Module):
             all_action_masks.append(amask)
             all_video_masks.append(vmask)
 
+        strict_flags = [bool(s.get("stage2_strict_video_mask", False)) for s in samples]
+        if any(strict_flags):
+            if not all(strict_flags) or any(m is None for m in all_video_masks):
+                raise ValueError("Stage2 batches require consistent strict video masks")
+            if any(m.dtype != torch.bool or m.ndim != 1 for m in all_video_masks):
+                raise ValueError("Stage2 video_mask must be bool [T]")
+            if any("video_view_mask" not in s for s in samples):
+                raise ValueError("Stage2 samples require video_view_mask [T,3]")
+
         ref_flags = [r is not None for r in all_ref_images]
         if any(ref_flags) and not all(ref_flags):
             raise ValueError("Mixed reference images in batch: all samples must be consistent.")
@@ -983,6 +1016,29 @@ class BaseWAMArchitecture(ABC, nn.Module):
             vace_videos=all_vace_videos,
             ref_images=all_ref_images if ref_flags[0] else None,
         )
+
+        if getattr(self, 'goal_expert', None) is not None:
+            from openwam.model.goal.runtime import prepare_goal_inputs
+            for sample in batch:
+                if not all(key in sample for key in ('goal_observed_head', 'goal_head_valid', 'goal_seed')):
+                    raise ValueError('goal training requires explicit clean goal_observed_head, goal_head_valid and goal_seed')
+            heads = []
+            for sample in batch:
+                head = sample['goal_observed_head']
+                valid = bool(sample['goal_head_valid'])
+                if head is None:
+                    if valid:
+                        raise ValueError('valid head requires explicit clean RGB')
+                    head = torch.zeros(3, 1, 256, 320)
+                head = torch.as_tensor(head, device=_device, dtype=_dtype)
+                if tuple(head.shape) != (3, 1, 256, 320):
+                    raise ValueError('sample clean head must be [3,1,256,320]')
+                heads.append(head)
+            preprocessed.update(prepare_goal_inputs(self, torch.stack(heads), all_prompts,
+                preprocessed['context'], context_lens=preprocessed.get('seq_lens'),
+                head_valid=torch.tensor([sample['goal_head_valid'] for sample in batch],
+                    dtype=torch.bool, device=_device),
+                seeds=[int(sample['goal_seed']) for sample in batch]))
 
         action_data = torch.cat(all_actions, dim=0) if all_actions[0] is not None else None
 
@@ -1048,10 +1104,20 @@ class BaseWAMArchitecture(ABC, nn.Module):
             # the source-of-truth contract.
             temporal_factor = int(self.video_backbone.temporal_compression)
             latent_masks = [
-                downsample_video_mask_to_latent(~m, temporal_factor=temporal_factor, skip_first=skip_first)
-                for m in all_video_masks
+                downsample_video_mask_to_latent(~m, temporal_factor=temporal_factor,
+                    skip_first=skip_first, strict=bool(sample.get("stage2_strict_video_mask", False)))
+                for m, sample in zip(all_video_masks, samples)
             ]
             inputs["video_is_pad"] = torch.stack(latent_masks, dim=0).to(device=_device)
+
+        if any(strict_flags):
+            from openwam.model.architectures.utils.common import stage2_latent_view_mask
+            latent_hw = inputs["input_latents"].shape[-2:]
+            spatial_masks = [stage2_latent_view_mask(m,
+                torch.as_tensor(s["video_view_mask"], device=m.device), latent_hw,
+                temporal_factor=temporal_factor, skip_first=skip_first)
+                for m, s in zip(all_video_masks, samples)]
+            inputs["video_spatial_valid"] = torch.stack(spatial_masks).to(device=_device)
 
         return inputs
 
@@ -1163,6 +1229,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         # MoT design, attention itself does not consume sample-level padding.
         forward_inputs.pop("action_is_pad", None)
         forward_inputs.pop("video_is_pad", None)
+        forward_inputs.pop("video_spatial_valid", None)
 
         # Route per-sample proprio_mask through pipeline_inputs to
         # ``_append_proprio_context_token``. Internal-only key; pop'd there.
@@ -1259,6 +1326,23 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         vb = self.video_backbone
         tw = vb.scheduler.linear_timesteps_weights[timestep_ids].to(dtype=torch.float32, device=device)
+
+        spatial_valid = inputs.get("video_spatial_valid")
+        if spatial_valid is not None:
+            expected = (noise_pred.shape[0], noise_pred.shape[2], *noise_pred.shape[-2:])
+            if spatial_valid.dtype != torch.bool or tuple(spatial_valid.shape) != expected:
+                raise ValueError(f"video_spatial_valid must be bool {expected}")
+            valid = spatial_valid.to(device=noise_pred.device)
+            if video_is_pad is not None:
+                if tuple(video_is_pad.shape) != expected[:2]:
+                    raise ValueError("video_is_pad does not match trimmed spatial validity")
+                valid = valid & ~video_is_pad.to(device=valid.device, dtype=torch.bool)[:, :, None, None]
+            # Mask before squaring: invalid/nonfinite padding contributes neither
+            # a loss nor a gradient. Normalize by actual valid channel/cell count.
+            delta = torch.where(valid[:, None], noise_pred.float() - target.float(), 0.)
+            count = valid.sum(dim=(1, 2, 3)) * noise_pred.shape[1]
+            per_sample = delta.square().sum(dim=(1, 2, 3, 4)) / count.clamp(min=1)
+            return (per_sample * tw).mean()
 
         per_element = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
         per_frame = per_element.mean(dim=(1, 3, 4))
@@ -1414,6 +1498,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
         cfg_scale: float = 1.0,
         cfg_merge: bool = False,
         active_action_mask: Optional[Tensor] = None,
+        goal_observed_head=None,
+        goal_head_valid: bool = True,
+        goal_seed: Optional[int] = None,
         **extra_pipeline_inputs: Any,
     ) -> dict:
         """Execute joint video-action denoising driven by a schedule.
@@ -1428,6 +1515,11 @@ class BaseWAMArchitecture(ABC, nn.Module):
             action_num_frames: Raw state/action window length. Generated
                 action chunk length is ``action_num_frames - 1``. Defaults to
                 ``num_frames`` for datasets whose video/action rates match.
+            goal_observed_head: Explicit clean head RGB PIL image or normalized
+                ``[1,3,1,256,320]`` tensor. Required for a valid Stage2 head.
+            goal_head_valid: Missing-head flag; false masks the 80 memory tokens.
+            goal_seed: Per-example predicted-goal seed, defaults to ``seed``.
+                Evaluation should pass the dataset sample's ``goal_seed``.
             active_action_mask: Optional ``(action_dim,)`` boolean mask for the
                 benchmark being generated. Inactive unified-action dimensions
                 stay on their analytic zero-padding noise path. When omitted,
@@ -1435,7 +1527,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         Returns:
             dict with ``video`` (list of PIL images or None) and
-            ``actions`` ((T, action_dim) numpy array).
+            ``actions`` (physical actions when a normalizer is attached), plus
+            ``normalized_actions`` in the model's training coordinates.
         """
         import time
 
@@ -1489,6 +1582,15 @@ class BaseWAMArchitecture(ABC, nn.Module):
             cfg_scale=cfg_scale,
             cfg_merge=cfg_merge,
         )
+
+        if getattr(self, 'goal_expert', None) is not None:
+            if any(k in extra_pipeline_inputs for k in ('goal_latent', 'goal_token_valid')):
+                raise ValueError('Stage2 inference conditions on predicted goals only')
+            from openwam.model.goal.runtime import prepare_inference_goal_inputs
+            inputs_shared.update(prepare_inference_goal_inputs(self, goal_observed_head,
+                [prompt], inputs_shared['context'], head_valid=[goal_head_valid],
+                seeds=[seed if goal_seed is None else goal_seed],
+                context_lens=inputs_shared.get('seq_lens', inputs_shared.get('context_lens'))))
 
         if profile:
             if torch.cuda.is_available():
@@ -1626,11 +1728,12 @@ class BaseWAMArchitecture(ABC, nn.Module):
             video_frames = None
 
         actions = action_latents.squeeze(0).float().cpu().numpy()
+        normalized_actions = actions.copy()
         normalizer = getattr(self, "normalizer", None)
         if normalizer is not None:
             actions = normalizer.unnormalize(actions)
 
-        return {"video": video_frames, "actions": actions}
+        return {"video": video_frames, "actions": actions, "normalized_actions": normalized_actions}
 
     # --- §15: Classifier-Free Guidance helpers (inference-time) ---
 
@@ -1757,6 +1860,7 @@ def _combine_cfg(uncond: Tensor, cond: Tensor, scale: float) -> Tensor:
 # Keys in ``inputs_shared`` that carry a leading batch axis and therefore
 # need duplication when stacking ``[uncond, cond]`` for cfg_merge=True.
 _CFG_BATCH_AXIS_KEYS: tuple = (
+    "goal_latent", "goal_token_valid",
     "latents",
     "input_latents",
     "proprio",

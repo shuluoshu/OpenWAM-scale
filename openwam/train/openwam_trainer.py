@@ -85,6 +85,10 @@ class OpenWAMTrainer:
                 logger.info("Reproducible mode: cfg.project.seed=%d (rank=%d)", self._run_seed, self._rank)
 
         t = cfg.training
+        from openwam.train.utils.stage2 import is_stage2, validate_stage2_config
+        self._stage2 = is_stage2(cfg)
+        if getattr(self, '_stage2', False):
+            validate_stage2_config(cfg)
         m = cfg.model
 
         # Build architecture (creates video_backbone internally from config).
@@ -138,6 +142,13 @@ class OpenWAMTrainer:
             resolved_arch.canonical.variant,
         )
 
+        if getattr(self, '_stage2', False) and getattr(self.architecture, 'goal_expert', None) is None:
+            # Baseline strict weights load precedes the new adapter; goal setup
+            # must precede both optimizer construction and parent train toggles.
+            from openwam.model.goal.runtime import configure_goal
+            configure_goal(self.architecture, cfg,
+                           checkpoint_dir=resume_path if resume_path else None)
+
         # Device placement: skip .to(device) when initialize_model_on_cpu and a real
         # training Accelerator is present — DeepSpeed's prepare() then handles the move.
         _init_on_cpu = bool(t.get("initialize_model_on_cpu", False))
@@ -184,6 +195,8 @@ class OpenWAMTrainer:
         Three entry modes (train.yaml finetune/resume fields): fresh, finetune warm-start
         (weights loaded at construction), or resume (load full state after prepare).
         """
+        if getattr(self, '_stage2', False):
+            return self.train_stage2(num_epochs=num_epochs, max_steps=max_steps)
         t = self.cfg.training
         num_epochs = num_epochs or cfg_get(t, "num_epochs", None)
         num_epochs = int(num_epochs) if num_epochs is not None else None
@@ -379,15 +392,196 @@ class OpenWAMTrainer:
         pbar.close()
         self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
 
+    def stage2_sampling_state(self):
+        """Committed state only; safe to persist on an optimizer boundary."""
+        from openwam.train.utils.stage2 import stage2_resume_contract
+        identity = self.dataset.normalization_identity()
+        return dict(training_contract=stage2_resume_contract(self.cfg),version='openwam.stage2.trainer.v1',
+            goal_asset_sha256=self.architecture.goal_asset_identity,
+            goal_prediction=dict(num_steps=int(self.architecture.goal_config.get('num_steps', 20)),
+                                 input_policy='clean_head', mode='predicted'),
+            progress=self._stage2_progress.state_dict(),
+            sampler=self._stage2_sampler.state_dict(committed_offset=self._stage2_progress.epoch_offset),
+            normalization=dict(selection_sha256=identity['selection_sha256'],
+                               registry_sha256=identity['registry_sha256']))
+
+    def restore_stage2_sampling_state(self, metadata):
+        """Strict restore contract; legacy/warm-start counters cannot resume."""
+        state = metadata.get('stage2')
+        if not isinstance(state, dict) or state.get('version') != 'openwam.stage2.trainer.v1':
+            raise ValueError('Stage2 resume requires explicit sampler/counter metadata; use warm-start')
+        from openwam.train.utils.stage2 import stage2_resume_contract
+        if state.get('training_contract') != stage2_resume_contract(self.cfg):
+            raise ValueError('Stage2 resume training/scheduler/augmentation contract mismatch; use warm-start')
+        if state.get('goal_asset_sha256') != self.architecture.goal_asset_identity:
+            raise ValueError('Stage2 resume frozen goal identity mismatch')
+        prediction = dict(num_steps=int(self.architecture.goal_config.get('num_steps', 20)),
+                          input_policy='clean_head', mode='predicted')
+        if state.get('goal_prediction') != prediction:
+            raise ValueError('Stage2 resume goal prediction policy mismatch')
+        identity = self.dataset.normalization_identity()
+        expected = dict(selection_sha256=identity['selection_sha256'], registry_sha256=identity['registry_sha256'])
+        if state.get('normalization') != expected:
+            raise ValueError('Stage2 resume selection/normalization identity mismatch')
+        self._stage2_progress.load_state_dict(state['progress'])
+        self._stage2_sampler.load_state_dict(state['sampler'])
+        if (self._stage2_sampler.epoch != self._stage2_progress.epoch or
+                self._stage2_sampler.offset != self._stage2_progress.epoch_offset):
+            raise ValueError('Stage2 resume sampler/counter offset mismatch')
+        next_draw = self._stage2_sampler.epoch*self._stage2_sampler.draws_per_epoch+self._stage2_sampler.offset
+        if next_draw != self._stage2_progress.consumed_draws:
+            raise ValueError('Stage2 resume absolute committed draw mismatch')
+        for key in ('global_step', 'opt_step'):
+            if key in metadata and metadata[key] != self._stage2_progress.opt_step:
+                raise ValueError(f'Stage2 resume {key} counter mismatch')
+
+    def _evaluate_stage2(self, output_path, opt_step, *, final=False):
+        from openwam.train.stage2_eval import (build_fixed_cases, evaluate_stage2,
+            completed_evaluation, _agree_error, _same)
+        error = None
+        try:
+            if not hasattr(self, '_stage2_eval_cases'):
+                self._stage2_eval_cases = build_fixed_cases(self.cfg, output_path)
+            cases = self._stage2_eval_cases
+            seed = int(self.cfg.project.seed)
+            num_steps = int(getattr(self.cfg.evaluation, 'num_steps', 20))
+            complete = completed_evaluation(output_path, cases, step=opt_step, seed=seed, num_steps=num_steps)
+        except Exception as exc:
+            error = f'{type(exc).__name__}: {exc}'
+        _agree_error(error, 'fixed-case construction/resume')
+        _same(complete)
+        if complete:
+            return
+        # ZeRO1/2 parameters are replicated, but generation/backbone collectives
+        # still require this identical call on every rank. Never branch on is_main.
+        architecture = self.accelerator.unwrap_model(self.architecture)
+        evaluate_stage2(architecture, cases, output_path, step=opt_step, seed=seed, num_steps=num_steps)
+
+    def train_stage2(self, num_epochs=None, max_steps=None):
+        """Stage2 counts successful optimizer updates; legacy train() stays unchanged.
+
+        Global draws are sharded exactly once by Accelerate. Sampling state uses
+        consumed batches rather than the prefetched sampler iterator cursor.
+        """
+        import json
+        import time
+        from tqdm import tqdm
+        from openwam.train.utils.stage2 import Stage2Progress
+        t = self.cfg.training
+        if num_epochs is not None:
+            raise ValueError('Stage2 uses max_steps optimizer updates, not num_epochs')
+        max_updates = int(max_steps if max_steps is not None else t.max_steps)
+        self._stage2_max_updates = max_updates
+        batch_size = int(t.batch_size)
+        accumulation = int(t.gradient_accumulation_steps)
+        self._stage2_progress = Stage2Progress(batch_size, int(self.accelerator.num_processes), accumulation)
+        optimizer = self.build_optimizer()
+        dataloader = self.build_dataloader(batch_size)
+        scheduler = self.build_lr_scheduler(optimizer, max_updates, debug=bool(t.debug))
+        save_steps = int(t.save_steps or 0)
+        keep_last_k = int(t.keep_last_k_ckpts)
+        is_main = self.accelerator.is_main_process
+        output_path, resume_state_dir = self.setup_output_dir(bool(t.debug), t.resume_ckpt_path)
+        optimizer, dataloader, scheduler = self.prepare_accelerate(optimizer, dataloader, scheduler)
+        if resume_state_dir:
+            # Validate counters/topology before mutating model or optimizer state.
+            with open(os.path.join(resume_state_dir, 'trainer_state.json')) as stream:
+                metadata = json.load(stream)
+            self.restore_stage2_sampling_state(metadata)
+            load_full_state(self.accelerator, resume_state_dir, require_stage2=True)
+        progress = self._stage2_progress
+        all_params = [p for group in optimizer.param_groups for p in group['params']]
+        max_grad_norm = float(t.max_grad_norm) if t.max_grad_norm else None
+        wandb_run = None if (t.debug or not is_main) else init_wandb(self.cfg)
+        last_eval = None
+
+        def evaluate(final=False):
+            nonlocal last_eval
+            if last_eval != progress.opt_step:
+                self._evaluate_stage2(output_path, progress.opt_step, final=final)
+                last_eval = progress.opt_step
+
+        def save(final=False):
+            if not save_steps:
+                return
+            save_weights(self.accelerator, self.architecture, output_path, progress.opt_step, final=final)
+            if t.save_full_states_for_resume:
+                save_full_state(self.accelerator, output_path, progress.opt_step, progress.opt_step,
+                    progress.epoch, trainer_metadata={'stage2': self.stage2_sampling_state()})
+            if is_main:
+                manage_checkpoints(output_path, keep_last_k)
+
+        evaluate()
+        pbar = tqdm(total=max_updates, initial=min(progress.opt_step, max_updates), unit='update', desc='Stage2')
+        last_time = time.monotonic()
+        if progress.opt_step < max_updates:
+            for epoch in itertools.count(progress.epoch):
+                progress.begin_epoch(epoch)
+                if hasattr(dataloader, 'set_epoch'):
+                    dataloader.set_epoch(epoch)
+                self._stage2_sampler.set_epoch(epoch)
+                for batch in dataloader:
+                    if self._run_seed is not None:
+                        seed = per_step_seed(self._run_seed, rank=self._rank, step=progress.micro_step)
+                        torch.manual_seed(seed)
+                        if torch.cuda.is_available():
+                            torch.cuda.manual_seed_all(seed)
+                    grad_norm = None
+                    with self.accelerator.accumulate(self.architecture):
+                        losses = self.compute_loss(batch)
+                        loss = losses['total']
+                        self.accelerator.backward(loss)
+                        grad_norm = loss.new_tensor(0.)
+                        synced = bool(self.accelerator.sync_gradients)
+                        if synced:
+                            if max_grad_norm is not None:
+                                grad_norm = loss.new_tensor(float(self.accelerator.clip_grad_norm_(all_params, max_grad_norm)))
+                            optimizer.step()
+                            skipped = bool(self.accelerator.optimizer_step_was_skipped)
+                            if scheduler is not None and not skipped:
+                                scheduler.step()
+                            optimizer.zero_grad()
+                        else:
+                            skipped = False
+                    updated = progress.consume(sync_gradients=synced, optimizer_step_skipped=skipped)
+                    metrics = reduce_step_metrics(self.accelerator, losses, grad_norm)
+                    now = time.monotonic()
+                    self.log_step(metrics=metrics, global_step=progress.micro_step, opt_step=progress.opt_step,
+                        epoch=epoch, lr=optimizer.param_groups[0]['lr'], steps_per_sec=1/max(now-last_time, 1e-9),
+                        batch_size=batch_size, pbar=None, wandb_run=wandb_run, debug=bool(t.debug), output_path=output_path)
+                    last_time = now
+                    if updated:
+                        pbar.update(1)
+                        pbar.set_postfix(loss=metrics['loss_total'], micro_step=progress.micro_step)
+                        if progress.opt_step % int(self.cfg.evaluation.every_updates) == 0:
+                            evaluate()
+                        if save_steps and progress.opt_step % save_steps == 0 and progress.opt_step < max_updates:
+                            save()
+                        if progress.opt_step >= max_updates:
+                            break
+                if progress.opt_step >= max_updates:
+                    break
+        pbar.close()
+        evaluate(final=True)
+        # Retain final full resume state. Legacy finish_training removes it.
+        save(final=True)
+        self.accelerator.wait_for_everyone()
+        if wandb_run is not None:
+            wandb_run.finish()
+
     # (3) Called by train() first — AdamW over the per-module (action/video) LR param groups.
     def build_optimizer(self) -> torch.optim.Optimizer:
         """AdamW over the per-module (action/video) LR parameter groups."""
         t = self.cfg.training
-        params = build_trainable_parameters(
-            self,
-            action_lr=float(t.action_lr) if getattr(t, "action_lr", None) else None,
-            video_lr=float(t.video_lr) if getattr(t, "video_lr", None) else None,
-        )
+        if getattr(self, '_stage2', False):
+            from openwam.train.utils.stage2 import build_stage2_parameter_groups
+            params = build_stage2_parameter_groups(self.architecture, t)
+        else:
+            params = build_trainable_parameters(
+                self,
+                action_lr=float(t.action_lr) if getattr(t, "action_lr", None) else None,
+                video_lr=float(t.video_lr) if getattr(t, "video_lr", None) else None,
+            )
         betas = tuple(getattr(t, "adam_betas", [0.9, 0.95]))
         return torch.optim.AdamW(params, lr=float(t.learning_rate), weight_decay=float(t.weight_decay), betas=betas)
 
@@ -408,6 +602,28 @@ class OpenWAMTrainer:
         from openwam.dataloader.mixture import MixtureDataset
 
         t = self.cfg.training
+        if getattr(self, '_stage2', False):
+            from openwam.train.utils.stage2 import GlobalDrawSampler, required_draws
+            from openwam.train.utils.seeding import dataloader_worker_init_fn, make_dataloader_generator
+            n_proc = int(self.accelerator.num_processes)
+            count = required_draws(max_updates=getattr(self, '_stage2_max_updates', t.max_steps),
+                accumulation=t.gradient_accumulation_steps, batch_size=batch_size, world_size=n_proc)
+            identity = self.dataset.normalization_identity()
+            self._stage2_sampler = GlobalDrawSampler(count, seed=self.dataset.seed,
+                selection_identity=identity['selection_sha256'])
+            workers = int(t.dataset_num_workers)
+            kwargs = dict(batch_size=batch_size, sampler=self._stage2_sampler,
+                shuffle=False, drop_last=True, num_workers=workers, collate_fn=list,
+                pin_memory=True, generator=make_dataloader_generator(int(self._run_seed), rank=0),
+                worker_init_fn=dataloader_worker_init_fn)
+            if workers:
+                # Spawn prevents inheritance of the parent's initialized CUDA context.
+                # Dataset.__getstate__ clears readers/caches in each worker.
+                kwargs.update(multiprocessing_context='spawn', prefetch_factor=1)
+            logger.info('Stage2 global batch=%d; global draws/epoch=%d; aggregate reader cache <=%d bytes',
+                batch_size*n_proc*int(t.gradient_accumulation_steps), count,
+                max(workers, 1)*n_proc*int(self.cfg.dataloader.max_cache_bytes))
+            return torch.utils.data.DataLoader(self.dataset, **kwargs)
         shuffle = not isinstance(self.dataset, MixtureDataset)
         kwargs: dict = dict(
             batch_size=batch_size,

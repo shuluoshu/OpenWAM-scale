@@ -49,7 +49,8 @@ class MoraRelativeRepresentation:
 
     def __init__(self, info, *, state_key="observation.states.eef",
                  joint_state_key="observation.states.joint", tcp_pose_keys=None,
-                 tcp_from_eef=None, joint_indices=None, gripper_command_sources=None):
+                 tcp_from_eef=None, joint_indices=None, gripper_command_sources=None,
+                 gripper_state_sources=None):
         self.features = info.get("features", {})
         self.state_key = state_key
         self.joint_state_key = joint_state_key
@@ -105,8 +106,16 @@ class MoraRelativeRepresentation:
             if len(set(all_indices)) != len(all_indices):
                 raise ValueError("joint_indices must not repeat source indices")
             self.columns.append(joint_state_key)
-        elif joint_indices:
+        elif joint_indices and any(joint_indices.values()):
             raise ValueError(f"joint_indices supplied but {joint_state_key} is absent")
+        self.gripper_states = None
+        if gripper_state_sources is not None:
+            # Reuse the validated scalar mapping; measured inputs never shift rows.
+            if any(spec.get("row_offset", 0) != 0 or "kind" in spec
+                   for spec in gripper_state_sources.values()):
+                raise ValueError("measured gripper sources must be same-row physical openness")
+            self.gripper_states = GripperCommands(info, gripper_state_sources)
+            self.columns.extend(self.gripper_states.columns)
         self.gripper_commands = GripperCommands(info, gripper_command_sources)
         self.columns = list(dict.fromkeys([*self.columns, *self.gripper_commands.columns]))
         self.contract = {
@@ -127,9 +136,24 @@ class MoraRelativeRepresentation:
                 gripper_command_timing="robot cmd[t:t+H]; human stored action targets[t:t+H] (already future-aligned)",
                 missing_gripper_command="mask_unavailable_gripper_target",
             )
+        if self.gripper_states is not None:
+            self.contract["gripper_state_sources"] = self.gripper_states.sources
         schema = {key: self.features[key] for key in self.columns}
         digest = json.dumps({"contract": self.contract, "schema": schema}, sort_keys=True).encode()
         self.contract["schema_fingerprint"] = hashlib.sha256(digest).hexdigest()
+
+    def measured_grippers(self, columns, n):
+        """Physical clipped inputs shared by representation and spike filtering."""
+        measured = np.full((n, 2), np.nan, np.float32)
+        if self.gripper_states is not None:
+            values, valid = self.gripper_states.align(columns, n)
+            measured[valid] = values[valid]
+        elif self.state_key in columns:
+            eef = np.asarray(columns[self.state_key], np.float32)
+            for side, index in enumerate((9, 19)):
+                if eef.shape[1] > index:
+                    measured[:, side] = eef[:, index]
+        return np.where(np.isfinite(measured), np.clip(measured, 0, 1), np.nan)
 
     def _absolute_values(self, columns):
         """Return source TCP/gripper/joint values and per-component masks.
@@ -145,11 +169,11 @@ class MoraRelativeRepresentation:
         valid = np.zeros((n, RAW_DIM), dtype=bool)
         eef = np.asarray(columns[self.state_key], dtype=np.float32) if self.state_key in columns else None
         joints = np.asarray(columns[self.joint_state_key], dtype=np.float32) if self.joint_state_key in columns else None
+        measured = self.measured_grippers(columns, n)
         for side_id, side in enumerate(SIDES):
             start = side_id * 10
-            if eef is not None and eef.shape[1] >= start + 10:
-                values[:, start + 9] = eef[:, start + 9]
-                valid[:, start + 9] = np.isfinite(eef[:, start + 9])
+            values[:, start + 9] = measured[:, side_id]
+            valid[:, start + 9] = np.isfinite(measured[:, side_id])
             key = self.tcp_pose_keys.get(side)
             if key is not None:
                 pose = np.asarray(columns[key], dtype=np.float32)

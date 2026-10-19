@@ -110,6 +110,14 @@ def _inject_project_seed(cfg: DictConfig) -> None:
 def _train(cfg: DictConfig) -> None:
     """Package-native training path."""
     _inject_project_seed(cfg)
+    from openwam.train.utils.stage2 import is_stage2, validate_stage2_launch
+    if is_stage2(cfg):
+        preflight = bool(cfg.goal.preflight)
+        summary = validate_stage2_launch(cfg, metadata_only=preflight)
+        if preflight:
+            import json
+            print(json.dumps(summary, indent=2), flush=True)
+            return
     _train_openwam(cfg)
 
 

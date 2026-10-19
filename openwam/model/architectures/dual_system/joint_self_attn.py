@@ -149,10 +149,11 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
 
         driver = self._mot_driver or self.build_mot_driver()
 
-        def _run_joint_loop(vstate, astate):
+        def _run_joint_loop(vstate, astate, goal_keys=None, goal_values=None, goal_token_valid=None):
             return driver.run_joint_loop(
                 vstate,
                 astate,
+                goal_keys=goal_keys, goal_values=goal_values, goal_token_valid=goal_token_valid,
                 use_gradient_checkpointing=False,
                 use_gradient_checkpointing_offload=False,
             )
@@ -184,6 +185,14 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
                 "architecture.__init__ to enable forward()."
             )
 
+        goal_latent = pipeline_inputs.pop("goal_latent", None)
+        goal_token_valid = pipeline_inputs.pop("goal_token_valid", None)
+        goal_keys = goal_values = None
+        if goal_latent is not None:
+            goal_keys, goal_values = self.goal_adapter(goal_latent, vb)
+        elif getattr(self, "goal_expert", None) is not None:
+            raise ValueError("goal-enabled forward requires prepared predicted goal tensors")
+
         pipeline_inputs = self._append_proprio_context_token(dict(pipeline_inputs), proprio)
         action_context = pipeline_inputs.get("context")
         action_context_mask = pipeline_inputs.get("context_mask")
@@ -208,6 +217,8 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
             **pipeline_inputs,
         )
 
+        if goal_latent is not None and (noisy_actions is None or ab is None):
+            raise ValueError("goal memory requires joint video/action forward")
         if noisy_actions is None or ab is None:
             for block_id in range(vb.num_layers):
                 vstate = vb.run_block(block_id, vstate)
@@ -228,13 +239,14 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         compiled_loop = getattr(self, "_compiled_mot_run_joint_loop", None)
         if compiled_loop is not None and not use_gradient_checkpointing and not use_gradient_checkpointing_offload:
             try:
-                vstate, astate = compiled_loop(vstate, astate)
+                vstate, astate = compiled_loop(vstate, astate, goal_keys, goal_values, goal_token_valid)
             except Exception as exc:
                 self._compiled_mot_run_joint_loop = None
                 logger.warning("dual self-attn compiled MoT loop failed; falling back to eager: %s", exc)
                 vstate, astate = driver.run_joint_loop(
                     vstate,
                     astate,
+                    goal_keys=goal_keys, goal_values=goal_values, goal_token_valid=goal_token_valid,
                     use_gradient_checkpointing=use_gradient_checkpointing,
                     use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                 )
@@ -242,6 +254,7 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
             vstate, astate = driver.run_joint_loop(
                 vstate,
                 astate,
+                goal_keys=goal_keys, goal_values=goal_values, goal_token_valid=goal_token_valid,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             )

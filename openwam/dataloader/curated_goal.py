@@ -64,6 +64,34 @@ def parse_curated_yaml(path, data_root=None):
     return dict(source_yaml=str(path),data_root=str(root),repos=repos)
 
 
+def language_intervals(labels, task_mapping, annotations, length):
+    """Shared language-only parser. Repeated IDs remain separate contiguous runs."""
+    from openwam.dataloader.subtask_goal import contiguous_subtasks
+    if labels['frame_index'] != list(range(length)):
+        raise ValueError('source frame indices must be dense unique complete')
+    tasks=[]; start=0
+    for end in range(1,length+1):
+        if end==length or labels['task_index'][end]!=labels['task_index'][start]:
+            index=int(labels['task_index'][start]); text=task_mapping[index]
+            if not isinstance(text,str) or not text.strip():raise ValueError('invalid task text')
+            tasks.append(dict(start=start,end_exclusive=end,text=text,task_index=index));start=end
+    if annotations is None:return tasks,[]
+    for row in annotations:
+        if type(row['subtask_index']) is not int or not isinstance(row['subtask'],str) or not row['subtask'].strip():
+            raise ValueError('malformed present subtask annotation row')
+        if ('start_frame' in row)!=('end_frame' in row):raise ValueError('incomplete annotation interval')
+        if 'start_frame' in row and not (type(row['start_frame']) is int and type(row['end_frame']) is int and 0<=row['start_frame']<row['end_frame']<=length):
+            raise ValueError('invalid present annotation interval')
+    runs=contiguous_subtasks(labels,annotations,length)
+    for run in runs:
+        reasons=set(run['exclusion_reasons'])
+        absent=reasons & {'negative_or_missing_subtask_index','source_subtask_unannotated'}
+        conflicts=reasons & {'missing_subtask_text','annotation_interval_does_not_cover_frame_run'}
+        if annotations and conflicts and not absent:
+            raise ValueError(f'inconsistent subtask annotation: {run["start"]}:{run["end_exclusive"]}: {sorted(conflicts)}')
+    return tasks,[s for s in runs if s['valid']]
+
+
 class CuratedGoalDataset:
     def __init__(self,source_yaml,cache_dir,seed=42,subtask_probability=.5,
                  max_cached_episodes=8,dtype=torch.bfloat16,data_root=None):
@@ -107,31 +135,14 @@ class CuratedGoalDataset:
             if 'subtask_unannotated' in names:columns+=['subtask_unannotated']
         labels=pq.read_table(data,columns=columns,filters=[('episode_index','=',episode)]).sort_by('frame_index').to_pydict()
         if labels['frame_index']!=list(range(length)):raise ValueError('source frame indices must be dense unique complete')
-        tasks=[];start=0
-        for end in range(1,length+1):
-            if end==length or labels['task_index'][end]!=labels['task_index'][start]:
-                index=int(labels['task_index'][start]);tasks.append(dict(start=start,end_exclusive=end,text=task_text(root,index),task_index=index));start=end
-        subtasks=[]
+        annotations=None
         if has_annotations:
             annotation_names=pq.ParquetFile(ann).schema_arrow.names
-            if not {'episode_index','subtask_index','subtask'}.issubset(annotation_names):raise ValueError('malformed present subtask annotations')
+            if not {'episode_index','subtask_index','subtask'}.issubset(annotation_names):
+                raise ValueError('malformed present subtask annotations')
             annotations=pq.read_table(ann,filters=[('episode_index','=',episode)]).to_pylist()
-            # Empty rows mean no usable annotations for this episode, not a schema failure.
-            for row in annotations:
-                if type(row['subtask_index']) is not int or not isinstance(row['subtask'],str) or not row['subtask'].strip():
-                    raise ValueError('malformed present subtask annotation row')
-                if ('start_frame' in row)!=('end_frame' in row):raise ValueError('incomplete annotation interval')
-                if 'start_frame' in row and not (type(row['start_frame']) is int and type(row['end_frame']) is int and 0<=row['start_frame']<row['end_frame']<=length):
-                    raise ValueError('invalid present annotation interval')
-            runs=contiguous_subtasks(labels,annotations,length)
-            for run in runs:
-                reasons=set(run['exclusion_reasons'])
-                explicitly_absent=reasons & {'negative_or_missing_subtask_index','source_subtask_unannotated'}
-                conflicts=reasons & {'missing_subtask_text','annotation_interval_does_not_cover_frame_run'}
-                if annotations and conflicts and not explicitly_absent:
-                    raise ValueError(f'inconsistent subtask annotation: {root}:{episode} '
-                                     f'frames [{run["start"]},{run["end_exclusive"]}): {sorted(conflicts)}')
-            subtasks=[s for s in runs if s['valid']]
+        mapping={int(i):task_text(root,int(i)) for i in set(labels['task_index'])}
+        tasks,subtasks=language_intervals(labels,mapping,annotations,length)
         for _,start,end in (s for s in repo['ranges'] if s[0]==episode):
             if end>length:raise ValueError('curated range exceeds original episode')
         result=dict(root=root,info=info,ep=ep,length=length,data=data,head=head,tasks=tasks,subtasks=subtasks,annotation_file=str(ann) if has_annotations else None)
