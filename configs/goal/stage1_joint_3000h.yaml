@@ -1,0 +1,6 @@
+base_config: stage1_joint_base.yaml
+dataset:
+  source_yaml: ../../pretrain/launch/moravla/train_files/pretrain_v0_3_curated_3000h.yaml
+  cache_dir: outputs/stage1_3000h/cache
+max_steps: 100000
+eval_every: 500

@@ -117,3 +117,13 @@ def test_transform_rejects_malformed_matrix_or_points():
             transform_points(transform, POINTS)
     with pytest.raises(ValueError):
         transform_points(np.eye(4), [1, 2])
+
+
+def test_transform_accepts_float32_homogeneous_roundoff_but_not_projective_rows():
+    transform = np.eye(4)
+    transform[3, 3] = 0.9999997615814209  # actual EgoDex terminal-row export
+    np.testing.assert_allclose(transform_points(transform, POINTS), POINTS)
+    for row in ([0, 0, 0, .999], [1e-4, 0, 0, 1]):
+        transform[3] = row
+        with pytest.raises(ValueError):
+            transform_points(transform, POINTS)

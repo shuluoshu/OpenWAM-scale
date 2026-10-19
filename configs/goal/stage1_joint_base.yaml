@@ -1,0 +1,55 @@
+# Shared Stage 1: image and 4D TCP patch joint flow matching.
+baseline_checkpoint: ${oc.env:OPENWAM_BASELINE_CHECKPOINT,models/openwam_alpha_v0.1/checkpoint.safetensors}
+shift: 5.0
+dtype: bfloat16
+batch_size: 1
+learning_rate: 1.0e-05
+max_steps: 5000
+eval_every: 500
+sampling_steps: 20
+gradient_checkpointing: true
+components:
+  dit:
+    model_class: openwam.model.video_backbone.wan.models.dit.WanModel
+    extra_kwargs:
+      has_image_input: false
+      patch_size:
+      - 1
+      - 2
+      - 2
+      in_dim: 48
+      dim: 3072
+      ffn_dim: 14336
+      freq_dim: 256
+      text_dim: 4096
+      out_dim: 48
+      num_heads: 24
+      num_layers: 30
+      eps: 1.0e-06
+      seperated_timestep: true
+      require_clip_embedding: false
+      require_vae_embedding: false
+      fuse_vae_embedding_in_latents: true
+  vae:
+    model_class: openwam.model.video_backbone.wan.models.vae.WanVideoVAE38
+    extra_kwargs: {}
+  text_encoder:
+    model_class: openwam.model.video_backbone.wan.models.text_encoder.WanTextEncoder
+    extra_kwargs: {}
+tokenizer:
+  model_class: openwam.model.video_backbone.wan.models.text_encoder.HuggingfaceTokenizer
+  subdir: tokenizer/google/umt5-xxl
+  kwargs:
+    name: null
+    seq_len: 512
+    clean: whitespace
+lambda_image: 0.5
+lambda_tcp: 1.0
+text_device: cpu
+text_cache_size: 32
+dataset:
+  source_yaml: null
+  cache_dir: outputs/stage1_joint/cache
+  max_cached_episodes: 8
+  subtask_probability: 0.5
+  data_root: null
