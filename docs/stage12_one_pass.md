@@ -1,5 +1,7 @@
 # Stage1 完整遍历一轮 → 冻结 → Stage2
 
+本文默认描述原 15 FPS / 8 卡配置；新增 [3 FPS / 单机 32 卡版本](stage12_3fps_32gpu.md) 使用独立 preset 和输出目录。
+
 本入口针对当前 **query latent + 10 帧头部历史** 方案。先训练 Stage1 图像/TCP 辅助任务，覆盖全部选定的有效当前帧与指令配对；最后一个更新完成并保存完整检查点后，自动启动原 Stage2 action/video mutual 训练。代码位于 `outputs/query_latent_20261020/code` 的 `codex/query-latent-goal` checkout。
 
 ## 一轮的定义：方案 2

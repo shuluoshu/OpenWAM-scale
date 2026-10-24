@@ -11,11 +11,20 @@ from collections import OrderedDict
 import hashlib
 import json
 import math
+import numbers
 from pathlib import Path
 import sqlite3
 import numpy as np
 
 VERSION=2
+
+
+def epoch_sample_fps(config):
+    """Current-frame sampling only; historical-frame and Stage2 rates are separate."""
+    value=config.get('sample_fps',15.0)
+    if isinstance(value,bool) or not isinstance(value,numbers.Real) or not math.isfinite(value) or value<=0:
+        raise ValueError('sample_fps must be a positive finite number')
+    return float(value)
 
 
 def sha256_file(path):
@@ -98,11 +107,13 @@ def _check_identity(dataset,metadata):
     if any(metadata.get(k)!=v for k,v in _identity(dataset).items()):raise ValueError('epoch index source identity mismatch')
 
 
-def validate_index(dataset,index_path):
+def validate_index(dataset,index_path,*,sample_fps=None):
     """Validate identity/completion and interval coverage; never decode images."""
     path=Path(index_path).resolve()
     with sqlite3.connect(f'{path.as_uri()}?mode=ro',uri=True) as c:
         m=_metadata(c);_check_identity(dataset,m)
+        if sample_fps is not None and m.get('sample_fps')!=epoch_sample_fps({'sample_fps':sample_fps}):
+            raise ValueError('epoch index sample_fps identity mismatch')
         if not m.get('complete'):raise ValueError('epoch index incomplete')
         _check_sources(c)
         expected=sum(len({e for e,_,_ in r['ranges']}) for r in dataset.repos)
@@ -119,7 +130,7 @@ def validate_index(dataset,index_path):
 
 
 def build_epoch_index(dataset,index_path,*,sample_fps=15.0):
-    if not math.isfinite(sample_fps) or sample_fps<=0:raise ValueError('sample_fps must be positive finite')
+    sample_fps=epoch_sample_fps({'sample_fps':sample_fps})
     path=Path(index_path);path.parent.mkdir(parents=True,exist_ok=True)
     with sqlite3.connect(path) as c:
         c.executescript('''CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -190,9 +201,9 @@ def build_epoch_index(dataset,index_path,*,sample_fps=15.0):
 
 
 class FiniteGoalDataset:
-    def __init__(self,dataset,index_path):
+    def __init__(self,dataset,index_path,*,sample_fps=None):
         self.dataset=dataset;self.index_path=Path(index_path).resolve()
-        self.summary=validate_index(dataset,self.index_path);self._connection=None;self._evaluations=None
+        self.summary=validate_index(dataset,self.index_path,sample_fps=sample_fps);self._connection=None;self._evaluations=None
         self._validated=OrderedDict()
     def __len__(self):return self.summary['total_samples']
     def _db(self):

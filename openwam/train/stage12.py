@@ -12,6 +12,15 @@ from openwam.train.goal_epoch import atomic_json,verify_completion,sha256
 ROOT=Path(__file__).resolve().parents[2]
 
 
+def single_node_torchrun(python,world,*,visible_devices=None):
+    """One worker per local GPU; the same launch contract is used for both stages."""
+    if isinstance(world,bool) or not isinstance(world,int) or world<1:
+        raise ValueError('world_size must be a positive integer')
+    if visible_devices is not None and visible_devices<world:
+        raise ValueError(f'world_size={world} requires {world} visible CUDA devices on this node; found {visible_devices}')
+    return [python,'-m','torch.distributed.run','--standalone',f'--nproc_per_node={world}']
+
+
 def epoch_identity(config,population,world):
     code=hashlib.sha256()
     for folder in ('openwam/model/goal','openwam/dataloader','openwam/train'):
@@ -71,8 +80,11 @@ def main(argv=None):
     parser.add_argument('--stage2-resume',help='explicit Stage2 full-state checkpoint if Stage2 was interrupted')
     args=parser.parse_args(argv)
     config=load_pipeline(args.config);output=Path(config['output_dir']);output.mkdir(parents=True,exist_ok=True)
-    world=int(config.get('world_size',8))
-    if world<1:raise ValueError('world_size must be positive')
+    world=config.get('world_size',8)
+    single_node_torchrun(sys.executable,world)
+    if args.train:
+        import torch
+        single_node_torchrun(sys.executable,world,visible_devices=torch.cuda.device_count())
     source=config['source_yaml'];index=output/'population.sqlite';stage1_output=output/'stage1'
     python=sys.executable
     env=os.environ.copy();env['PYTHONPATH']=str(ROOT)+os.pathsep+env.get('PYTHONPATH','')
@@ -103,10 +115,10 @@ def main(argv=None):
     prepared=json.loads((output/'prepared.json').read_text())
     registry=config.get('stats_registry') or prepared['stats_registry']
     from openwam.dataloader.curated_goal import CuratedGoalDataset
-    from openwam.dataloader.goal_epoch import validate_index
+    from openwam.dataloader.goal_epoch import validate_index,epoch_sample_fps
     ds=dict(stage1['dataset']);ds['cache_dir']=str(output/'check_cache')
     dataset=CuratedGoalDataset(**ds,seed=stage1.get('seed',42))
-    population=validate_index(dataset,index);identity=epoch_identity(stage1,population,world)
+    population=validate_index(dataset,index,sample_fps=epoch_sample_fps(stage1));identity=epoch_identity(stage1,population,world)
     from openwam.dataloader.curated_stage2 import CuratedStage2Dataset
     stage2['dataloader']['normalization_registry']=registry
     # Construction validates immutable registry bytes and exact selection/config contract.
@@ -114,12 +126,14 @@ def main(argv=None):
     for p in (stage1['baseline_checkpoint'],config.get('stage2_baseline')):
         if not p or not Path(p).exists():raise FileNotFoundError('baseline checkpoint missing: '+str(p))
     if args.check:
-        print(json.dumps(dict(identity=identity,stats_registry=registry,stage2_config=config['stage2_config']),indent=2));return 0
+        print(json.dumps(dict(identity=identity,sample_fps=population['sample_fps'],
+            stage1_updates=(population['total_samples']+world-1)//world,
+            torchrun=single_node_torchrun(python,world),stats_registry=registry,stage2_config=config['stage2_config']),indent=2));return 0
     if not args.resume and (output/'pipeline_state.json').exists():raise ValueError('existing pipeline requires --resume')
     old=json.loads((output/'pipeline_state.json').read_text()) if (output/'pipeline_state.json').exists() else {}
     if old.get('phase') in ('stage2','stage2_failed') and not args.stage2_resume:
         raise ValueError('interrupted Stage2 requires --stage2-resume full-state checkpoint; refusing implicit restart')
-    torchrun=[python,'-m','torch.distributed.run','--standalone',f'--nproc_per_node={world}']
+    torchrun=single_node_torchrun(python,world)
     command1=[*torchrun,*common,'--train']+(['--resume'] if args.resume else [])
     overrides=[f'dataloader.source_yaml={source}',f'dataloader.normalization_registry={registry}',
         'goal.checkpoint={goal_checkpoint}',f'project.output_dir={output / "stage2"}',

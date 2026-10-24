@@ -1,0 +1,3 @@
+# Only current-frame sampling changes; history ages and goal endpoints stay intact.
+base_config: stage1_query_history_epoch.yaml
+sample_fps: 3.0

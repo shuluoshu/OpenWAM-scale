@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an exact 15 FPS population or train it once with torchrun."""
+"""Build an exact configured-FPS population or train it once with torchrun."""
 from pathlib import Path
 import argparse
 import gc
@@ -27,10 +27,11 @@ def main(argv=None):
     import torch.distributed as dist
     from openwam.train.goal_curated import load_config,TextContextCache
     from openwam.dataloader.curated_goal import CuratedGoalDataset
-    from openwam.dataloader.goal_epoch import build_epoch_index,FiniteGoalDataset
+    from openwam.dataloader.goal_epoch import build_epoch_index,FiniteGoalDataset,epoch_sample_fps
     from openwam.train.goal_epoch import atomic_json,train_epoch,sha256
     torch.set_num_threads(2)
     config=load_config(args.config,source_yaml=args.source_yaml)
+    sample_fps=epoch_sample_fps(config)
     if config['model']['goal_representation']!='query_latent':raise ValueError('finite launcher requires query_latent')
     rank=int(os.environ.get('RANK',0));world=int(os.environ.get('WORLD_SIZE',1));local=int(os.environ.get('LOCAL_RANK',0))
     if args.prepare and world!=1:raise ValueError('prepare the index in a single CPU process')
@@ -39,10 +40,9 @@ def main(argv=None):
     seed=config.get('seed',42);dtype=getattr(torch,config.get('dtype','bfloat16'))
     dataset=CuratedGoalDataset(**ds,seed=seed,dtype=dtype)
     if args.prepare:
-        result=build_epoch_index(dataset,args.index,sample_fps=15.)
+        result=build_epoch_index(dataset,args.index,sample_fps=sample_fps)
         atomic_json(output/'population.json',result);print(json.dumps(result,indent=2));return 0
-    finite=FiniteGoalDataset(dataset,args.index)
-    if finite.summary['sample_fps']!=15.:raise ValueError('expected 15 FPS population')
+    finite=FiniteGoalDataset(dataset,args.index,sample_fps=sample_fps)
     if not len(finite):raise ValueError('empty population')
     from openwam.train.stage12 import epoch_identity
     identity=epoch_identity(config,finite.summary,world)

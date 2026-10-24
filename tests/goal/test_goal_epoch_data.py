@@ -232,3 +232,24 @@ def test_projected_content_digest_rejects_change_without_file_stat_change(tmp_pa
             m=original(repo,episode);m['tasks'][0]['text']='changed without file stamp';return m
         d._episode=changed
     with pytest.raises(ValueError,match='source labels changed'):f.sample(0)
+
+
+def test_three_fps_keeps_terminal_goals_and_rejects_other_rate_index(tmp_path):
+    d=Source(tmp_path,length=61)
+    original=d._episode
+    def episode(repo,index):
+        m=original(repo,index);m['subtasks']=[dict(start=2,end_exclusive=28,text='sub')];return m
+    d._episode=episode;path=tmp_path/'index.db'
+    summary=goal_epoch.build_epoch_index(d,path,sample_fps=3.)
+    f=goal_epoch.FiniteGoalDataset(d,path,sample_fps=3.)
+    pairs=[f.sample(i)[0] for i in range(len(f))]
+    assert [(r['level'],r['anchor'],r['goal']) for r in pairs]==[
+        *[('task',a,60) for a in (10,20,30,40,50)],('subtask',10,27),('subtask',20,27)]
+    assert summary['sample_fps']==3.
+    with pytest.raises(ValueError,match='sample_fps'):goal_epoch.validate_index(d,path,sample_fps=15.)
+    with pytest.raises(ValueError,match='sample_fps'):goal_epoch.FiniteGoalDataset(d,path,sample_fps=15.)
+
+
+@pytest.mark.parametrize('bad',[0,-1,float('nan'),float('inf'),True,'3',None])
+def test_invalid_configured_epoch_sample_rate_rejected(bad):
+    with pytest.raises(ValueError,match='sample_fps'):goal_epoch.epoch_sample_fps({'sample_fps':bad})
