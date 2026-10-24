@@ -1044,6 +1044,14 @@ class BaseWAMArchitecture(ABC, nn.Module):
                     masks.append(mask)
             kwargs = ({'goal_observed_multiview':torch.stack(observations),
                        'goal_view_valid':torch.stack(masks)} if mode == 'multiview' else {})
+            from openwam.model.goal.history import HISTORY_FIELDS, move_history
+            for field in HISTORY_FIELDS:
+                present = [field in sample for sample in batch]
+                if any(present):
+                    if not all(present): raise ValueError('history fields must be present for every sample')
+                    kwargs[field] = torch.stack([sample[field] for sample in batch])
+            history = move_history(kwargs, _device, _dtype)
+            kwargs.update(history)
             preprocessed.update(prepare_goal_inputs(self, None if mode == 'multiview' else torch.stack(observations), all_prompts,
                 preprocessed['context'], context_lens=preprocessed.get('seq_lens'),
                 head_valid=torch.tensor([sample['goal_head_valid'] for sample in batch],
@@ -1511,6 +1519,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
         goal_observed_head=None,
         goal_observed_multiview=None,
         goal_view_valid=None,
+        history_images=None,
+        history_latents=None,
+        history_ages=None,
+        history_valid=None,
         goal_head_valid: bool = True,
         goal_seed: Optional[int] = None,
         **extra_pipeline_inputs: Any,
@@ -1605,6 +1617,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
             inputs_shared.update(prepare_inference_goal_inputs(self, goal_observed_head,
                 [prompt], inputs_shared['context'], head_valid=[goal_head_valid],
                 goal_observed_multiview=goal_observed_multiview, goal_view_valid=goal_view_valid,
+                history_images=history_images, history_latents=history_latents,
+                history_ages=history_ages, history_valid=history_valid,
                 seeds=[seed if goal_seed is None else goal_seed],
                 context_lens=inputs_shared.get('seq_lens', inputs_shared.get('context_lens'))))
 

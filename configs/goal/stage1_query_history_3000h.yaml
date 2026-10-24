@@ -1,0 +1,16 @@
+base_config: stage1_query_3000h.yaml
+model:
+  query_history:
+    enabled: true
+    num_frames: 10
+    tokens_per_frame: 16
+    compressor_dim: 128
+    cache_size: 256
+history_learning_rate: 1.0e-4
+dataset:
+  cache_dir: outputs/stage1_query_history_3000h/cache
+  history:
+    enabled: true
+    num_frames: 10
+    mean_interval_s: 1.0
+    jitter_fraction: 0.5

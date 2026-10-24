@@ -14,11 +14,12 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
+from openwam.dataloader.head_history import HistorySamplingConfig, materialize_head_history
 from openwam.dataloader.native_cameras import HEAD_CAMERAS, resolve_native_cameras
 from openwam.model.goal.observation import OBSERVATION_MODES, VIEW_NAMES, clean_multiview
 
 
-def parse_curated_yaml(path, data_root=None):
+def parse_curated_yaml(path, data_root=None, path_aliases=None):
     """Parse only selection metadata; never enumerate source episode contents."""
     path=Path(path).resolve()
     with path.open() as stream:
@@ -37,13 +38,15 @@ def parse_curated_yaml(path, data_root=None):
         if len(set(roots))!=1:raise ValueError('expected one source data_root_dir or explicit data_root')
         data_root=roots[0]
     root=Path(data_root).resolve();selection=selections[0];repos=[]
+    native=document.get('curation',{}).get('post_training_additions',{}).get('sources',{})
+    path_aliases=path_aliases or {}
     weights=selection.get('repo_weights',{})
     for name,ranges in selection['segments_by_repo'].items():
         weight=float(weights.get(name,0))
         if not math.isfinite(weight) or weight<0:raise ValueError(f'invalid repo weight: {name}')
         if not weight:continue
-        family=name.split('/')[0]
-        if family not in HEAD_CAMERAS:raise ValueError(f'unsupported source family {family}')
+        family='posttrain_native' if name in native else name.split('/')[0]
+        if family not in HEAD_CAMERAS and family!='posttrain_native':raise ValueError(f'unsupported source family {family}')
         clean=[]
         for item in ranges:
             if len(item)!=3 or any(type(v) is not int for v in item):raise ValueError('ranges must be integer [episode,start,end]')
@@ -55,7 +58,9 @@ def parse_curated_yaml(path, data_root=None):
         ordered=sorted(clean)
         if any(a[0]==b[0] and a[2]>b[1] for a,b in zip(ordered,ordered[1:])):
             raise ValueError(f'overlapping curated ranges: {name}')
-        repos.append(dict(repo=name,path=str(root/name),family=family,weight=weight,ranges=clean))
+        entry=dict(repo=name,path=str(Path(path_aliases.get(name,root/name)).resolve()),family=family,weight=weight,ranges=clean)
+        if name in native:entry['native_metadata']=native[name]
+        repos.append(entry)
     if not repos:raise ValueError('no positive weighted selected repositories')
     return dict(source_yaml=str(path),data_root=str(root),repos=repos)
 
@@ -90,15 +95,17 @@ def language_intervals(labels, task_mapping, annotations, length):
 
 class CuratedGoalDataset:
     def __init__(self,source_yaml,cache_dir,seed=42,subtask_probability=.5,
-                 max_cached_episodes=8,dtype=torch.bfloat16,data_root=None,observation_mode='head'):
+                 max_cached_episodes=8,dtype=torch.bfloat16,data_root=None,observation_mode='head',history=None,path_aliases=None):
         if observation_mode not in OBSERVATION_MODES:raise ValueError(f'invalid observation_mode: {observation_mode}')
         if not 0<=subtask_probability<=1:raise ValueError('invalid subtask probability')
         if max_cached_episodes<1:raise ValueError('max_cached_episodes must be positive')
-        self.selection=parse_curated_yaml(source_yaml,data_root);self.repos=self.selection['repos']
+        self.selection=parse_curated_yaml(source_yaml,data_root,path_aliases);self.repos=self.selection['repos']
         self.cache_dir=Path(cache_dir);self.cache_dir.mkdir(parents=True,exist_ok=True)
         self.seed=int(seed);self.subtask_probability=subtask_probability;self.max_cached_episodes=max_cached_episodes
         self.dtype=getattr(torch,dtype) if isinstance(dtype,str) else dtype
         self.observation_mode=observation_mode
+        self.history=history if isinstance(history,HistorySamplingConfig) else HistorySamplingConfig(**(history or {}))
+        self._history_draw_id=0
         self._episodes=OrderedDict();self._evaluations=None;self._asset_slot=0;self._evaluating=False
         self._weights=np.array([r['weight'] for r in self.repos]);self._weights/=self._weights.sum()
 
@@ -115,20 +122,25 @@ class CuratedGoalDataset:
 
     def _episode(self,repo,episode):
         import pyarrow.parquet as pq
-        from scripts.data.prepare_goal_labels import read_episode,task_text
+        from scripts.data.prepare_goal_labels import task_text
+        from openwam.dataloader.native_stage2_io import read_episode_metadata
         from openwam.dataloader.subtask_goal import contiguous_subtasks
         key=(repo['path'],episode)
         if key in self._episodes:
             self._episodes.move_to_end(key);return self._episodes[key]
         root=Path(repo['path']);info=json.loads((root/'meta/info.json').read_text())
-        head=HEAD_CAMERAS[repo['family']]
+        head=(resolve_native_cameras(repo['repo'],info)[0] if repo['family']=='posttrain_native' else HEAD_CAMERAS[repo['family']])
+        declared=repo.get('native_metadata',{})
+        if declared.get('fps') is not None and float(declared['fps'])!=float(info['fps']):raise ValueError('native source FPS disagrees with selection metadata')
+        if declared.get('required_data_path_override'):info=dict(info,data_path=declared['required_data_path_override'])
         if info['features'].get(head,{}).get('dtype')!='video':raise ValueError(f'unverified head camera schema: {head}')
         cameras=resolve_native_cameras(repo['repo'],info) if self.observation_mode=='multiview' else [head,None,None]
-        ep=read_episode(root,episode);length=int(ep['length'])
+        ep=read_episode_metadata(root,episode);length=int(ep['length'])
         data=root/info['data_path'].format(episode_index=episode,chunk_index=int(ep['data/chunk_index']),file_index=int(ep['data/file_index']))
         names=pq.ParquetFile(data).schema_arrow.names
         ann=root/'meta/sub_tasks.parquet';has_annotations=ann.exists()
         columns=['frame_index','task_index']
+        columns += [key for key in ('canonical.frame_valid','training.valid') if key in names]
         if has_annotations:
             if 'subtask_index' not in names:raise ValueError('present annotations lack frame subtask_index')
             columns+=['subtask_index']
@@ -143,9 +155,17 @@ class CuratedGoalDataset:
             annotations=pq.read_table(ann,filters=[('episode_index','=',episode)]).to_pylist()
         mapping={int(i):task_text(root,int(i)) for i in set(labels['task_index'])}
         tasks,subtasks=language_intervals(labels,mapping,annotations,length)
+        from openwam.dataloader.posttrain_annotations import external_subtasks
+        external=external_subtasks(repo,episode,length)
+        if external is not None:
+            if subtasks:raise ValueError('conflicting native and external subtask annotations')
+            subtasks=external;ann=Path(repo['native_metadata']['annotation_file']);has_annotations=True
         for _,start,end in (s for s in repo['ranges'] if s[0]==episode):
             if end>length:raise ValueError('curated range exceeds original episode')
         result=dict(root=root,info=info,ep=ep,length=length,data=data,head=head,cameras=cameras,tasks=tasks,subtasks=subtasks,annotation_file=str(ann) if has_annotations else None)
+        from openwam.dataloader.native_stage2_io import source_frame_validity
+        result['source_valid']=source_frame_validity(labels,length)
+        if self.history.enabled:result['history_source_valid']=result['source_valid']
         self._episodes[key]=result
         while len(self._episodes)>self.max_cached_episodes:self._episodes.popitem(last=False)
         return result
@@ -159,6 +179,7 @@ class CuratedGoalDataset:
         return options
 
     def sample(self,step):
+        self._history_draw_id=int(step)
         rng=np.random.default_rng(np.random.SeedSequence([self.seed,int(step)]))
         repo=self.repos[int(rng.choice(len(self.repos),p=self._weights))]
         ranges=repo['ranges'];lengths=np.array([e-s for _,s,e in ranges],float)
@@ -230,13 +251,31 @@ class CuratedGoalDataset:
                     source_video=str(wrist_video),alignment=wrist_alignment[anchor])
         rows=pq.read_table(m['data'],filters=[('episode_index','=',episode),('frame_index','=',goal)]).to_pylist()
         if len(rows)!=1:raise ValueError('goal geometry source row not unique')
-        endpoint=goal_source_tcp(repo['family'],rows[0],tcp_from_eef=recorded_tcp_transform(repo['family'],m['info']))
-        eligible,qa=camera_eligibility(repo['family'],m['root'],episode)
-        camera,cam_meta=goal_camera(repo['family'],rows[0],m['head'],m['info'],images[goal].size,geometry_eligible=eligible)
         projection=dict(uv=np.zeros((2,2),np.float32),projection_valid=np.zeros(2,bool),in_frame=np.zeros(2,bool),visibility=np.full(2,-1,np.int8))
-        if camera is not None:
-            k,e,model,d,wh=camera
-            projection=project_goal_tcp(endpoint['tcp_world'],e,k,wh,camera_model=model,distortion=d,tcp_valid=endpoint['tcp_valid'])
+        if repo['family']=='posttrain_native':
+            from openwam.dataloader.posttrain_physical import project_posttrain_goal
+            columns={key:np.asarray([value]) for key,value in rows[0].items()}
+            uv,valid,endpoint=project_posttrain_goal(m['info'],m['ep'],columns,0,m['head'])
+            uv=np.asarray(uv,dtype=np.float32);valid=np.asarray(valid,dtype=bool)
+            if uv.shape!=(2,2) or valid.shape!=(2,):raise ValueError('malformed native TCP projection')
+            valid &= np.isfinite(uv).all(-1)
+            width,height=images[goal].size
+            # Physical adapter returns native pixels; labels use the resized head tile.
+            scaled=(uv.astype(np.float64)+.5)*[320./width,256./height]-.5
+            inside=(valid & (uv[:,0]>=0) & (uv[:,0]<=width-1)
+                & (uv[:,1]>=0) & (uv[:,1]<=height-1)
+                & (scaled[:,0]>=0) & (scaled[:,0]<=319)
+                & (scaled[:,1]>=0) & (scaled[:,1]<=255))
+            normalized=np.where(inside[:,None],scaled/[319.,255.],0.).astype(np.float32)
+            projection.update(uv=normalized,projection_valid=valid,in_frame=inside)
+            cam_meta=dict(camera=m['head'],native_projection=endpoint);qa=None
+        else:
+            endpoint=goal_source_tcp(repo['family'],rows[0],tcp_from_eef=recorded_tcp_transform(repo['family'],m['info']))
+            eligible,qa=camera_eligibility(repo['family'],m['root'],episode)
+            camera,cam_meta=goal_camera(repo['family'],rows[0],m['head'],m['info'],images[goal].size,geometry_eligible=eligible)
+            if camera is not None:
+                k,e,model,d,wh=camera
+                projection=project_goal_tcp(endpoint['tcp_world'],e,k,wh,camera_model=model,distortion=d,tcp_valid=endpoint['tcp_valid'])
         identity=f'{repo["repo"]}:{episode}:{level}:{segment["start"]}:{anchor}:{goal}'
         ident=hashlib.sha256(identity.encode()).hexdigest()[:24]
         # Training assets occupy a fixed rotating set; evaluation assets persist.
@@ -267,4 +306,12 @@ class CuratedGoalDataset:
         record=clean_json(record)
         batch=prepare_overfit_images([record],device='cpu',dtype=self.dtype)[0]
         batch.update(instruction=record['instruction'],id=ident,family=repo['family'],granularity=level)
+        if self.history.enabled:
+            start=next(a for e,a,b in repo['ranges'] if e==episode and a<=anchor<b)
+            history_seed=int(hashlib.sha256(f'{self.seed}:{self._history_draw_id}:{identity}'.encode()).hexdigest()[:15],16)
+            fields,trace=materialize_head_history(m['root'],m['info'],m['ep'],m['head'],anchor,start,
+                self.history,np.random.default_rng(history_seed),not self._evaluating,
+                sequential=repo['family']=='mecka',dtype=self.dtype,source_valid=m['history_source_valid'])
+            batch.update({k:v.unsqueeze(0) for k,v in fields.items()})
+            record['provenance']['head_history']=clean_json(trace)
         return record,batch

@@ -62,6 +62,7 @@ def main(argv=None):
         if representation == 'query_latent':
             from openwam.model.goal.query_expert import QueryGoalExpert
             return QueryGoalExpert(dit, codec, dit_config=dit_config, query_config=query_options,
+                history_config=model.get('query_history'),
                 lambda_query_image=config.get('lambda_query_image', .1),
                 lambda_query_tcp=config.get('lambda_query_tcp', .1), **kwargs)
         return PatchGoalExpert(dit, codec, dit_config=dit_config, **kwargs)
@@ -85,6 +86,12 @@ def main(argv=None):
         expert.to(device=args.device or 'cpu', dtype=smoke_dtype)
         expert.codec.vae.to(device=args.device or 'cpu', dtype=smoke_dtype)
         records[0].update(metric_key='synthetic:task:0',granularity='task')
+        if getattr(getattr(expert,'history_config',None),'enabled',False):
+            for batch in batches:
+                b=len(batch['observed'])
+                batch.update(history_images=torch.zeros(b,10,3,1,256,320),
+                    history_ages=torch.arange(10,0,-1).float().expand(b,-1).clone(),
+                    history_valid=torch.ones(b,10,dtype=torch.bool))
         class SyntheticDataset:
             def evaluation_samples(self):return list(zip(records,batches))
             def sample(self,step):return records[0],batches[0]
@@ -142,6 +149,7 @@ def main(argv=None):
                 return encode_text([prompt],tokenizer=tokenizer,text_encoder=text_encoder,device=text_device)
             cache=TextContextCache(encode,max_entries=config.get('text_cache_size',32))
             result=train_curated(expert,dataset=dataset,context_cache=cache,output_dir=output,
+                history_learning_rate=config.get('history_learning_rate',1e-4),
                 steps=args.steps if args.steps is not None else config['max_steps'],eval_every=config.get('eval_every',500),
                 sampling_steps=config.get('sampling_steps',20),learning_rate=config['learning_rate'],seed=args.seed,
                 dependency_identities=identities,dependency_metadata=dict(components=config['components'],tokenizer=config['tokenizer']),

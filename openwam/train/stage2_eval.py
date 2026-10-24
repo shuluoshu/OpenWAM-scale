@@ -114,6 +114,8 @@ def generation_conditions(sample, *, seed, num_steps, observation_mode='head', o
         _proprio_sample_mask=sample['proprio_mask'].unsqueeze(0), active_action_mask=active,
         goal_observed_head=None if head is None else head.unsqueeze(0),
         goal_head_valid=bool(sample['goal_head_valid']), goal_seed=int(sample['goal_seed']), decode_video=True)
+    from openwam.model.goal.history import history_kwargs
+    result.update({key:value.unsqueeze(0) for key,value in history_kwargs(sample).items()})
     if observation_mode == 'multiview':
         observed, valid = _clean_multiview_condition(sample)
         if observation_dtype is not None:observed=observed.to(dtype=observation_dtype)
@@ -152,6 +154,10 @@ def _conditions_sha(sample, kwargs):
         digest.update(_json(['multiview',MULTIVIEW_PREPROCESSING_VERSION,str(kwargs['goal_observed_multiview'].dtype)]).encode())
         for key in ('goal_observed_multiview','goal_view_valid'):
             digest.update(np.ascontiguousarray(_array(kwargs[key])).tobytes())
+    from openwam.model.goal.history import history_kwargs
+    for key, value in history_kwargs(kwargs).items():
+        digest.update(_json([key,list(value.shape),str(value.dtype)]).encode())
+        digest.update(np.ascontiguousarray(_array(value)).tobytes())
     for image in kwargs['first_frame_image']: digest.update(image.tobytes())
     return digest.hexdigest()
 
@@ -365,6 +371,10 @@ def _fixed_assets(sample, folder, *, observation_mode='head', actual_goal_inputs
     identity.update(_json([trace_identity,sample['report_target'],sample['prompt'],sample['goal_seed']]).encode())
     if observation_mode=='multiview':
         identity.update(b'multiview'+str(observed.dtype).encode()+_array(observed).tobytes()+_array(valid).tobytes())
+    from openwam.model.goal.history import history_kwargs
+    fixed_history=history_kwargs(sample if actual_goal_inputs is None else actual_goal_inputs)
+    for key, value in fixed_history.items():
+        identity.update(_json([key,list(value.shape),str(value.dtype)]).encode()+_array(value).tobytes())
     signature=identity.hexdigest();manifest=folder/'manifest.json'
     if manifest.exists():
         saved=json.loads(manifest.read_text())
@@ -384,6 +394,7 @@ def _fixed_assets(sample, folder, *, observation_mode='head', actual_goal_inputs
         from openwam.model.goal.observation import observation_token_mask
         tensors['goal_observation_token_valid']=(_array(observation_token_mask(valid[None])[0]) if valid[0] else np.zeros(120,bool))
     elif head is not None:tensors['goal_observed_head']=_array(head)
+    tensors.update({key:_array(value) for key,value in fixed_history.items()})
     tensors['active_action_mask']=_array(sample['_eval']['active_action_mask'])
     np.savez_compressed(folder/'supervision.npz',**tensors)
     trace=dict(trace=sample['trace'],report_target=sample['report_target'],prompt=sample['prompt'],goal_seed=sample['goal_seed'])

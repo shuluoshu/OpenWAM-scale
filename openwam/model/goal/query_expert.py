@@ -15,6 +15,7 @@ from .codec import GoalCodec, GoalCodecSpec
 from .observation import (MULTIVIEW_IMAGE_SHAPE, MULTIVIEW_LATENT_SHAPE,
                           observation_token_mask, sanitize_canvas)
 from .patch_expert import PatchGoalExpert
+from .history import HistoryConfig, HistoryCompressor, HeadFeatureCache, validate_history
 
 QUERY_FORMAT = 'openwam.goal.query.v1'
 DEFAULT_QUERY = dict(num_image_tokens=64, num_tcp_tokens=2, dim=512,
@@ -42,7 +43,7 @@ class QueryConfig:
 
 
 class GoalQueryTransformer(nn.Module):
-    def __init__(self, config, *, text_dim, observation_tokens):
+    def __init__(self, config, *, text_dim, observation_tokens, history_config=None):
         super().__init__()
         self.config = config
         d = config.dim
@@ -57,8 +58,11 @@ class GoalQueryTransformer(nn.Module):
             batch_first=True, norm_first=True) for _ in range(config.num_layers))
         self.norm = nn.LayerNorm(d)
         self.use_gradient_checkpointing = False
+        if history_config is not None and history_config.enabled:
+            self.history = HistoryCompressor(history_config, d)
 
-    def forward(self, observation, context, *, observation_valid, context_lens=None):
+    def forward(self, observation, context, *, observation_valid, context_lens=None,
+                history_latents=None, history_ages=None, history_valid=None):
         patches = rearrange(observation, 'b c 1 (h p) (w q) -> b (h w) (p q c)', p=2, q=2)
         b = patches.shape[0]
         if patches.shape[1] != self.observation_position.shape[1]:
@@ -80,6 +84,10 @@ class GoalQueryTransformer(nn.Module):
         memory = torch.cat((self.observation_projection(patches) + self.observation_position + self.modality[0],
                             self.text_projection(context) + self.modality[1]), dim=1)
         padding = ~torch.cat((observation_valid, text_valid), dim=1)
+        if hasattr(self, 'history'):
+            ht, hv = self.history(history_latents, history_ages, history_valid)
+            memory = torch.cat((memory, ht.to(memory.dtype)), dim=1)
+            padding = torch.cat((padding, ~hv), dim=1)
         queries = torch.cat((self.image_queries, self.tcp_queries), dim=1).expand(b, -1, -1)
         for block in self.blocks:
             if self.training and self.use_gradient_checkpointing:
@@ -95,7 +103,8 @@ class QueryGoalEncoder(nn.Module):
     representation = 'query_latent'
     shift = 1.  # Deterministic runtime cache contract; no diffusion sampling.
 
-    def __init__(self, codec, *, text_dim, query_config=None, observation_mode='multiview'):
+    def __init__(self, codec, *, text_dim, query_config=None, observation_mode='multiview',
+                 history_config=None):
         super().__init__()
         if observation_mode not in ('head', 'multiview'):
             raise ValueError('invalid query observation_mode')
@@ -103,8 +112,18 @@ class QueryGoalEncoder(nn.Module):
         self.text_dim = int(text_dim)
         self.query_config = QueryConfig(**(query_config or {}))
         self.observation_mode = observation_mode
+        self.history_config = HistoryConfig(**(history_config or {}))
         self.encoder = GoalQueryTransformer(self.query_config, text_dim=text_dim,
-            observation_tokens=120 if observation_mode == 'multiview' else 80)
+            observation_tokens=120 if observation_mode == 'multiview' else 80,
+            history_config=self.history_config)
+        self._history_cache = HeadFeatureCache(self.history_config.cache_size)
+
+    def clear_history_cache(self):
+        self._history_cache.clear()
+
+    def _apply(self, fn, recurse=True):
+        self.clear_history_cache()
+        return super()._apply(fn, recurse=recurse)
 
     @property
     def observation_codec(self):
@@ -114,7 +133,19 @@ class QueryGoalEncoder(nn.Module):
             name='wan22_vae48_multiview_single_frame', image_shape=MULTIVIEW_IMAGE_SHAPE,
             latent_shape=MULTIVIEW_LATENT_SHAPE))
 
-    def extract_tokens(self, observed, context, *, context_lens=None, observed_view_valid=None):
+    def extract_tokens(self, observed, context, *, context_lens=None, observed_view_valid=None,
+                       history_images=None, history_latents=None, history_ages=None, history_valid=None):
+        history_args = {}
+        provided = any(v is not None for v in (history_images,history_latents,history_ages,history_valid))
+        if not self.history_config.enabled and provided:
+            raise ValueError('history inputs supplied to a history-disabled encoder')
+        if self.history_config.enabled:
+            validate_history(history_ages,history_valid,batch_size=len(observed))
+            if (history_images is None) == (history_latents is None):
+                raise ValueError('history requires exactly one of images or cached latents')
+            if history_latents is None:
+                history_latents=self._history_cache.encode(self.codec,history_images,history_valid)
+            history_args=dict(history_latents=history_latents,history_ages=history_ages,history_valid=history_valid)
         if self.observation_mode == 'multiview':
             observed = sanitize_canvas(observed, observed_view_valid)
             valid = observation_token_mask(observed_view_valid).to(observed.device)
@@ -123,7 +154,7 @@ class QueryGoalEncoder(nn.Module):
                 raise ValueError('head query encoder does not accept a view mask')
             valid = torch.ones(len(observed), 80, device=observed.device, dtype=torch.bool)
         observation = self.observation_codec.encode(observed)
-        return self.encoder(observation, context, observation_valid=valid, context_lens=context_lens)
+        return self.encoder(observation, context, observation_valid=valid, context_lens=context_lens,**history_args)
 
     def train(self, mode=True):
         return super().train(False if getattr(self, '_frozen', False) else mode)
@@ -169,9 +200,9 @@ class QueryGoalExpert(QueryGoalEncoder):
     def __init__(self, dit, codec, *, dit_config, query_config=None,
                  observation_mode='multiview', shift=5., lambda_image=.5,
                  lambda_tcp=1., lambda_query_image=.1, lambda_query_tcp=.1,
-                 use_gradient_checkpointing=False):
+                 use_gradient_checkpointing=False, history_config=None):
         super().__init__(codec, text_dim=dit.text_embedding[0].in_features,
-                         query_config=query_config, observation_mode=observation_mode)
+                         query_config=query_config, observation_mode=observation_mode, history_config=history_config)
         if any(not math.isfinite(x) or x < 0 for x in (lambda_query_image, lambda_query_tcp)):
             raise ValueError('invalid query auxiliary loss weights')
         self.decoder = QueryAuxiliaryDecoder(dit, codec, dit_config=dit_config, shift=shift,
@@ -196,9 +227,11 @@ class QueryGoalExpert(QueryGoalEncoder):
         return z, blank, self.condition_projection(z)
 
     def forward(self, observed, context, targets, *, context_lens=None,
-                observed_view_valid=None, **flow_kwargs):
+                observed_view_valid=None, history_images=None, history_latents=None,
+                history_ages=None, history_valid=None, **flow_kwargs):
         z, blank, condition = self._condition(observed, context, context_lens=context_lens,
-                                              observed_view_valid=observed_view_valid)
+            observed_view_valid=observed_view_valid,history_images=history_images,
+            history_latents=history_latents,history_ages=history_ages,history_valid=history_valid)
         result = self.decoder(blank, condition, targets, **flow_kwargs)
         im, uv = self.readout(z)
         clean = result['target_latent']
@@ -215,11 +248,13 @@ class QueryGoalExpert(QueryGoalEncoder):
 
     @torch.no_grad()
     def generate(self, observed, context, *, context_lens=None, observed_view_valid=None,
-                 num_steps=20, seed=0):
+                 num_steps=20, seed=0, history_images=None, history_latents=None,
+                 history_ages=None, history_valid=None):
         if self.training:
             raise RuntimeError('query goal diagnostics require eval()')
         _, blank, condition = self._condition(observed, context, context_lens=context_lens,
-                                              observed_view_valid=observed_view_valid)
+            observed_view_valid=observed_view_valid,history_images=history_images,
+            history_latents=history_latents,history_ages=history_ages,history_valid=history_valid)
         return self.decoder.generate(blank, condition, num_steps=num_steps, seed=seed)
 
     def train_stage_a(self):

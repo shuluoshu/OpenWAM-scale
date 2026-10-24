@@ -117,3 +117,49 @@ def test_real_decode_missing_geometry_masks(tmp_path):
     assert batch['targets'].uv.dtype==torch.float32
     assert not batch['targets'].point_valid.any()
     assert record['provenance']['goal_video']['source_frame_index']==7
+
+
+def test_history_reader_shapes_range_and_instruction_cache(tmp_path):
+    av=pytest.importorskip('av')
+    config,root=fixture(tmp_path,annotations=True)
+    with av.open(str(root/'video.mp4'),'w') as container:
+        stream=container.add_stream('mpeg4',rate=10);stream.width=32;stream.height=24;stream.pix_fmt='yuv420p'
+        for index in range(10):
+            frame=av.VideoFrame.from_ndarray(np.full((24,32,3),index*20,dtype=np.uint8),format='rgb24')
+            for packet in stream.encode(frame):container.mux(packet)
+        for packet in stream.encode():container.mux(packet)
+    from openwam.train.goal_curated import TextContextCache,prepare_batch
+    captured=[]
+    def encode(text):
+        captured.append(text)
+        return torch.zeros(1,2,4),torch.tensor([2])
+    cache=TextContextCache(encode)
+    d=CuratedGoalDataset(config,tmp_path/'cache',history={'enabled':True},subtask_probability=1)
+    record,batch=d.sample(0)
+    assert batch['history_images'].shape==(1,10,3,1,256,320)
+    assert batch['history_valid'].dtype==torch.bool
+    assert batch['history_ages'].dtype==torch.float32
+    trace=record['provenance']['head_history']
+    assert trace['selected_start'] in (1,6)
+    assert all(i==-1 or trace['selected_start']<=i<record['anchor_source_frame'] for i in trace['indices'])
+    prepare_batch(record,batch,device='cpu',dtype=torch.float32,context_cache=cache)
+    assert captured==['repeat'] and record['instruction']==batch['instruction']=='repeat'
+    d.subtask_probability=0
+    record,batch=d.sample(1)
+    prepare_batch(record,batch,device='cpu',dtype=torch.float32,context_cache=cache)
+    assert captured==['repeat','first task']
+
+
+def test_history_reads_global_source_flags_only_when_enabled(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    config,root=fixture(tmp_path)
+    table=pq.read_table(root/'data.parquet')
+    table=table.append_column('canonical.frame_valid',pa.array([1.,0.,float('nan')]+[1.]*7))
+    table=table.append_column('training.valid',pa.array([1.]*3+[float('inf'),.5]+[1.]*5))
+    pq.write_table(table,root/'data.parquet')
+    disabled=CuratedGoalDataset(config,tmp_path/'disabled')
+    assert 'history_source_valid' not in disabled._episode(disabled.repos[0],0)
+    enabled=CuratedGoalDataset(config,tmp_path/'enabled',history={'enabled':True})
+    metadata=enabled._episode(enabled.repos[0],0)
+    np.testing.assert_array_equal(metadata['history_source_valid'],[True,False,False,False,False]+[True]*5)

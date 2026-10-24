@@ -110,6 +110,16 @@ def build_stage2_parameter_groups(architecture,training):
 def validate_stage2_config(cfg):
     from openwam.model.goal.runtime import goal_observation_mode, goal_representation
     goal_config=OmegaConf.to_container(cfg.goal,resolve=True)
+    from openwam.model.goal.runtime import validate_goal_model_config
+    from openwam.model.goal.history import HistoryConfig
+    validate_goal_model_config(goal_config, OmegaConf.to_container(cfg.model,resolve=True))
+    history = HistoryConfig(**goal_config.get('history', {}))
+    sampling = OmegaConf.select(cfg,'dataloader.history',default={})
+    sampling = OmegaConf.to_container(sampling,resolve=True) if OmegaConf.is_config(sampling) else dict(sampling)
+    if sampling.get('enabled', False) != history.enabled or sampling.get('num_frames',10) != history.num_frames:
+        raise ValueError('dataloader history disagrees with goal.history')
+    if history.enabled and (sampling.get('mean_interval_s',1.) != 1. or sampling.get('jitter_fraction',.5) != .5):
+        raise ValueError('history requires 1s intervals and 50% jitter')
     goal_observation_mode(goal_config)
     representation=goal_representation(goal_config)
     if OmegaConf.select(cfg,'model.goal_representation',default='patch_denoise')!=representation:
@@ -205,6 +215,9 @@ def validate_stage2_launch(cfg,*,metadata_only=False):
     if metadata.get('format')!=cfg.goal.format:raise ValueError('Stage1 patch bundle metadata format mismatch')
     if metadata_key=='query_goal_bundle':
         from openwam.model.goal.query_expert import QueryConfig
+        from openwam.model.goal.history import HistoryConfig
+        if HistoryConfig(**metadata.get('history_config', {})) != HistoryConfig(**dict(cfg.goal.get('history', {}))):
+            raise ValueError('Stage1 history bundle configuration mismatch')
         if metadata.get('representation')!='query_latent' or QueryConfig(**metadata['query_config'])!=QueryConfig(**OmegaConf.to_container(cfg.goal.query,resolve=True)):
             raise ValueError('Stage1 query bundle model configuration mismatch')
     if metadata.get('observation_mode', 'head')!=mode:raise ValueError('Stage1 patch bundle observation mode mismatch')

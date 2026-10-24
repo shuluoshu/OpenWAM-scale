@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from openwam.dataloader.head_history import HistorySamplingConfig, materialize_head_history
 from openwam.dataloader.curated_goal import parse_curated_yaml
 from openwam.dataloader.native_stage2_profiles import fingerprint
 from openwam.dataloader.native_stage2_io import ByteLRU, load_episode, window_options, merge_source_masks, source_frame_validity
@@ -22,9 +23,10 @@ class CuratedStage2Dataset(Dataset):
     """
     def __init__(self,source_yaml,*,data_root=None,seed=42,normalization_registry=None,
                  split='train',max_cached_episodes=2,max_cache_bytes=256*1024*1024,
-                 observation_augmentation=None,gripper_state_filter=None,draws_per_epoch=100000):
+                 observation_augmentation=None,gripper_state_filter=None,draws_per_epoch=100000,history=None):
         self.selection=parse_curated_yaml(source_yaml,data_root);self.repos=self.selection['repos']
         self.seed=int(seed);self.split=split;self.draws_per_epoch=int(draws_per_epoch)
+        self.history=history if isinstance(history,HistorySamplingConfig) else HistorySamplingConfig(**(history or {}))
         self.source_yaml_sha256=hashlib.sha256(Path(source_yaml).read_bytes()).hexdigest()
         self.filter_config=filter_config(gripper_state_filter)
         self._cache=ByteLRU(max_cached_episodes,max_cache_bytes)
@@ -51,7 +53,7 @@ class CuratedStage2Dataset(Dataset):
         source=get_cfg(config,'source_yaml') if split=='train' else get_cfg(config,'evaluation_source_yaml')
         if not source:raise ValueError('explicit source_yaml required' if split=='train' else 'independent evaluation_source_yaml required')
         keys=('data_root','seed','normalization_registry','max_cached_episodes','max_cache_bytes',
-              'observation_augmentation','gripper_state_filter','draws_per_epoch')
+              'observation_augmentation','gripper_state_filter','draws_per_epoch','history')
         kwargs={k:get_cfg(config,k) for k in keys if get_cfg(config,k) is not None}
         if split!='train':
             stats=get_cfg(config,'evaluation_normalization_registry')
@@ -196,6 +198,13 @@ class CuratedStage2Dataset(Dataset):
                 selected_range=[option['selected_start'],option['selected_end_exclusive']],
                 goal_resize={'source_wh':list(head.size) if head else None,'destination_wh':[320,256]},
                 stats_registry=self.registry_path,normalization_population=stats['population']))
+        if self.history.enabled:
+            history_seed=int(fingerprint([goal_seed,'head_history',draw_id])[:15],16)
+            fields,history_trace=materialize_head_history(m['root'],m['info'],m['ep'],camera,anchor,
+                option['selected_start'],self.history,np.random.default_rng(history_seed),self.split=='train',
+                sequential=m['profile']['family']=='mecka',
+                source_valid=source_frame_validity(m['columns'],m['length']))
+            sample.update(fields);sample['trace']['head_history']=history_trace
         if m['fk']:
             sample['fk_supervision']=m['fk'].build(cols,raw,mask,state,sm,
                 {k:np.array(v) for k,v in stats['action'].items() if k!='count'},'quantile',32)

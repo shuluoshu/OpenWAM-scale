@@ -230,12 +230,23 @@ def export_inputs(output_dir, records, batches):
                       context=batch['context'].detach().float().cpu().numpy(),
                       original_image_dtype=str(target.image.dtype))
         view_metadata={}
+        if 'history_images' in batch:
+            from openwam.model.goal.history import history_kwargs
+            for key,value in history_kwargs(batch).items():
+                tensor=value.detach().cpu()
+                arrays[key]=tensor.float().numpy() if tensor.is_floating_point() else tensor.numpy()
+                if tensor.dtype==torch.bfloat16:
+                    arrays[key+'_bfloat16_bits']=tensor.view(torch.uint16).numpy()
+            view_metadata['history_ages']=batch['history_ages'].cpu().tolist()
+            view_metadata['history_valid']=batch['history_valid'].cpu().tolist()
+            for slot in range(batch['history_images'].shape[1]):
+                _display_image(batch['history_images'][:,slot]).save(destination/f'{name}_history_{slot:02d}.png')
         if 'observed_view_valid' in batch:
             from openwam.model.goal.observation import observation_token_mask
             mask=batch['observed_view_valid'].detach().cpu()
             arrays['observed_view_valid']=mask.numpy()
             arrays['observation_token_valid']=observation_token_mask(mask).numpy()
-            view_metadata=dict(observation_mode='multiview',observed_view_valid=mask.tolist(),
+            view_metadata.update(observation_mode='multiview',observed_view_valid=mask.tolist(),
                                observed_shape=list(batch['observed'].shape),
                                valid_observation_tokens=arrays['observation_token_valid'].sum(axis=1).tolist())
         # Float32 conversion is exact for every BF16 value. Raw bits are also retained.
@@ -264,6 +275,12 @@ def export_inputs(output_dir, records, batches):
     for card in cards:
         name=card['id']
         observed_label,target_label,note=input_report_labels(card)
+        if 'history_ages' in card:
+            note+='<p>Past head frames, oldest first; ages are realized seconds before the current frame. Invalid slots are masked.</p><div class="images" style="overflow-x:auto">'
+            for slot,(age,ok) in enumerate(zip(card['history_ages'][0],card['history_valid'][0])):
+                label=f'{age:.3f} s ago' if ok else 'PAD — masked'
+                note+=f'<figure><figcaption>{label}</figcaption><img style="width:160px" src="{name}_history_{slot:02d}.png"></figure>'
+            note+='</div>'
         panels.append('<article><h2>'+html.escape(card['family'])+'</h2><p>'+html.escape(card['instruction'])+
             '</p>'+note+'<div class="images"><figure><figcaption>'+observed_label+'</figcaption><img src="'+name+'_observed.png"></figure>'+
             '<figure><figcaption>'+target_label+'</figcaption><img src="'+name+'_target_points.png"></figure></div>'+

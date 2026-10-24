@@ -142,7 +142,8 @@ def evaluate_patch(expert,batches,output_dir,*,step=0,seed=42,num_steps=20):
     cards=[]; metrics={}; aggregate=[[],[]]; maes=[]
     for index,b in enumerate(batches):
         if b['observed'].shape[0]!=1: raise ValueError('one case per batch required')
-        prediction=expert.generate(b['observed'],b['context'],seed=seed+index,num_steps=num_steps,context_lens=b.get('context_lens'),observed_view_valid=b.get('observed_view_valid'))
+        from openwam.model.goal.history import history_kwargs
+        prediction=expert.generate(b['observed'],b['context'],seed=seed+index,num_steps=num_steps,context_lens=b.get('context_lens'),observed_view_valid=b.get('observed_view_valid'),**history_kwargs(b))
         decoded=expert.codec.decode(prediction.latent)
         if not torch.isfinite(decoded).all(): raise FloatingPointError('nonfinite generated image')
         uv=prediction.uv.float(); target=b['targets']; valid=point_mask(target)[0].cpu().tolist()

@@ -1,5 +1,7 @@
 # Stage1 / Stage2 操作手册：联合去噪与 Query Latent 两种方案
 
+可选的 10 帧头部历史输入见 [历史版操作手册](query_history_training.md)。
+
 本文对应 `codex/query-latent-goal`，基于 `2490537` 的三视角 Stage1、Stage2 实现。
 新方案采用**独立、单次前向的目标 latent 提取器**；Stage2 冻结它，直接读取 tokens。
 旧方案仍为默认值。下列完整训练命令供启动实验使用，不代表已经执行。

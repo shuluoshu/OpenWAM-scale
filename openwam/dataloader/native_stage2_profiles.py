@@ -21,6 +21,8 @@ def names(feature):
 
 
 def resolve_native_profile(repo, info):
+    from openwam.dataloader.posttrain_physical import is_posttrain_native, resolve_posttrain_profile
+    if is_posttrain_native(info):return resolve_posttrain_profile(repo,info)
     family=repo.split('/')[0]; f=info['features']; m=info.get('starvla_metadata',{})
     if family not in HEAD_CAMERAS:raise ValueError(f'{repo}: unsupported_family')
     robot=m.get('robot_type',m.get('canonical_robot_type',m.get('embodiment',family)))

@@ -9,6 +9,7 @@ import json
 import torch
 from .patch_expert import PatchGoalExpert, PatchGoalPrediction
 from .types import GoalCondition
+from .history import HistoryConfig, history_kwargs, move_history, validate_history
 
 PREPROCESSING_VERSION = 'openwam.goal.clean_head.rgb320x256.v1'
 MULTIVIEW_PREPROCESSING_VERSION = 'openwam.goal.clean_multiview.rgb320x384.v2'
@@ -43,6 +44,11 @@ def goal_observation_mode(config):
 def validate_goal_model_config(config, model):
     """Also used by public loaders that do not execute the training preflight."""
     representation = goal_representation(config)
+    history = HistoryConfig(**config.get('history', {}))
+    if history.enabled and representation != 'query_latent':
+        raise ValueError('history requires query_latent representation')
+    if HistoryConfig(**model.get('query_history', {})) != history:
+        raise ValueError('model.query_history disagrees with goal.history')
     if model.get('goal_representation', representation) != representation:
         raise ValueError('model.goal_representation disagrees with goal representation')
     if representation == 'query_latent' and 'query_goal' in model:
@@ -53,6 +59,8 @@ def validate_goal_model_config(config, model):
 
 def validate_goal_compatibility(requested, saved):
     """No topology changes when loading an existing Stage2 checkpoint."""
+    if HistoryConfig(**requested.get('history', {})) != HistoryConfig(**saved.get('history', {})):
+        raise ValueError('Stage2 history differs from saved checkpoint')
     if goal_representation(requested) != goal_representation(saved):
         raise ValueError('Stage2 goal representation differs from saved checkpoint; use original baseline for a new mode')
     if goal_observation_mode(requested) != goal_observation_mode(saved):
@@ -79,6 +87,10 @@ def goal_prediction_policy(architecture):
         from .query_expert import QueryConfig
         result.update(format='openwam.goal.query.v1', representation='query_latent',
                       query=asdict(QueryConfig(**config.get('query', {}))), num_steps=1)
+    history = HistoryConfig(**config.get('history', {}))
+    if history.enabled:
+        from dataclasses import asdict
+        result['history'] = asdict(history)
     return result
 
 
@@ -164,19 +176,23 @@ def _tensor_hash(tensor):
 
 def goal_cache_key(*, observed, context, context_len, prompt, seed, num_steps,
                    asset_identity, shift, preprocessing_version=PREPROCESSING_VERSION,
-                   observation_mode='head', observed_view_valid=None):
+                   observation_mode='head', observed_view_valid=None,
+                   history_images=None, history_latents=None, history_ages=None, history_valid=None):
     value=dict(version=preprocessing_version,image=_tensor_hash(observed),
         context=_tensor_hash(context),context_len=None if context_len is None else int(context_len),
         prompt=prompt,seed=int(seed),steps=int(num_steps),asset=asset_identity,shift=float(shift))
     if observation_mode != 'head':
         value.update(observation_mode=observation_mode, view_valid=_tensor_hash(observed_view_valid))
+    for key, tensor in history_kwargs(locals()).items():
+        if tensor is not None: value[key] = _tensor_hash(tensor)
     return hashlib.sha256(json.dumps(value,sort_keys=True).encode()).hexdigest()
 
 
 @torch.no_grad()
 def predict_goals(*, expert, observed, context, context_lens, seeds, num_steps,
                   cache, asset_identity, prompts, augmented, microbatch_size=1,
-                  observed_view_valid=None):
+                  observed_view_valid=None, history_images=None, history_latents=None,
+                  history_ages=None, history_valid=None):
     """Generate detached goals with per-row seeds; augmented inputs bypass cache."""
     if not isinstance(microbatch_size,int) or microbatch_size<1:
         raise ValueError('goal microbatch_size must be positive')
@@ -193,6 +209,7 @@ def predict_goals(*, expert, observed, context, context_lens, seeds, num_steps,
         observed = sanitize_canvas(observed, observed_view_valid)
     elif observed_view_valid is not None:
         raise ValueError('head goal expert does not accept a view mask')
+    history = _validate_runtime_history(expert, count, history_images, history_latents, history_ages, history_valid)
     expert.freeze()
     results=[None]*count; keys=[None]*count; pending=[]
     for i in range(count):
@@ -201,6 +218,7 @@ def predict_goals(*, expert, observed, context, context_lens, seeds, num_steps,
                 context_len=None if context_lens is None else int(context_lens[i]),
                 prompt=prompts[i],seed=seeds[i],num_steps=num_steps,
                 asset_identity=asset_identity,shift=expert.shift,observation_mode=mode,
+                **{k:v[i] for k,v in history.items()},
                 observed_view_valid=None if observed_view_valid is None else observed_view_valid[i],
                 preprocessing_version=MULTIVIEW_PREPROCESSING_VERSION if mode=='multiview' else PREPROCESSING_VERSION)
             hit=cache.get(keys[i])
@@ -213,7 +231,7 @@ def predict_goals(*, expert, observed, context, context_lens, seeds, num_steps,
         kwargs = dict(context_lens=None if context_lens is None else context_lens[ids],
             **({'observed_view_valid': observed_view_valid[ids]} if mode=='multiview' else {}))
         if getattr(expert, 'representation', 'patch_denoise') == 'query_latent':
-            z = expert.extract_tokens(observed[ids], context[ids], **kwargs).detach()
+            z = expert.extract_tokens(observed[ids], context[ids], **kwargs, **{k:v[ids] for k,v in history.items()}).detach()
             pred = GoalCondition(z, torch.ones(z.shape[:2], device=z.device, dtype=torch.bool),
                                  torch.full((len(ids),2,2), float('nan'), device=z.device))
         else:
@@ -253,6 +271,12 @@ def configure_goal(architecture, cfg, *, checkpoint_dir=None):
         raise ValueError("Self-contained goal asset requires SHA256 identity")
     if expected and identity != expected:
         raise ValueError("Goal asset SHA256 mismatch")
+    if goal_representation(config) == 'query_latent':
+        from safetensors import safe_open
+        with safe_open(str(asset), framework='pt', device='cpu') as file:
+            metadata = json.loads((file.metadata() or {}).get('query_goal_bundle', '{}'))
+        if HistoryConfig(**metadata.get('history_config', {})) != HistoryConfig(**config.get('history', {})):
+            raise ValueError('goal history config disagrees with checkpoint')
     placement = next(vb.dit.parameters())
     expert = load_stage2_goal(asset, vae=vb.vae, text_encoder=getattr(vb,'text_encoder',None),
         tokenizer=getattr(vb,'_tokenizer',None), text_dim=vb.text_dim,
@@ -265,6 +289,8 @@ def configure_goal(architecture, cfg, *, checkpoint_dir=None):
         raise ValueError('goal representation disagrees with loaded expert')
     if representation == 'query_latent':
         from .query_expert import QueryConfig
+        if getattr(expert, 'history_config', HistoryConfig()) != HistoryConfig(**config.get('history', {})):
+            raise ValueError('goal history config disagrees with checkpoint')
         if expert.query_config != QueryConfig(**config.get('query', {})):
             raise ValueError('goal query config disagrees with checkpoint')
     if {id(p) for p in expert.parameters()} & {id(p) for p in vb.dit.parameters()}:
@@ -282,13 +308,15 @@ def configure_goal(architecture, cfg, *, checkpoint_dir=None):
 @torch.no_grad()
 def prepare_goal_inputs(architecture, goal_observed_head, prompts, context, *,
                         head_valid, seeds, context_lens=None,
-                        goal_observed_multiview=None, goal_view_valid=None):
+                        goal_observed_multiview=None, goal_view_valid=None,
+                        history_images=None, history_latents=None, history_ages=None, history_valid=None):
     """Condition only on explicit clean same-anchor RGB, never a canvas crop.
 
     Missing head rows are masked without invoking the teacher on black images.
     UV is detached and stored separately for diagnostics, never in model inputs.
     """
     count = context.shape[0]
+    history = _validate_runtime_history(architecture.goal_expert, count, history_images, history_latents, history_ages, history_valid)
     valid = torch.as_tensor(head_valid,device=context.device)
     if valid.dtype != torch.bool or valid.shape != (count,):
         raise ValueError('head_valid must be bool [B]')
@@ -325,7 +353,7 @@ def prepare_goal_inputs(architecture, goal_observed_head, prompts, context, *,
     if ids.numel():
         config = architecture.goal_config
         pred,_ = predict_goals(expert=architecture.goal_expert,
-            observed=observed[ids],context=context[ids],
+            observed=observed[ids],context=context[ids], **{k:v[ids] for k,v in history.items()},
             context_lens=None if context_lens is None else torch.as_tensor(context_lens,device=context.device)[ids],
             seeds=[seeds[i] for i in ids.tolist()],prompts=[prompts[i] for i in ids.tolist()],
             num_steps=int(config.get('num_steps',20)),cache=architecture.goal_cache,
@@ -418,9 +446,11 @@ def clean_goal_head(image):
 @torch.no_grad()
 def prepare_inference_goal_inputs(architecture, goal_observed_head, prompts, context, *,
                                   head_valid, seeds, context_lens=None,
-                                  goal_observed_multiview=None, goal_view_valid=None):
+                                  goal_observed_multiview=None, goal_view_valid=None,
+                                  history_images=None, history_latents=None, history_ages=None, history_valid=None):
     """Inference uses the exact training condition builder and explicit row seeds."""
     from PIL import Image
+    history = move_history({k:v for k,v in history_kwargs(locals()).items() if v is not None}, context.device, architecture.dtype)
     mode = getattr(architecture.goal_expert, 'observation_mode', 'head')
     if mode == 'multiview':
         if goal_observed_multiview is not None:
@@ -429,7 +459,7 @@ def prepare_inference_goal_inputs(architecture, goal_observed_head, prompts, con
             goal_observed_multiview = goal_observed_multiview.to(device=context.device,dtype=architecture.dtype)
         return prepare_goal_inputs(architecture, None, prompts, context,
             head_valid=head_valid,seeds=seeds,context_lens=context_lens,
-            goal_observed_multiview=goal_observed_multiview,goal_view_valid=goal_view_valid)
+            goal_observed_multiview=goal_observed_multiview,goal_view_valid=goal_view_valid, **history)
     if isinstance(goal_observed_head, Image.Image):
         goal_observed_head = clean_goal_head(goal_observed_head).unsqueeze(0)
     if goal_observed_head is not None:
@@ -437,4 +467,25 @@ def prepare_inference_goal_inputs(architecture, goal_observed_head, prompts, con
         if not torch.isfinite(goal_observed_head).all() or goal_observed_head.abs().max() > 1.00001:
             raise ValueError('clean goal head must be finite RGB normalized to [-1,1]')
     return prepare_goal_inputs(architecture, goal_observed_head, prompts, context,
-        head_valid=head_valid, seeds=seeds, context_lens=context_lens)
+        head_valid=head_valid, seeds=seeds, context_lens=context_lens, **history)
+
+
+def _validate_runtime_history(expert, count, images, latents, ages, valid):
+    values = dict(history_images=images, history_latents=latents, history_ages=ages, history_valid=valid)
+    values = {k:v for k,v in values.items() if v is not None}
+    if not getattr(expert, 'history_config', HistoryConfig()).enabled:
+        if values: raise ValueError('history supplied to disabled goal expert')
+        return {}
+    validate_history(ages, valid, batch_size=count)
+    if (images is None) == (latents is None):
+        raise ValueError('enabled history requires exactly one history images or latents tensor')
+    tensor, shape = (images, (count,10,3,1,256,320)) if images is not None else (latents, (count,10,48,1,16,20))
+    if tensor.shape != shape: raise ValueError('history input shape mismatch')
+    if any(v.device != tensor.device for v in (ages, valid)):
+        raise ValueError('history tensors must share a device')
+    selected = tensor[valid]
+    if not selected.is_floating_point() or not torch.isfinite(selected).all():
+        raise ValueError('valid history inputs must be finite floating tensors')
+    if images is not None and selected.numel() and selected.abs().max() > 1.00001:
+        raise ValueError('history RGB must be normalized [-1,1]')
+    return values

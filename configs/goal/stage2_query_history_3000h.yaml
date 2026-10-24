@@ -1,0 +1,21 @@
+# @package _global_
+defaults:
+  - stage2_query_3000h
+  - _self_
+model:
+  query_history:
+    enabled: true
+    num_frames: 10
+    tokens_per_frame: 16
+    compressor_dim: 128
+    cache_size: 256
+goal:
+  history: ${model.query_history}
+dataloader:
+  history:
+    enabled: true
+    num_frames: 10
+    mean_interval_s: 1.0
+    jitter_fraction: 0.5
+project:
+  name: openwam-stage2-query-history-3000h

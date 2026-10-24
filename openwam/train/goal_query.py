@@ -19,7 +19,8 @@ def save_query_bundle(expert, checkpoint, *, training_metadata=None, dependency_
     identities = dependency_identities or dependency_identity(expert.codec.vae,
         text_dim=expert.text_dim, precomputed_text_fingerprint=precomputed_text_fingerprint)
     meta = dict(format=QUERY_FORMAT, representation='query_latent',
-        query_config=asdict(expert.query_config), observation_mode=expert.observation_mode,
+        query_config=asdict(expert.query_config), history_config=asdict(expert.history_config),
+        observation_mode=expert.observation_mode,
         observation=observation_metadata(expert.observation_mode), codec=expert.codec.metadata(),
         dit_config=expert.dit_config, shift=expert.shift,
         lambda_image=expert.lambda_image, lambda_tcp=expert.lambda_tcp,
@@ -59,11 +60,12 @@ def load_query_bundle(checkpoint, *, vae, text_encoder=None, tokenizer=None, tex
             raise ValueError('incompatible query codec')
         if encoder_only:
             expert = QueryGoalEncoder(GoalCodec(vae), text_dim=dep['text_dim'],
-                query_config=asdict(config), observation_mode=mode)
+                query_config=asdict(config), observation_mode=mode, history_config=meta.get('history_config'))
             state = {k: file.get_tensor(k) for k in file.keys() if k.startswith('encoder.')}
         else:
             expert = QueryGoalExpert(WanModel(**meta['dit_config']), GoalCodec(vae),
                 dit_config=meta['dit_config'], query_config=asdict(config), observation_mode=mode,
+                history_config=meta.get('history_config'),
                 **{k: meta[k] for k in ('shift', 'lambda_image', 'lambda_tcp', 'lambda_query_image', 'lambda_query_tcp')})
             state = {k: file.get_tensor(k) for k in file.keys()}
         expert.load_state_dict(state, strict=True)

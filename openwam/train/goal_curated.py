@@ -40,6 +40,14 @@ def load_config(path, *, source_yaml=None, data_root=None):
     if representation == 'query_latent':
         from openwam.model.goal.query_expert import QueryConfig
         QueryConfig(**config.get('model', {}).get('query_goal', {}))
+    from openwam.model.goal.history import HistoryConfig
+    from openwam.dataloader.head_history import HistorySamplingConfig
+    history=HistoryConfig(**config.get('model',{}).get('query_history',{}))
+    sampling=HistorySamplingConfig(**config.get('dataset',{}).get('history',{}))
+    if history.enabled and representation!='query_latent':
+        raise ValueError('history requires query_latent')
+    if (history.enabled,history.num_frames)!=(sampling.enabled,sampling.num_frames):
+        raise ValueError('model/dataset history configuration mismatch')
     from openwam.model.goal.observation import OBSERVATION_MODES
     mode=config.get('observation_mode','head')
     if mode not in OBSERVATION_MODES or config.get('dataset',{}).get('observation_mode','head')!=mode:
@@ -123,6 +131,8 @@ def prepare_batch(record,batch,*,device,dtype,context_cache=None):
     """Copy metadata and transfer this singleton only; retain FP32 UV precision."""
     result=dict(batch)
     result['observed']=batch['observed'].to(device=device,dtype=dtype)
+    from openwam.model.goal.history import move_history
+    result.update(move_history(batch,device,dtype))
     if 'observed_view_valid' in batch:
         result['observed_view_valid']=batch['observed_view_valid'].to(device=device)
     target=batch['targets'].to(device=device)
@@ -182,14 +192,29 @@ def preflight(dataset,output_dir):
     return summary
 
 
+def goal_parameter_groups(expert, learning_rate, history_learning_rate):
+    """Keep new FP32 history parameters at an explicit independent learning rate."""
+    if not math.isfinite(history_learning_rate) or history_learning_rate<=0:
+        raise ValueError('history_learning_rate must be positive and finite')
+    history=getattr(getattr(expert,'encoder',None),'history',None)
+    extra=list(history.parameters()) if history is not None else []
+    identities={id(p) for p in extra}
+    groups=[dict(params=[p for p in expert.parameters() if id(p) not in identities],
+                 lr=learning_rate,name='goal')]
+    if extra:groups.append(dict(params=extra,lr=history_learning_rate,name='history'))
+    return groups
+
+
 def train_curated(expert,*,dataset,context_cache,output_dir,steps=5000,eval_every=500,
                   sampling_steps=20,learning_rate=1e-5,seed=42,training_metadata=None,
-                  dependency_metadata=None,dependency_identities=None,precomputed_text_fingerprint=None):
+                  dependency_metadata=None,dependency_identities=None,precomputed_text_fingerprint=None,
+                  history_learning_rate=1e-4):
     """Stream indexed samples; keep immutable evaluation directories and history."""
     from openwam.train.goal_overfit import FP32MasterAdamW,_write_json
     from openwam.train.goal_trainer import _seed
     from openwam.train.goal_patch import evaluate_patch,save_patch_bundle
     from openwam.train.goal_history import render_goal_history
+    from openwam.model.goal.history import history_kwargs
     require_single_process()
     query = getattr(expert, 'representation', 'patch_denoise') == 'query_latent'
     save_bundle = save_patch_bundle
@@ -244,13 +269,13 @@ def train_curated(expert,*,dataset,context_cache,output_dir,steps=5000,eval_ever
     publish(True)
     try:
         evaluate(0)
-        optimizer=FP32MasterAdamW([dict(params=list(expert.parameters()),lr=learning_rate)])
+        optimizer=FP32MasterAdamW(goal_parameter_groups(expert,learning_rate,history_learning_rate))
         for step in range(1,steps+1):
             _seed(seed+step);expert.train_stage_a();optimizer.zero_grad()
             record,cpu_batch=dataset.sample(step-1)
             batch=prepare_batch(record,cpu_batch,device=device,dtype=dtype,context_cache=context_cache)
             out=expert(batch['observed'],batch['context'],batch['targets'],context_lens=batch.get('context_lens'),
-                       observed_view_valid=batch.get('observed_view_valid'))
+                       observed_view_valid=batch.get('observed_view_valid'),**history_kwargs(batch))
             if not torch.isfinite(out['loss']):raise FloatingPointError('nonfinite training loss')
             out['loss'].backward()
             norm=torch.nn.utils.clip_grad_norm_(expert.parameters(),1.,error_if_nonfinite=True,foreach=False)
