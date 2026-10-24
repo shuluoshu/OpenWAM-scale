@@ -4,6 +4,14 @@ defaults:
   - _self_
 
 model:
+  goal_representation: patch_denoise
+  query_goal:
+    num_image_tokens: 64
+    num_tcp_tokens: 2
+    dim: 512
+    num_heads: 8
+    num_layers: 4
+    ffn_dim: 2048
   architecture:
     action_dim: 112
     state_dim: 112
@@ -11,6 +19,7 @@ model:
     video_attention_mask_mode: first_frame_causal
 
 goal:
+  representation: ${model.goal_representation}
   enabled: true
   format: openwam.goal.patch.v1
   mode: predicted

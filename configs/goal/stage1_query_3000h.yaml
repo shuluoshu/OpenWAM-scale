@@ -1,0 +1,7 @@
+base_config: stage1_multiview_3000h.yaml
+model:
+  goal_representation: query_latent
+lambda_query_image: 0.1
+lambda_query_tcp: 0.1
+dataset:
+  cache_dir: outputs/stage1_query_3000h/cache

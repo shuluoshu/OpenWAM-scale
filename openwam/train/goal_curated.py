@@ -34,6 +34,12 @@ def load_config(path, *, source_yaml=None, data_root=None):
             config=OmegaConf.merge(read(filename.parent/base,seen|{filename}),config)
         return config
     config=OmegaConf.to_container(read(path,set()),resolve=True)
+    representation = config.get('model', {}).get('goal_representation', 'patch_denoise')
+    if representation not in ('patch_denoise', 'query_latent'):
+        raise ValueError('unsupported model.goal_representation')
+    if representation == 'query_latent':
+        from openwam.model.goal.query_expert import QueryConfig
+        QueryConfig(**config.get('model', {}).get('query_goal', {}))
     from openwam.model.goal.observation import OBSERVATION_MODES
     mode=config.get('observation_mode','head')
     if mode not in OBSERVATION_MODES or config.get('dataset',{}).get('observation_mode','head')!=mode:
@@ -185,6 +191,12 @@ def train_curated(expert,*,dataset,context_cache,output_dir,steps=5000,eval_ever
     from openwam.train.goal_patch import evaluate_patch,save_patch_bundle
     from openwam.train.goal_history import render_goal_history
     require_single_process()
+    query = getattr(expert, 'representation', 'patch_denoise') == 'query_latent'
+    save_bundle = save_patch_bundle
+    if query:
+        from openwam.train.goal_query import save_query_bundle
+        save_bundle = save_query_bundle
+    checkpoint_name = 'query_goal.safetensors' if query else 'patch_goal.safetensors'
     if any(not isinstance(v,int) or v<1 for v in (steps,eval_every,sampling_steps)):raise ValueError('positive integer budgets required')
     if not math.isfinite(learning_rate) or learning_rate<=0:raise ValueError('positive finite learning rate required')
     output=_new_output(output_dir);started=time.monotonic()
@@ -197,6 +209,7 @@ def train_curated(expert,*,dataset,context_cache,output_dir,steps=5000,eval_ever
     _seed(seed)
     summary=dict(**(training_metadata or {}))
     summary.update(mode='stage1_joint_curated_streaming',status='running',steps=steps,completed_steps=0,
+        representation='query_latent' if query else 'patch_denoise', checkpoint=checkpoint_name,
         observation_mode=expert.observation_mode,initialization=getattr(expert,'initialization_metadata',None),
         eval_every=eval_every,sampling_steps=sampling_steps,seed=seed,learning_rate=learning_rate,
         evaluations=[],scope=dataset.scope_summary(),evaluation_split='train',formal_generalization=False,
@@ -216,6 +229,8 @@ def train_curated(expert,*,dataset,context_cache,output_dir,steps=5000,eval_ever
             timeline=output/'timeline.html'
             timeline.write_text(timeline.read_text().replace('href="../index.html"','href="index.html"').replace('href="../g1_concept_and_plan.html"','href="method.html"'))
     (output/'method.html').write_text('<!doctype html><meta charset="utf-8"><h1>Stage A joint flow</h1><p>Clean observation and instruction condition shared Wan blocks. Terminal image and ordered TCP patch receive independent Gaussian noise and share sigma. TCP coordinates repeat 48 times; group means decode continuous UV without clamping. Both task/subtask supervision is weak. Frozen text uses a bounded CPU LRU. Single-process only; checkpoint reload/resume training is not implemented.</p>')
+    if query:
+        (output/'method.html').write_text('<!doctype html><meta charset="utf-8"><h1>Query latent Stage1</h1><p>Current observation and instruction condition learned image/TCP queries in one encoder forward. Only these tokens condition a training-only joint image/TCP flow decoder. Group readouts add masked image-latent and TCP regression supervision. All images and sampled points shown here are auxiliary joint-flow predictions. Stage2 loads only the frozen encoder, with no auxiliary generation. Single-process; Stage1 optimizer resume is not implemented.</p>')
     (output/'index.html').write_text('<!doctype html><meta charset="utf-8"><h1>Curated Stage A diagnostics</h1><a href="timeline.html">All evaluation steps</a> · <a href="inputs/index.html">Actual inputs and view masks</a> · <a href="inputs/manifest.json">Input provenance</a> · <a href="summary.json">Scope/config</a> · <a href="method.html">Method</a><p>Fixed bounded training examples; no held-out performance or task-success claim.</p>')
     def evaluate(step):
         event('evaluation_started',step=step)
@@ -251,11 +266,14 @@ def train_curated(expert,*,dataset,context_cache,output_dir,steps=5000,eval_ever
                 loss=float(out['loss'].detach()),fm_loss=float(out['fm_loss'].detach()),tcp_loss=float(out['tcp_loss'].detach()),
                 valid_points=int(out['valid_points']),gradient_norm=float(norm))
             summary['last_step']=last
+            if query:
+                last.update(query_image_loss=float(out['query_image_loss'].detach()),
+                            query_tcp_loss=float(out['query_tcp_loss'].detach()))
             del out,batch,cpu_batch,record
             event('train_step',**last);publish()
             if step%eval_every==0 or step==steps:
                 evaluate(step)
-                save_patch_bundle(expert,output/'patch_goal.safetensors',training_metadata={**summary,'selected_step':step},
+                save_bundle(expert,output/checkpoint_name,training_metadata={**summary,'selected_step':step},
                     dependency_metadata=dependency_metadata,dependency_identities=dependency_identities,
                     precomputed_text_fingerprint=precomputed_text_fingerprint)
                 event('checkpoint_saved',step=step)

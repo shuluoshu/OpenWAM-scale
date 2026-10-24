@@ -32,10 +32,35 @@ class GoalMemoryAdapter(nn.Module):
         return keys, values
 
 
-def append_goal_mask(base, token_valid, observation_queries):
+class QueryGoalMemoryAdapter(nn.Module):
+    """Map semantic query tokens directly to each Stage2 layer's read-only KV."""
+    def __init__(self, backbone, query_config):
+        super().__init__()
+        from .query_expert import QueryConfig
+        self.config = QueryConfig(**query_config)
+        self.projection = nn.Linear(self.config.dim, 512)
+        self.type_embedding = nn.Parameter(torch.randn(2, 512) * .02)
+        width = backbone.num_heads * backbone.head_dim
+        self.keys = nn.ModuleList(nn.Linear(512, width) for _ in range(backbone.num_layers))
+        self.values = nn.ModuleList(nn.Linear(512, width) for _ in range(backbone.num_layers))
+
+    def forward(self, latent, backbone):
+        if tuple(latent.shape[1:]) != (self.config.num_tokens, self.config.dim):
+            raise ValueError('query goal tokens disagree with configured count/width')
+        tokens = self.projection(latent.detach())
+        types = torch.cat((self.type_embedding[:1].expand(self.config.num_image_tokens, -1),
+                           self.type_embedding[1:].expand(self.config.num_tcp_tokens, -1)))
+        tokens = tokens + types
+        keys = torch.stack([block.self_attn.norm_k(proj(tokens))
+                            for block, proj in zip(backbone.dit.blocks, self.keys)])
+        values = torch.stack([proj(tokens) for proj in self.values])
+        return keys, values
+
+
+def append_goal_mask(base, token_valid, observation_queries, *, num_tokens=80):
     """Preserve even rectangular prefix-KV masks; add only readable goal columns."""
-    if token_valid is None or token_valid.dtype != torch.bool or token_valid.ndim != 2 or token_valid.shape[1] != 80:
-        raise ValueError('goal token validity must be [B,80]')
+    if token_valid is None or token_valid.dtype != torch.bool or token_valid.ndim != 2 or token_valid.shape[1] != num_tokens:
+        raise ValueError(f'goal token validity must be [B,{num_tokens}]')
     tail = token_valid[:, None, None, :].expand(-1, 1, base.shape[-2], -1).clone()
     tail[:, :, :observation_queries] = False
     return torch.cat((base[None, None].expand(token_valid.shape[0], 1, -1, -1), tail), dim=-1)

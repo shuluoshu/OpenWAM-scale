@@ -25,6 +25,10 @@ def main(argv=None):
     parser.add_argument('--dtype',choices=['float32','bfloat16'])
     parser.add_argument('--steps',type=int)
     parser.add_argument('--seed',type=int,default=42)
+    parser.add_argument('--goal-representation', choices=['patch_denoise', 'query_latent'],
+                        help='override model.goal_representation')
+    for key in ('num_image_tokens', 'num_tcp_tokens', 'dim', 'num_heads', 'num_layers', 'ffn_dim'):
+        parser.add_argument('--query-' + key.replace('_', '-'), type=int, default=None)
     parser.add_argument('--tokenizer-path',help='explicit tokenizer directory override')
     parser.add_argument('--init-goal-checkpoint',help='explicit checked v1 head -> multiview initialization; fresh optimizer')
     args=parser.parse_args(argv)
@@ -34,9 +38,33 @@ def main(argv=None):
     if args.source_yaml and not Path(args.source_yaml).is_absolute():parser.error('--source-yaml must be absolute')
     if args.init_goal_checkpoint and args.preflight:parser.error('--init-goal-checkpoint requires --train or --smoke')
     config=load_config(args.config,source_yaml=args.source_yaml,data_root=args.data_root)
+    model = config.setdefault('model', {})
+    if args.goal_representation:
+        model['goal_representation'] = args.goal_representation
+    representation = model.get('goal_representation', 'patch_denoise')
+    query_options = model.setdefault('query_goal', {})
+    for key in ('num_image_tokens', 'num_tcp_tokens', 'dim', 'num_heads', 'num_layers', 'ffn_dim'):
+        value = getattr(args, 'query_' + key)
+        if value is not None:
+            if representation != 'query_latent':
+                parser.error('--query-* settings require query_latent')
+            query_options[key] = value
+    if representation == 'query_latent':
+        from openwam.model.goal.query_expert import QueryConfig
+        QueryConfig(**query_options)
+        if args.init_goal_checkpoint:
+            parser.error('legacy --init-goal-checkpoint cannot initialize query_latent topology')
     observation_mode=config.get('observation_mode','head')
     flow_settings=dict(shift=config.get('shift',5.),lambda_image=config.get('lambda_image',.5),
                        lambda_tcp=config.get('lambda_tcp',1.))
+    def build_expert(dit, codec, dit_config, **kwargs):
+        from openwam.model.goal.patch_expert import PatchGoalExpert
+        if representation == 'query_latent':
+            from openwam.model.goal.query_expert import QueryGoalExpert
+            return QueryGoalExpert(dit, codec, dit_config=dit_config, query_config=query_options,
+                lambda_query_image=config.get('lambda_query_image', .1),
+                lambda_query_tcp=config.get('lambda_query_tcp', .1), **kwargs)
+        return PatchGoalExpert(dit, codec, dit_config=dit_config, **kwargs)
     if args.init_goal_checkpoint and observation_mode!='multiview':
         parser.error('--init-goal-checkpoint requires a multiview config')
     output=Path(args.output_dir)
@@ -51,8 +79,11 @@ def main(argv=None):
                 observation_mode=observation_mode,text_dim=expert.dit.text_embedding[0].in_features,
                 precomputed_text_fingerprint=fingerprint,device=args.device or 'cpu',**flow_settings)
         else:
-            expert=PatchGoalExpert(expert.dit,expert.codec,dit_config=expert.dit_config,
+            expert=build_expert(expert.dit,expert.codec,dit_config=expert.dit_config,
                 observation_mode=observation_mode,**flow_settings)
+        smoke_dtype = getattr(torch, args.dtype or 'float32')
+        expert.to(device=args.device or 'cpu', dtype=smoke_dtype)
+        expert.codec.vae.to(device=args.device or 'cpu', dtype=smoke_dtype)
         records[0].update(metric_key='synthetic:task:0',granularity='task')
         class SyntheticDataset:
             def evaluation_samples(self):return list(zip(records,batches))
@@ -97,7 +128,7 @@ def main(argv=None):
                     use_gradient_checkpointing=config.get('gradient_checkpointing',True),**flow_settings)
                 expert.to(device=device,dtype=dtype)
             else:
-                expert=PatchGoalExpert(original.dit,original.codec,dit_config=original.dit_config,
+                expert=build_expert(original.dit,original.codec,dit_config=original.dit_config,
                     **flow_settings,
                     use_gradient_checkpointing=config.get('gradient_checkpointing',True),
                     observation_mode=observation_mode).to(device=device,dtype=dtype)

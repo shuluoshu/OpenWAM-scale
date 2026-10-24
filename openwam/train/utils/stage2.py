@@ -108,10 +108,20 @@ def build_stage2_parameter_groups(architecture,training):
 
 
 def validate_stage2_config(cfg):
-    from openwam.model.goal.runtime import goal_observation_mode
-    goal_observation_mode(OmegaConf.to_container(cfg.goal,resolve=True))
-    required={'goal.enabled':True,'goal.conditioning':'image_memory',
-        'goal.mode':'predicted','goal.num_steps':20,
+    from openwam.model.goal.runtime import goal_observation_mode, goal_representation
+    goal_config=OmegaConf.to_container(cfg.goal,resolve=True)
+    goal_observation_mode(goal_config)
+    representation=goal_representation(goal_config)
+    if OmegaConf.select(cfg,'model.goal_representation',default='patch_denoise')!=representation:
+        raise ValueError('model.goal_representation disagrees with goal representation')
+    query=representation=='query_latent'
+    if query:
+        from openwam.model.goal.query_expert import QueryConfig
+        model_query=OmegaConf.to_container(cfg.model.query_goal,resolve=True)
+        if QueryConfig(**model_query)!=QueryConfig(**goal_config.get('query',{})):
+            raise ValueError('model.query_goal disagrees with goal.query')
+    required={'goal.enabled':True,'goal.conditioning':'query_memory' if query else 'image_memory',
+        'goal.mode':'predicted','goal.num_steps':1 if query else 20,
         'model.architecture.action_dim':112,'model.architecture.state_dim':112,
         'model.architecture.use_proprioception':True,'model.architecture.attention_mask_mode':'mutual',
         'model.architecture.video_attention_mask_mode':'first_frame_causal',
@@ -159,9 +169,10 @@ def validate_stage2_launch(cfg,*,metadata_only=False):
     baseline_cfg = OmegaConf.load(str(Path(directory)/'config.yaml'))
     goal_directory = directory if is_stage2(baseline_cfg) else None
     if goal_directory:
-        from openwam.model.goal.runtime import goal_observation_mode
-        if goal_observation_mode(OmegaConf.to_container(cfg.goal,resolve=True)) != goal_observation_mode(OmegaConf.to_container(baseline_cfg.goal,resolve=True)):
-            raise ValueError('Stage2 configured goal policy/mode disagrees with saved checkpoint')
+        from openwam.model.goal.runtime import validate_goal_compatibility
+        requested=OmegaConf.to_container(cfg.goal,resolve=True)
+        saved_goal=OmegaConf.to_container(baseline_cfg.goal,resolve=True)
+        validate_goal_compatibility(requested,saved_goal)
         from omegaconf import open_dict
         with open_dict(cfg):
             cfg.goal = baseline_cfg.goal
@@ -186,11 +197,16 @@ def validate_stage2_launch(cfg,*,metadata_only=False):
     goal=resolve_goal_asset(OmegaConf.to_container(cfg.goal, resolve=True), goal_directory)
     if not goal.is_file():raise FileNotFoundError('STAGE1_GOAL_CHECKPOINT must name a patch bundle')
     with safe_open(str(goal),framework='pt',device='cpu') as handle:
-        metadata=json.loads((handle.metadata() or {}).get('patch_goal_bundle','{}'))
+        metadata_key='query_goal_bundle' if cfg.goal.get('representation','patch_denoise')=='query_latent' else 'patch_goal_bundle'
+        metadata=json.loads((handle.metadata() or {}).get(metadata_key,'{}'))
     from openwam.model.goal.runtime import goal_observation_mode
     from openwam.model.goal.observation import observation_metadata
     mode=goal_observation_mode(OmegaConf.to_container(cfg.goal,resolve=True))
     if metadata.get('format')!=cfg.goal.format:raise ValueError('Stage1 patch bundle metadata format mismatch')
+    if metadata_key=='query_goal_bundle':
+        from openwam.model.goal.query_expert import QueryConfig
+        if metadata.get('representation')!='query_latent' or QueryConfig(**metadata['query_config'])!=QueryConfig(**OmegaConf.to_container(cfg.goal.query,resolve=True)):
+            raise ValueError('Stage1 query bundle model configuration mismatch')
     if metadata.get('observation_mode', 'head')!=mode:raise ValueError('Stage1 patch bundle observation mode mismatch')
     if mode=='multiview' and metadata.get('observation')!=json.loads(json.dumps(observation_metadata(mode))):
         raise ValueError('Stage1 patch bundle multiview observation contract mismatch')

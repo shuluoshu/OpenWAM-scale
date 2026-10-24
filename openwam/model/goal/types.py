@@ -67,7 +67,7 @@ class GoalPrediction:
 
 @dataclass
 class GoalCondition:
-    """Detached predicted terminal image and ordered continuous TCP UV."""
-    latent: torch.Tensor  # [B,48,1,16,20]
-    image_token_valid: torch.Tensor  # bool [B,80], excludes the TCP token
-    uv: torch.Tensor  # FP32 [B,2,2], normalized left/right, unclamped
+    """Detached goal memory. Representation is bound by the loaded expert/adapter."""
+    latent: torch.Tensor  # patch: [B,48,1,16,20]; query: [B,N1+N2,D]
+    image_token_valid: torch.Tensor  # legacy field name; query includes both groups
+    uv: torch.Tensor  # FP32 [B,2,2]; query runtime has no decoder, so NaN/unavailable

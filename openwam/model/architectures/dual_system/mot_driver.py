@@ -364,7 +364,8 @@ class DualSystemMoTDriver:
             from openwam.model.goal.conditioning import append_goal_mask
             if self.attention_mask_mode != "mutual" or self.vb.video_attention_mask_mode != "first_frame_causal":
                 raise ValueError("goal memory requires mutual + first_frame_causal")
-            attn_mask = append_goal_mask(attn_mask, goal_token_valid, self._video_tokens_per_frame(vstate))
+            attn_mask = append_goal_mask(attn_mask, goal_token_valid, self._video_tokens_per_frame(vstate),
+                                        num_tokens=goal_keys.shape[-2])
 
         for layer_id in range(self.num_layers):
             vstate, astate = self.step(

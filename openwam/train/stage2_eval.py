@@ -316,9 +316,9 @@ def prediction_metrics(result, diagnostics, goal_image, sample):
                 error=np.abs(pred[y0:y1,x0:x1]-gt[y0:y1,x0:x1]);total+=float(error.sum());count+=error.size
     metrics['future_video_mae']=dict(value=total/count if count else None,sum=total,valid_count=count,
         sample_count=int(count>0),status='available' if count else 'unavailable')
-    valid_goal=bool(_array(diagnostics['image_token_valid']).any())
+    valid_goal=bool(_array(diagnostics['image_token_valid']).any()) and diagnostics.get('goal_decode_available', True)
     target=sample['_eval'].get('report_goal')
-    metrics['goal_image_mae']=_metric(np.abs(np.asarray(goal_image,dtype=float)-np.asarray(target.convert('RGB').resize((320,256),Image.Resampling.BILINEAR),dtype=float)) if target is not None and valid_goal else [])
+    metrics['goal_image_mae']=_metric(np.abs(np.asarray(goal_image,dtype=float)-np.asarray(target.convert('RGB').resize((320,256),Image.Resampling.BILINEAR),dtype=float)) if target is not None and goal_image is not None and valid_goal else [])
     projection=sample['_eval'].get('projection');uv=_array(diagnostics['predicted_uv'])[0]
     if projection is not None and valid_goal:
         valid=np.asarray(projection['projection_valid'],bool)&np.asarray(projection['in_frame'],bool)
@@ -417,15 +417,20 @@ def _curves(folder, predicted, sample):
 
 
 def _case_assets(folder, result, diagnostics, goal_image, sample):
-    folder.mkdir();goal_image.save(folder/'goal_prediction.png')
-    overlay=goal_image.copy();draw=ImageDraw.Draw(overlay);uv=_array(diagnostics['predicted_uv'])[0]
-    for point,color in zip(uv,('red','blue')):
-        if np.isfinite(point).all():
-            x,y=point*[319,255];draw.ellipse((x-4,y-4,x+4,y+4),outline=color,width=2)
-    overlay.save(folder/'goal_uv.png')
+    folder.mkdir()
+    uv=_array(diagnostics['predicted_uv'])[0]
+    if goal_image is not None:
+        goal_image.save(folder/'goal_prediction.png')
+        overlay=goal_image.copy();draw=ImageDraw.Draw(overlay)
+        for point,color in zip(uv,('red','blue')):
+            if np.isfinite(point).all():
+                x,y=point*[319,255];draw.ellipse((x-4,y-4,x+4,y+4),outline=color,width=2)
+        overlay.save(folder/'goal_uv.png')
     projection=sample['_eval'].get('projection')
     _write_json(folder/'goal_points.json',dict(predicted_uv=[p.tolist() if np.isfinite(p).all() else None for p in uv],
-        image_token_valid=_array(diagnostics['image_token_valid']),target=projection))
+        image_token_valid=_array(diagnostics['image_token_valid']),target=projection,
+        goal_decode_available=diagnostics.get('goal_decode_available',True),
+        representation=diagnostics.get('representation','patch_denoise')))
     side=[]
     for gt,pred in zip(sample['video'],result['video']):
         canvas=Image.new('RGB',(640,384));canvas.paste(gt,(0,0));canvas.paste(pred,(320,0));side.append(canvas)
@@ -447,6 +452,8 @@ def _page(body):
 def _step_html(folder, report):
     body=f'<h1>Stage2 update {report["step"]}</h1><p>{html.escape(_json(report["coverage"]))}</p>'
     body+='<p>Predicted frozen Stage1 goals stay constant for fixed input/seed. Future video and actions measure Stage2 learning. Task report endpoints are true episode ends; subtask report endpoints are instruction interval ends. Success is not verified. Video: GT left, prediction right. MAE pixels use 0–255; joints rad, gripper openness, FK m/rad. Counts exclude invalid labels. All ranks generate identical cases; counts come from rank zero once.</p>'
+    if report.get('goal_representation') == 'query_latent':
+        body+='<p>Query latent mode: Stage2 loads only the frozen encoder. Goal image/TCP auxiliary decoders are absent; their predictions and errors are unavailable here. Stage1 evaluation retains those diagnostics. Latent tokens, action and future video predictions are saved.</p>'
     body+=_metric_table(report['aggregate'])
     for group,metrics in report['by_family_granularity'].items():
         body+='<details><summary>'+html.escape(group)+'</summary>'+_metric_table(metrics)+'</details>'
@@ -553,7 +560,8 @@ def evaluate_stage2(architecture,cases,output_dir,*,step,seed,num_steps=20):
             if rank==0:
                 try:
                     diagnostics=architecture.goal_diagnostics
-                    goal_image=_pil_goal(architecture.goal_expert.codec.decode(diagnostics['predicted_latent']))
+                    goal_image=(_pil_goal(architecture.goal_expert.codec.decode(diagnostics['predicted_latent']))
+                                if diagnostics.get('goal_decode_available',True) else None)
                     metrics=prediction_metrics(result,diagnostics,goal_image,sample)
                     name=f'case_{index:03d}';_fixed_assets(sample,root/'fixed_inputs'/name,observation_mode=observation_mode,actual_goal_inputs=kwargs)
                     _case_assets(work/name,result,diagnostics,goal_image,sample)
@@ -575,6 +583,7 @@ def evaluate_stage2(architecture,cases,output_dir,*,step,seed,num_steps=20):
             try:
                 coverage=getattr(cases,'coverage',dict(mode='explicit supplied cases',selected_cases=len(cases)))
                 report=dict(schema=SCHEMA,step=int(step),seed=int(seed),num_steps=int(num_steps),coverage=coverage,sample_count=len(rows),
+                    goal_representation=getattr(architecture.goal_expert,'representation','patch_denoise'),
                     goal_observation_mode=observation_mode,metric_rank_policy='rank0 authoritative; same cases generated on all ranks',cases=rows,aggregate=_aggregate(rows))
                 report['by_family_granularity']={f'{family}/{level}':_aggregate([r for r in rows if r['family']==family and r['granularity']==level])
                     for family,level in sorted({(r['family'],r['granularity']) for r in rows})}

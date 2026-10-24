@@ -14,17 +14,53 @@ PREPROCESSING_VERSION = 'openwam.goal.clean_head.rgb320x256.v1'
 MULTIVIEW_PREPROCESSING_VERSION = 'openwam.goal.clean_multiview.rgb320x384.v2'
 
 
+def goal_representation(config):
+    representation = config.get('representation', 'patch_denoise')
+    if representation not in ('patch_denoise', 'query_latent'):
+        raise ValueError('unsupported goal representation')
+    is_query = config.get('format') == 'openwam.goal.query.v1'
+    if is_query != (representation == 'query_latent'):
+        raise ValueError('goal representation/format mismatch')
+    return representation
+
+
 def goal_observation_mode(config):
     """Validate paired policy/version; absent fields retain historical v1 defaults."""
+    representation = goal_representation(config)
     pair = (config.get('format', 'openwam.goal.patch.v1'), config.get('input_policy', 'clean_head'))
     contracts = {('openwam.goal.patch.v1', 'clean_head'): 'head',
-                 ('openwam.goal.patch.v2', 'clean_multiview'): 'multiview'}
+                 ('openwam.goal.patch.v2', 'clean_multiview'): 'multiview',
+                 ('openwam.goal.query.v1', 'clean_head'): 'head',
+                 ('openwam.goal.query.v1', 'clean_multiview'): 'multiview'}
     if pair not in contracts:
         raise ValueError('goal format/input_policy contract mismatch')
     mode = contracts[pair]
     if config.get('observation_mode', mode) != mode:
         raise ValueError('goal observation_mode disagrees with format/input_policy contract')
     return mode
+
+
+def validate_goal_model_config(config, model):
+    """Also used by public loaders that do not execute the training preflight."""
+    representation = goal_representation(config)
+    if model.get('goal_representation', representation) != representation:
+        raise ValueError('model.goal_representation disagrees with goal representation')
+    if representation == 'query_latent' and 'query_goal' in model:
+        from .query_expert import QueryConfig
+        if QueryConfig(**dict(model['query_goal'])) != QueryConfig(**config.get('query', {})):
+            raise ValueError('model.query_goal disagrees with goal.query')
+
+
+def validate_goal_compatibility(requested, saved):
+    """No topology changes when loading an existing Stage2 checkpoint."""
+    if goal_representation(requested) != goal_representation(saved):
+        raise ValueError('Stage2 goal representation differs from saved checkpoint; use original baseline for a new mode')
+    if goal_observation_mode(requested) != goal_observation_mode(saved):
+        raise ValueError('Stage2 configured goal policy/mode disagrees with saved checkpoint')
+    if goal_representation(requested) == 'query_latent':
+        from .query_expert import QueryConfig
+        if QueryConfig(**requested.get('query', {})) != QueryConfig(**saved.get('query', {})):
+            raise ValueError('Stage2 query dimensions differ from saved checkpoint')
 
 
 def goal_prediction_policy(architecture):
@@ -38,6 +74,11 @@ def goal_prediction_policy(architecture):
     if mode == 'multiview':
         result.update(format='openwam.goal.patch.v2', observation_mode=mode,
                       preprocessing_version=MULTIVIEW_PREPROCESSING_VERSION)
+    if goal_representation(config) == 'query_latent':
+        from dataclasses import asdict
+        from .query_expert import QueryConfig
+        result.update(format='openwam.goal.query.v1', representation='query_latent',
+                      query=asdict(QueryConfig(**config.get('query', {}))), num_steps=1)
     return result
 
 
@@ -53,8 +94,16 @@ def goal_asset_sha256(path):
 
 
 def load_stage2_goal(path, *, vae, text_encoder, tokenizer, text_dim, device,
-                     dtype, precomputed_text_fingerprint=None) -> PatchGoalExpert:
-    """Load only the versioned patch bundle, checking borrowed dependencies."""
+                     dtype, precomputed_text_fingerprint=None) -> torch.nn.Module:
+    """Load the versioned frozen conditioner, omitting query auxiliary heads."""
+    from safetensors import safe_open
+    with safe_open(str(path), framework='pt', device='cpu') as file:
+        is_query = 'query_goal_bundle' in (file.metadata() or {})
+    if is_query:
+        from openwam.train.goal_query import load_query_bundle
+        return load_query_bundle(path, vae=vae, text_encoder=text_encoder,
+            tokenizer=tokenizer, text_dim=text_dim, device=device, dtype=dtype,
+            precomputed_text_fingerprint=precomputed_text_fingerprint, encoder_only=True)
     from openwam.train.goal_patch import load_patch_bundle
     return load_patch_bundle(path, vae=vae, text_encoder=text_encoder,
         tokenizer=tokenizer, text_dim=text_dim, device=device, dtype=dtype,
@@ -161,10 +210,15 @@ def predict_goals(*, expert, observed, context, context_lens, seeds, num_steps,
         if results[i] is None: pending.append(i)
     for start in range(0,len(pending),microbatch_size):
         ids=pending[start:start+microbatch_size]
-        pred=to_goal_condition(expert.generate(observed[ids],context[ids],
-            seed=[seeds[i] for i in ids],num_steps=num_steps,
-            context_lens=None if context_lens is None else context_lens[ids],
-            **({'observed_view_valid': observed_view_valid[ids]} if mode=='multiview' else {})))
+        kwargs = dict(context_lens=None if context_lens is None else context_lens[ids],
+            **({'observed_view_valid': observed_view_valid[ids]} if mode=='multiview' else {}))
+        if getattr(expert, 'representation', 'patch_denoise') == 'query_latent':
+            z = expert.extract_tokens(observed[ids], context[ids], **kwargs).detach()
+            pred = GoalCondition(z, torch.ones(z.shape[:2], device=z.device, dtype=torch.bool),
+                                 torch.full((len(ids),2,2), float('nan'), device=z.device))
+        else:
+            pred=to_goal_condition(expert.generate(observed[ids],context[ids],
+                seed=[seeds[i] for i in ids],num_steps=num_steps, **kwargs))
         for row,i in enumerate(ids):
             results[i]=GoalCondition(*(getattr(pred,name)[row:row+1] for name in
                                       ('latent','image_token_valid','uv')))
@@ -182,6 +236,9 @@ def configure_goal(architecture, cfg, *, checkpoint_dir=None):
     if not config.get('enabled', False):
         architecture.train(architecture.training)
         return
+    model = OmegaConf.select(cfg, 'model', default={}) if OmegaConf.is_config(cfg) else cfg.get('model', {})
+    model = OmegaConf.to_container(model, resolve=True) if OmegaConf.is_config(model) else model
+    validate_goal_model_config(config, model)
     if config.get('mode', 'predicted') != 'predicted':
         raise ValueError('Stage2 requires predicted goals')
     mode = goal_observation_mode(config)
@@ -203,10 +260,17 @@ def configure_goal(architecture, cfg, *, checkpoint_dir=None):
         precomputed_text_fingerprint=config.get('precomputed_text_fingerprint'))
     if getattr(expert, 'observation_mode', 'head') != mode:
         raise ValueError('goal configured mode disagrees with loaded expert mode')
-    if {id(p) for p in expert.dit.parameters()} & {id(p) for p in vb.dit.parameters()}:
+    representation = goal_representation(config)
+    if getattr(expert, 'representation', 'patch_denoise') != representation:
+        raise ValueError('goal representation disagrees with loaded expert')
+    if representation == 'query_latent':
+        from .query_expert import QueryConfig
+        if expert.query_config != QueryConfig(**config.get('query', {})):
+            raise ValueError('goal query config disagrees with checkpoint')
+    if {id(p) for p in expert.parameters()} & {id(p) for p in vb.dit.parameters()}:
         raise ValueError('goal and video DiT Parameters must be independent')
     architecture.goal_expert = expert
-    configure_goal_adapter(architecture)
+    configure_goal_adapter(architecture, config)
     architecture.goal_config = config
     architecture.goal_asset_identity = identity
     architecture.goal_asset_source = str(asset.resolve())
@@ -251,8 +315,11 @@ def prepare_goal_inputs(architecture, goal_observed_head, prompts, context, *,
         if valid.any(): raise ValueError(f'valid heads require explicit clean {name} RGB')
     elif tuple(observed.shape) != shape:
         raise ValueError(f'clean {name} must be {list(shape)}')
-    latent = context.new_zeros((count,48,1,16,20))
-    tokens = torch.zeros(count,80,dtype=torch.bool,device=context.device)
+    query = getattr(architecture.goal_expert, 'representation', 'patch_denoise') == 'query_latent'
+    spec = getattr(architecture.goal_expert, 'query_config', None)
+    latent_shape = (spec.num_tokens, spec.dim) if query else (48,1,16,20)
+    latent = context.new_zeros((count,*latent_shape))
+    tokens = torch.zeros(count,spec.num_tokens if query else 80,dtype=torch.bool,device=context.device)
     uv = torch.full((count,2,2),float('nan'),device=context.device)
     ids = valid.nonzero(as_tuple=True)[0]
     if ids.numel():
@@ -268,6 +335,7 @@ def prepare_goal_inputs(architecture, goal_observed_head, prompts, context, *,
         latent[ids]=pred.latent.to(latent); tokens[ids]=pred.image_token_valid; uv[ids]=pred.uv
     architecture.goal_diagnostics = {'predicted_uv':uv.detach(),
         'predicted_latent':latent.detach(), 'image_token_valid':tokens.detach(), 'observation_mode':mode,
+        'representation':'query_latent' if query else 'patch_denoise', 'goal_decode_available':not query,
         'observed_view_valid':None if view_valid is None else view_valid.detach()}
     return {'goal_latent':latent.detach(),'goal_token_valid':tokens.detach()}
 
@@ -285,13 +353,23 @@ def resolve_goal_asset(config, checkpoint_dir=None):
     return asset
 
 
-def configure_goal_adapter(architecture):
+def configure_goal_adapter(architecture, config=None):
     """Build adapter before strict unified load; teacher follows restored VAE/T5."""
-    from .conditioning import GoalMemoryAdapter
+    from .conditioning import GoalMemoryAdapter, QueryGoalMemoryAdapter
+    config = config or {}
+    query = goal_representation(config) == 'query_latent'
     if getattr(architecture, 'goal_adapter', None) is None:
         placement = next(architecture.video_backbone.dit.parameters())
-        architecture.goal_adapter = GoalMemoryAdapter(architecture.video_backbone).to(
+        adapter = (QueryGoalMemoryAdapter(architecture.video_backbone, dict(config.get('query', {})))
+                   if query else GoalMemoryAdapter(architecture.video_backbone))
+        architecture.goal_adapter = adapter.to(
             device=placement.device, dtype=placement.dtype)
+    elif isinstance(architecture.goal_adapter, QueryGoalMemoryAdapter) != query:
+        raise ValueError('existing goal adapter representation mismatch')
+    elif query:
+        from .query_expert import QueryConfig
+        if architecture.goal_adapter.config != QueryConfig(**config.get('query', {})):
+            raise ValueError('existing query adapter dimensions mismatch')
 
 
 def save_goal_assets(architecture, output_dir, cfg):

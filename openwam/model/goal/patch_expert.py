@@ -248,6 +248,7 @@ class PatchGoalExpert(nn.Module):
                     clean_latent=estimated_image, observed_latent=observed_latent,
                     noisy_latent=noisy_image, velocity=image_velocity, sigma=sigma,
                     noisy_tcp_patch=noisy_tcp, clean_tcp_patch=estimated_tcp,
+                    target_latent=clean_image,
                     tcp_velocity=tcp_velocity, tcp_noise=tcp_noise, tcp_valid=point_valid,
                     uv=decode_tcp_patch(estimated_tcp))
 
