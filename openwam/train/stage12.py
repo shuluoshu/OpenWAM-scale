@@ -69,7 +69,7 @@ def load_pipeline(path):
     return config
 
 
-def main(argv=None):
+def main(argv=None, *, _runner=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',default=str(ROOT/'configs/goal/stage12_query_history_posttrain.yaml'))
     modes=parser.add_mutually_exclusive_group(required=True)
@@ -81,14 +81,20 @@ def main(argv=None):
     args=parser.parse_args(argv)
     config=load_pipeline(args.config);output=Path(config['output_dir']);output.mkdir(parents=True,exist_ok=True)
     world=config.get('world_size',8)
-    single_node_torchrun(sys.executable,world)
+    from openwam.train.stage12_distributed import topology,torchrun_command,coordinate_pipeline
+    nodes,_=topology(config)
     if args.train:
         import torch
-        single_node_torchrun(sys.executable,world,visible_devices=torch.cuda.device_count())
+        validate=lambda:torchrun_command(sys.executable,config,visible_devices=torch.cuda.device_count())
+        if nodes>1 and _runner is None:
+            return coordinate_pipeline(lambda runner: main(argv,_runner=runner),config,startup_validation=validate)
+        validate()
     source=config['source_yaml'];index=output/'population.sqlite';stage1_output=output/'stage1'
     python=sys.executable
     env=os.environ.copy();env['PYTHONPATH']=str(ROOT)+os.pathsep+env.get('PYTHONPATH','')
-    def run(command):subprocess.run(command,cwd=ROOT,env=env,check=True)
+    def run(command):
+        if _runner is not None:return _runner(command,cwd=ROOT,env=env)
+        return subprocess.run(command,cwd=ROOT,env=env,check=True)
     common=[str(ROOT/'scripts/train_goal_epoch.py'),'--config',config['stage1_config'],'--source-yaml',source,'--index',str(index),'--output-dir',str(stage1_output)]
     from openwam.train.goal_curated import load_config
     stage1=load_config(config['stage1_config'],source_yaml=source)
@@ -128,12 +134,12 @@ def main(argv=None):
     if args.check:
         print(json.dumps(dict(identity=identity,sample_fps=population['sample_fps'],
             stage1_updates=(population['total_samples']+world-1)//world,
-            torchrun=single_node_torchrun(python,world),stats_registry=registry,stage2_config=config['stage2_config']),indent=2));return 0
+            torchrun=torchrun_command(python,config,require_env=False),stats_registry=registry,stage2_config=config['stage2_config']),indent=2));return 0
     if not args.resume and (output/'pipeline_state.json').exists():raise ValueError('existing pipeline requires --resume')
     old=json.loads((output/'pipeline_state.json').read_text()) if (output/'pipeline_state.json').exists() else {}
     if old.get('phase') in ('stage2','stage2_failed') and not args.stage2_resume:
         raise ValueError('interrupted Stage2 requires --stage2-resume full-state checkpoint; refusing implicit restart')
-    torchrun=single_node_torchrun(python,world)
+    torchrun=torchrun_command(python,config)
     command1=[*torchrun,*common,'--train']+(['--resume'] if args.resume else [])
     overrides=[f'dataloader.source_yaml={source}',f'dataloader.normalization_registry={registry}',
         'goal.checkpoint={goal_checkpoint}',f'project.output_dir={output / "stage2"}',

@@ -1,0 +1,70 @@
+{
+  "region": "cn-shanghai",
+  "workspace_id": "1140257",
+  "quota_id": "quota9lheyy49shl",
+  "image": "moqi-sh-arc-registry-vpc.cn-shanghai.cr.aliyuncs.com/moqi-sh/mq_sanyi_train:sanyi-dsw-0515",
+  "cpu": "168",
+  "memory": "1600Gi",
+  "shared_memory": "64Gi",
+  "display_name": "openwam-stage12-3fps-4x8gpu",
+  "pod_count": 4,
+  "gpus_per_pod": 8,
+  "code_dir": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/query_latent_20261020/code",
+  "python": "/mnt/data/cpfs/b5/yeqingda/envs/openwam/bin/python",
+  "commit": "auto",
+  "pipeline_config": "configs/goal/stage12_query_history_posttrain_3fps_4x8gpu.yaml",
+  "resume": false,
+  "stage2_resume": null,
+  "data_sources": [
+    {
+      "MountPath": "/mnt/data/nas/F_zone_nas",
+      "Uri": "nas://0328f6e7-uykx.cn-shanghai.extreme.nas.aliyuncs.com/"
+    },
+    {
+      "MountPath": "/mnt/data/nas/B_zone_nas",
+      "Uri": "nas://03a06c7a-awqh.cn-shanghai.extreme.nas.aliyuncs.com/"
+    },
+    {
+      "MountPath": "/mnt/data/cpfs/b5",
+      "Uri": "bmcpfs://cpfs-01001yvf8qy3eg0e9mhv2-vpc-vyv66j.cn-shanghai.cpfs.aliyuncs.com/"
+    },
+    {
+      "MountPath": "/mnt/data/cpfs/b5big",
+      "Uri": "bmcpfs://cpfs-01001yicmjn0uwxwbk0z5-vpc-2fylmm.cn-shanghai.cpfs.aliyuncs.com/"
+    }
+  ],
+  "user_vpc": {
+    "SecurityGroupId": "sg-uf6c51dgcyyg22k9aabi",
+    "SwitchId": "vsw-uf6031nybmufu28ssvekq",
+    "VpcId": "vpc-uf6mp9wg299dfh8gzhkp7",
+    "ExtendedCIDRs": [
+      "10.1.192.0/21",
+      "10.1.160.0/19",
+      "10.1.255.0/24",
+      "10.1.128.0/19",
+      "10.1.96.0/19",
+      "10.1.64.0/19",
+      "10.1.32.0/19"
+    ]
+  },
+  "reference_only": {
+    "observed_at_utc": "2026-10-24",
+    "job_id": "dlc6s0umjw7jois6",
+    "workspace_id": "1140257",
+    "quota_id": "quota9lheyy49shl",
+    "specs": [
+      {
+        "Image": "moqi-sh-arc-registry-vpc.cn-shanghai.cr.aliyuncs.com/moqi-sh/mq_sanyi_train:sanyi-dsw-0515",
+        "PodCount": 1,
+        "ResourceConfig": {
+          "CPU": "168",
+          "GPU": "8",
+          "GPUType": "",
+          "Memory": "1600Gi",
+          "SharedMemory": "1600Gi"
+        }
+      }
+    ],
+    "note": "Mounts/VPC/image/per-node CPU and RAM from succeeded 8-GPU job. User approved 4 x 8 topology and explicitly declined capacity polling on 2026-10-24; use queued scheduling."
+  }
+}

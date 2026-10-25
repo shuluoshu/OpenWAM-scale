@@ -1,0 +1,15 @@
+# Sparse Stage1 pass over every retained source, then frozen-query Stage2.
+# DLC: 4 nodes x 8 GPUs; per-rank batch1 -> global batch32.
+stage1_config: configs/goal/stage1_query_history_epoch_3fps.yaml
+stage2_config: goal/stage2_query_history_3000h
+source_yaml: outputs/stage12_posttrain_selection/source.yaml
+output_dir: outputs/stage12_posttrain_3fps_4x8gpu
+world_size: 32
+nnodes: 4
+gpus_per_node: 8
+stage2_baseline: ${oc.env:STAGE2_BASELINE_CHECKPOINT,/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/curated_gripper_human_20261014/gripper_human_aug_lr0.0001_b320/checkpoints/2026-10-15_21-16-09}
+stats_registry: ${oc.env:STAGE2_STATS_REGISTRY,null}
+stats_episodes_per_profile: 4
+stats_windows_per_profile: 128
+stage2_max_steps: 100000
+stage2_overrides: []

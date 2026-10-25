@@ -143,7 +143,7 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
         return result
     def event(kind,**values):
         if rank==0:
-            row=dict(event=kind,**values)
+            row=dict(event=kind,wall_time=time.time(),**values)
             with (output/'progress.jsonl').open('a') as f:f.write(json.dumps(row,allow_nan=False)+'\n')
             print(json.dumps(row,allow_nan=False),flush=True)
     primary(lambda: (_ for _ in ()).throw(ValueError('existing run requires --resume')) if (output/'latest.json').exists() and not resume else None)

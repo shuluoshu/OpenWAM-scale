@@ -53,6 +53,13 @@ def test_source_identity_and_incomplete_index_rejected(tmp_path):
     with pytest.raises(ValueError,match='incomplete'):goal_epoch.validate_index(d,p)
 
 
+def test_old_annotation_segmentation_index_requires_rebuild(tmp_path):
+    d=Source(tmp_path);p=tmp_path/'index.db';goal_epoch.build_epoch_index(d,p)
+    with sqlite3.connect(p) as c:c.execute("UPDATE metadata SET value='2' WHERE key='version'")
+    with pytest.raises(ValueError,match='identity'):goal_epoch.validate_index(d,p)
+    with pytest.raises(ValueError,match='identity'):goal_epoch.build_epoch_index(d,p)
+
+
 def test_resume_committed_episode_and_compact_storage(tmp_path):
     d=Source(tmp_path,length=100_000);d.repos[0]['ranges'].append((1,0,100_000))
     original=d._episode

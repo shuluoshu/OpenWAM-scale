@@ -515,6 +515,7 @@ class OpenWAMTrainer:
         evaluate()
         pbar = tqdm(total=max_updates, initial=min(progress.opt_step, max_updates), unit='update', desc='Stage2')
         last_time = time.monotonic()
+        monitor_started = last_time
         if progress.opt_step < max_updates:
             for epoch in itertools.count(progress.epoch):
                 progress.begin_epoch(epoch)
@@ -552,6 +553,12 @@ class OpenWAMTrainer:
                         batch_size=batch_size, pbar=None, wandb_run=wandb_run, debug=bool(t.debug), output_path=output_path)
                     last_time = now
                     if updated:
+                        if is_main and (progress.opt_step == 1 or progress.opt_step % 10 == 0 or progress.opt_step == max_updates):
+                            row = dict(event='update', step=progress.opt_step, total_steps=max_updates,
+                                elapsed_s=time.monotonic()-monitor_started, wall_time=time.time(),
+                                **{key: float(value) if math.isfinite(float(value)) else None for key, value in metrics.items()})
+                            with open(os.path.join(output_path, 'progress.jsonl'), 'a') as stream:
+                                stream.write(json.dumps(row, allow_nan=False)+'\n')
                         pbar.update(1)
                         pbar.set_postfix(loss=metrics['loss_total'], micro_step=progress.micro_step)
                         if progress.opt_step % int(self.cfg.evaluation.every_updates) == 0:

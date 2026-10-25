@@ -5,6 +5,37 @@ import torch
 from PIL import Image
 
 
+def test_adjacent_same_id_annotations_keep_separate_goal_frames():
+    from openwam.dataloader.curated_goal import language_intervals
+    frames=dict(frame_index=list(range(8)),task_index=[0]*8,subtask_index=[503]*8)
+    annotations=[dict(subtask_index=503,subtask='fold wristband',start_frame=0,end_frame=4),
+                 dict(subtask_index=503,subtask='fold wristband',start_frame=4,end_frame=8)]
+    _,rows=language_intervals(frames,{0:'fold all wristbands'},annotations,8)
+    assert [(r['start'],r['end_exclusive'],r['end_frame']) for r in rows]==[(0,4,3),(4,8,7)]
+    assert [r['number'] for r in rows]==[0,1]
+
+
+def test_annotation_boundary_preserves_unannotated_gap_and_frame_label_changes():
+    from openwam.dataloader.subtask_goal import contiguous_subtasks
+    frames=dict(frame_index=list(range(8)),task_index=[0]*8,subtask_index=[1]*8,
+                subtask_unannotated=[False,False,True,False,False,False,False,False])
+    annotations=[dict(subtask_index=1,subtask='repeat',start_frame=0,end_frame=4),
+                 dict(subtask_index=1,subtask='repeat',start_frame=5,end_frame=8)]
+    rows=contiguous_subtasks(frames,annotations,8)
+    assert [(r['start'],r['end_exclusive']) for r in rows]==[(0,2),(2,3),(3,4),(4,5),(5,8)]
+    assert [r['valid'] for r in rows]==[True,False,True,False,True]
+    assert 'annotation_interval_does_not_cover_frame_run' in rows[3]['exclusion_reasons']
+
+
+def test_overlapping_same_id_annotations_are_ambiguous():
+    from openwam.dataloader.subtask_goal import contiguous_subtasks
+    frames=dict(frame_index=list(range(8)),task_index=[0]*8,subtask_index=[1]*8)
+    annotations=[dict(subtask_index=1,subtask='repeat',start_frame=0,end_frame=5),
+                 dict(subtask_index=1,subtask='repeat',start_frame=4,end_frame=8)]
+    with pytest.raises(ValueError,match='overlapping subtask annotation'):
+        contiguous_subtasks(frames,annotations,8)
+
+
 def test_contiguous_runs_do_not_merge_repeated_ids_or_bridge_gaps():
     from openwam.dataloader.subtask_goal import contiguous_subtasks
     frames={'frame_index':list(range(9)), 'task_index':[0]*9,'subtask_index':[4,4,-1,4,4,5,5,5,5],

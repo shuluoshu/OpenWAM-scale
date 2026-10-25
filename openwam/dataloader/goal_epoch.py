@@ -16,7 +16,9 @@ from pathlib import Path
 import sqlite3
 import numpy as np
 
-VERSION=2
+# v3 preserves adjacent same-ID annotation occurrences and their goal frames.
+# Existing v2 populations must be rebuilt, including partially prepared indices.
+VERSION=3
 
 
 def epoch_sample_fps(config):
