@@ -75,7 +75,10 @@ def collect(job,root,*,now=None):
     candidates=list((root/'stage2').rglob('progress.jsonl')) if (root/'stage2').exists() else []
     latest=max(candidates,key=lambda p:p.stat().st_mtime) if candidates else None
     second=read_progress(latest) if latest else []
-    one=stage_summary(first,total_hint=None,stage='stage1',now=now)
+    population=read_json(root/'stage1/population.json',{})
+    samples=population.get('total_samples')
+    prepared_steps=math.ceil(samples/32) if population.get('complete') and isinstance(samples,int) and samples>0 else None
+    one=stage_summary(first,total_hint=prepared_steps,stage='stage1',now=now)
     two=stage_summary(second,total_hint=100000,stage='stage2',now=now)
     phase=state.get('phase','preparation_or_queue');status=job.get('Status','Unknown')
     eta=two['eta_unix'] if phase=='stage2' and status=='Running' else None

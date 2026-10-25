@@ -207,8 +207,10 @@ def _prepare_episode(dataset,item,sample_fps):
 
 
 def _prepare_episode_result(dataset,item,sample_fps):
+    from openwam.dataloader.episode_metadata import offline_metadata_cache
     ri,repo,episode,ranges=item
-    metadata=dataset._episode(repo,episode);n=int(metadata['length']);fps=float(metadata['info']['fps'])
+    with offline_metadata_cache():metadata=dataset._episode(repo,episode)
+    n=int(metadata['length']);fps=float(metadata['info']['fps'])
     sources=_episode_sources(metadata)
     if not math.isfinite(fps) or fps<=0:raise ValueError('invalid source fps')
     ratio=max(Fraction(str(fps))/Fraction(str(sample_fps)),Fraction(1))

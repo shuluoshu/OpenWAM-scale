@@ -29,14 +29,8 @@ class ByteLRU(OrderedDict):
 
 
 def read_episode_metadata(root,episode):
-    import pyarrow.dataset as ds
-    files=sorted((root/'meta/episodes').glob('chunk-*/*.parquet'))
-    if not files:raise ValueError(f'{root}:{episode}: missing episode metadata')
-    dataset=ds.dataset([str(p) for p in files],format='parquet')
-    columns=[n for n in dataset.schema.names if not n.startswith('stats/')]
-    table=dataset.to_table(columns=columns,filter=ds.field('episode_index')==episode)
-    if len(table)!=1:raise ValueError(f'{root}:{episode}: nonunique episode metadata')
-    return table.to_pylist()[0]
+    from openwam.dataloader.episode_metadata import read_episode_metadata as read
+    return read(root,episode)
 
 
 def load_episode(repo,episode,filter_config,max_bytes):
