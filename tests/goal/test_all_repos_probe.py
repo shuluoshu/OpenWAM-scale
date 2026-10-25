@@ -38,3 +38,18 @@ def test_prepare_tries_later_episode_only_for_no_pair_and_owns_cache():
         def _episode(self,repo,episode):raise ValueError('bad annotation')
     result=prepare_one(Broken(),0,repo,3.)
     assert result['status']=='failed' and result['episode']==0 and 'bad annotation' in result['error']
+
+
+def test_replay_shards_cover_exact_family_without_duplicates_or_identity_drift():
+    from scripts.validate_goal_all_repos import select_replay_entries
+    identity=dict(source_sha256='hash',config={'rate':3},population_version=3,repositories=5,sample_fps=3.)
+    entries=[dict(repo_index=i,repo=f'family/{i}',path=f'/cpfs/{i}',family='mecka' if i<4 else 'other') for i in range(5)]
+    repos=[dict(repo=r['repo'],path=r['path'],family=r['family']) for r in entries]
+    groups=[select_replay_entries(entries,identity,identity,repos,['mecka'],i,3) for i in range(3)]
+    assert sorted(r['repo_index'] for group in groups for r in group)==[0,1,2,3]
+    with pytest.raises(ValueError,match='identity'):
+        select_replay_entries(entries,dict(identity,source_sha256='changed'),identity,repos,['mecka'],0,1)
+    with pytest.raises(ValueError,match='coverage'):
+        select_replay_entries(entries[:-1],identity,identity,repos,['mecka'],0,1)
+    with pytest.raises(ValueError,match='family'):
+        select_replay_entries(entries,identity,identity,repos,['missing'],0,1)

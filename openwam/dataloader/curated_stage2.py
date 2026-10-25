@@ -136,7 +136,8 @@ class CuratedStage2Dataset(Dataset):
             # Native metadata carries the per-file start; decode verifies integral CFR ordinals.
             if prefix+'to_timestamp' in ep and float(ep[prefix+'to_timestamp'])<offset+(max(indices)+1)/fps-1/fps:
                 raise ValueError(f'{path}: invalid_segment_bounds/video_offset')
-            images,alignment=decode_frames(path,offset,fps,indices,sequential=m['profile']['family']=='mecka')
+            images,alignment=decode_frames(path,offset,fps,indices,sequential=m['profile']['family']=='mecka',
+                video_ordinals=m['video_ordinals'] if m['profile']['family']=='mecka' else None)
             for target,index in zip(views,indices):target[camera]=images[index]
             trace[camera]=dict(path=str(path),alignment=alignment)
         return views,trace
@@ -190,7 +191,7 @@ class CuratedStage2Dataset(Dataset):
             goal_observed_head=clean,goal_observed_multiview=clean_canvas,goal_view_valid=current_mask,goal_head_valid=head is not None and bool(frame_valid[0]),goal_seed=goal_seed,
             report_target=dict(goal_source_frame=instruction['end_exclusive']-1,label_kind=level+'_end',success_verified=False),
             trace=dict(identity=identity,draw_id=draw_id,source_repo=str(m['root']),episode=episode,anchor=anchor,last_source=option['last_source'],
-                source_parquet=str(m['data']),info_sha256=m['info_hash'],profile_id=m['profile']['profile_id'],
+                source_parquet=str(m['data']),source_parquets=[str(p) for p in m['data_files']],info_sha256=m['info_hash'],profile_id=m['profile']['profile_id'],
                 raw_action=raw,raw_action_mask=mask,raw_state=state,raw_state_mask=sm,
                 video_source_indices=video_indices.tolist(),video_alignment=alignment,
                 mask_reasons=m['profile']['mask_reasons']+(['head_calibration_ineligible'] if not m['head_calibration_eligible'] else []),
@@ -203,7 +204,8 @@ class CuratedStage2Dataset(Dataset):
             fields,history_trace=materialize_head_history(m['root'],m['info'],m['ep'],camera,anchor,
                 option['selected_start'],self.history,np.random.default_rng(history_seed),self.split=='train',
                 sequential=m['profile']['family']=='mecka',
-                source_valid=source_frame_validity(m['columns'],m['length']))
+                source_valid=source_frame_validity(m['columns'],m['length']),
+                video_ordinals=m['video_ordinals'] if m['profile']['family']=='mecka' else None)
             sample.update(fields);sample['trace']['head_history']=history_trace
         if m['fk']:
             sample['fk_supervision']=m['fk'].build(cols,raw,mask,state,sm,

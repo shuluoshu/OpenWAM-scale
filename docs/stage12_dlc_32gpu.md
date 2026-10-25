@@ -99,7 +99,13 @@ DLC 给每个 Pod 注入的 `RANK/WORLD_SIZE` 分别是节点序号和节点数�
 
 用户已授权提交此任务，以及每 3 小时向“通知我！”群发送 DLC 链接、名称、loss 图、进度和 ETA；不再查询 quota 空闲容量。
 
-本次提交的 site 配置副本在 `outputs/dlc_stage12_3fps_32gpu/submission.site.json`，设置了 `preparation_status` 和 `prepared_marker`。CPU 全量准备在当前 DSW 运行，`preparation_gate.py` 跟踪进程并更新状态；GPU 容器在模型初始化前等待共享状态变为 ready。准备失败、心跳超过 15 分钟或等待超过 24 小时则退出并报错。若 GPU 先分配到，等待期间仍会占用所申请资源。DSW 必须保持运行以完成准备。
+必须先在 DSW 完成 CPU 全量准备与验证，再提交 GPU 任务。site JSON 必须指定 CPFS 上的 `prepared_marker`；生成器、`submit.sh` 和 GPU 入口都会即时检查完成索引、源 YAML 校验和、采样率与统计 registry。未准备完成直接拒绝提交或启动，不再等待后台准备进程。`priority` 支持 1–9，H200 本次重提设为 9。
+
+2026-10-25 离线产物集中放在 `/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/offline_stage12_3fps_20261025`：`population.sqlite` 为可续建的 3 FPS 样本索引，`population.progress.json` 为持久进度，`stage2_metadata_audit.json` 为全来源审计，`statistics/registry-*.json` 为归一化统计，`validation/` 为 Mecka 修复后逐源真实 forward，`pipeline.yaml` 与 `dlc_site.json` 为本次配置。`prepared.json` 仅在全部准备及验证通过后写入。
+
+索引准备 `scripts/train_goal_epoch.py --prepare` 默认使用 `--index-workers 32 --index-max-pending 64 --index-commit-every 256`，保留 v3 索引已有完整事务。并发只改变读取和提交效率，样本顺序与 ID 不变。设置 `TMPDIR`、`SQLITE_TMPDIR` 和缓存目录至 CPFS；不向 `/root/train` 写入准备数据。恢复前不要覆盖已有索引或修改源标签。
+
+准备和训练共用完整 episode 读取器：episode 跨 Parquet 边界时，根据真实 episode_index 汇集各分片，并验证本地帧号及全局行号；末帧 TCP 标签也从完整分片集合读取。Mecka 使用 source_frame_index 指向原视频解码序号，覆盖当前、目标与历史帧。缺失或重复行会报出来源和 episode，不静默剔除。
 
 每任务的 `scripts/pai/monitor_stage12.py` 从 DLC 状态与共享 Stage1/Stage2 `progress.jsonl` 取数据，复用已安装的 `dlc-loss-monitor` 飞书发送适配器。发送前校验接收群名称为“通知我！”。不扫描或推送其他任务，不复制凭据到仓库。
 

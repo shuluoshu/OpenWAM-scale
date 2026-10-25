@@ -153,6 +153,29 @@ def test_dataset_native_short_windows_clean_head_and_missing_views(tmp_path,monk
     assert a['report_target']['goal_source_frame']>=anchor
 
 
+def test_native_episode_reads_all_parquet_parts(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from openwam.dataloader.curated_stage2 import CuratedStage2Dataset
+    selection=make_native_source(tmp_path)
+    root=tmp_path/'source/interndata_a1/unit'
+    info=json.loads((root/'meta/info.json').read_text())
+    info['data_path']='data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet'
+    (root/'meta/info.json').write_text(json.dumps(info))
+    rows=pq.read_table(root/'data/episode-0.parquet').to_pylist()
+    paths=[]
+    for chunk,a,b in [(0,0,10),(1,10,24)]:
+        path=root/f'data/chunk-{chunk:03d}/file-000.parquet';path.parent.mkdir()
+        pq.write_table(pa.Table.from_pylist(rows[a:b]),path);paths.append(path)
+    (root/'data/episode-0.parquet').unlink()
+    d=CuratedStage2Dataset(selection)
+    m=d._episode(d.repos[0],0)
+    assert tuple(m['data_files'])==tuple(paths)
+    np.testing.assert_array_equal(m['columns']['frame_index'],np.arange(24))
+    assert m['columns']['states.left_tcp_to_robot_pose'][-1,0]==pytest.approx(.23)
+    assert m['subtasks'][-1]['end_exclusive']==18
+
+
 def test_dataset_selection_split_and_stats_provenance(tmp_path):
     from openwam.dataloader.curated_stage2 import CuratedStage2Dataset
     from openwam.dataloader.native_stage2_stats import prepare_native_stats

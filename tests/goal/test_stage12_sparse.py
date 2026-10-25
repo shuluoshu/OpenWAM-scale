@@ -15,7 +15,8 @@ def test_3fps_cli_prepare_uses_config_without_loading_model(tmp_path,monkeypatch
     monkeypatch.setattr(curated,'load_config',lambda *a,**kw:dict(model={'goal_representation':'query_latent'},dataset={},sample_fps=3.))
     sentinel=object();monkeypatch.setattr(source,'CuratedGoalDataset',lambda **kw:sentinel)
     seen=[]
-    def build(dataset,path,*,sample_fps):
+    def build(dataset,path,*,sample_fps,workers,max_pending,commit_every):
+        assert (workers,max_pending,commit_every)==(32,64,256)
         assert dataset is sentinel;seen.append(sample_fps);return dict(total_samples=7,sample_fps=sample_fps)
     monkeypatch.setattr(epoch,'build_epoch_index',build)
     assert train_goal_epoch.main(['--prepare','--config','unused','--index',str(tmp_path/'index.db'),'--output-dir',str(tmp_path/'out')])==0

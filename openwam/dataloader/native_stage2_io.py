@@ -41,6 +41,7 @@ def read_episode_metadata(root,episode):
 
 def load_episode(repo,episode,filter_config,max_bytes):
     import pyarrow.parquet as pq
+    from openwam.dataloader.episode_data import episode_data_path,read_episode_table
     from scripts.data.prepare_goal_labels import task_text
     from openwam.dataloader.utils.fk_supervision import FKSupervisionBuilder
     root=Path(repo['path']);raw_info=(root/'meta/info.json').read_bytes();info=json.loads(raw_info)
@@ -54,11 +55,12 @@ def load_episode(repo,episode,filter_config,max_bytes):
     fk=FKSupervisionBuilder(profile['fk_supervision'],rep,info) if profile['fk_supervision'] else None
     ep=read_episode_metadata(root,episode);length=int(ep['length'])
     head_eligible,head_qa=calibration_eligibility(root,repo['family'],episode)
-    path=root/info['data_path'].format(episode_index=episode,chunk_index=int(ep['data/chunk_index']),file_index=int(ep['data/file_index']))
+    path=episode_data_path(root,info,ep)
     available=pq.ParquetFile(path).schema_arrow.names
     ann=root/'meta/sub_tasks.parquet'
     keys=list(dict.fromkeys(['frame_index','task_index',*rep.columns,
         *(fk.columns if fk else []),*[k for k in VALIDITY_COLUMNS if k in info['features']]]))
+    if profile['family']=='mecka':keys=list(dict.fromkeys([*keys,'source_frame_index']))
     if profile['family']=='posttrain_native':
         keys=list(dict.fromkeys(['frame_index','task_index',*profile['source_columns'],*[k for k in VALIDITY_COLUMNS if k in info['features']]]))
     if ann.exists():
@@ -69,7 +71,7 @@ def load_episode(repo,episode,filter_config,max_bytes):
     estimate=length*sum(max(1,int(np.prod(info['features'].get(k,{}).get('shape',[1]))))*8 for k in keys)
     if profile['family']=='posttrain_native':estimate+=length*(2*7+16)*8
     if estimate>max_bytes:raise ValueError(f'{root}:{episode}: cache_byte_budget needs >= {estimate}')
-    table=pq.read_table(path,columns=keys,filters=[('episode_index','=',episode)]).sort_by('frame_index')
+    table,data_files=read_episode_table(root,info,ep,keys,max_bytes=max_bytes)
     if table.nbytes>max_bytes:raise ValueError(f'{root}:{episode}: cache_byte_budget')
     columns={k:np.asarray(table[k].to_pylist()) for k in keys}
     if not np.array_equal(columns['frame_index'],np.arange(length)):
@@ -98,9 +100,12 @@ def load_episode(repo,episode,filter_config,max_bytes):
     bad,reasons=gripper_state_outliers(rep.measured_grippers(columns,length),commands,rep.gripper_commands.controller_valid(valid),filter_config)
     columns[ALIGNED_COMMAND]=commands;columns[ALIGNED_VALID]=valid
     result=dict(root=root,info=info,info_hash=__import__('hashlib').sha256(raw_info).hexdigest(),profile=profile,
-        representation=rep,fk=fk,ep=ep,length=length,data=path,columns=columns,tasks=tasks,subtasks=subs,
+        representation=rep,fk=fk,ep=ep,length=length,data=path,data_files=data_files,columns=columns,tasks=tasks,subtasks=subs,
         head_calibration_eligible=head_eligible,head_calibration_qa=head_qa,calibration_sha256=calibration_file_hash(root),
         bad=bad,bad_prefix=np.r_[0,np.cumsum(bad)],filter_reasons=reasons,annotation_file=str(ann) if ann.exists() else None)
+    if profile['family']=='mecka':
+        from openwam.dataloader.video_alignment import mecka_video_ordinals
+        result['video_ordinals']=mecka_video_ordinals(columns,ep)
     size=sum(v.nbytes for v in columns.values())+bad.nbytes+result['bad_prefix'].nbytes+len(raw_info)
     if size>max_bytes:raise ValueError(f'{root}:{episode}: cache_byte_budget needs {size}')
     return result,size

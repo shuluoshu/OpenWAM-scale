@@ -2,6 +2,7 @@
   "region": "cn-shanghai",
   "workspace_id": "1140257",
   "quota_id": "quota9lheyy49shl",
+  "priority": 9,
   "image": "moqi-sh-arc-registry-vpc.cn-shanghai.cr.aliyuncs.com/moqi-sh/mq_sanyi_train:sanyi-dsw-0515",
   "cpu": "168",
   "memory": "1600Gi",
@@ -13,6 +14,7 @@
   "python": "/mnt/data/cpfs/b5/yeqingda/envs/openwam/bin/python",
   "commit": "auto",
   "pipeline_config": "configs/goal/stage12_query_history_posttrain_3fps_4x8gpu.yaml",
+  "prepared_marker": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/query_latent_20261020/code/outputs/stage12_posttrain_3fps_4x8gpu/prepared.json",
   "resume": false,
   "stage2_resume": null,
   "data_sources": [

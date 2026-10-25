@@ -51,6 +51,19 @@ def append(path,row):
         f.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+'\n');f.flush()
 
 
+def select_replay_entries(entries,previous,current,repos,families,shard_index,shards):
+    """Reuse audited sample selection, not the previous model's pass results."""
+    for key in ('source_sha256','config','population_version','repositories','sample_fps'):
+        if previous.get(key)!=current.get(key):raise ValueError('replay source/config identity changed: '+key)
+    if [r['repo_index'] for r in entries]!=list(range(len(repos))):raise ValueError('incomplete replay source coverage')
+    for row,repo in zip(entries,repos):
+        if any(row[key]!=repo[key] for key in ('repo','path','family')):raise ValueError('replay source identity changed')
+    if shards<1 or not 0<=shard_index<shards:raise ValueError('invalid replay shard')
+    if not set(families)<=set(r['family'] for r in entries):raise ValueError('unknown replay family')
+    chosen=[r for r in entries if not families or r['family'] in families]
+    return chosen[shard_index::shards]
+
+
 def prepare_one(data,index,repo,sample_fps):
     # Each worker owns its metadata LRU; no decoding, assets or CUDA in workers.
     data=copy(data);data._episodes=OrderedDict();data.max_cached_episodes=1
@@ -79,7 +92,12 @@ def main():
     mode.add_argument('--prepare',action='store_true');mode.add_argument('--forward',action='store_true')
     p.add_argument('--config',required=True);p.add_argument('--source-yaml',required=True)
     p.add_argument('--output-dir',required=True);p.add_argument('--device',default='cuda:0')
+    p.add_argument('--replay-from',type=Path,help='reuse a verified full source-selection manifest for fresh forwards')
+    p.add_argument('--families',nargs='*',default=[])
+    p.add_argument('--shards',type=int,default=1);p.add_argument('--shard-index',type=int,default=0)
     args=p.parse_args()
+    if args.prepare and (args.replay_from or args.families or args.shards!=1 or args.shard_index):
+        p.error('replay/shard options require --forward')
     import torch
     from openwam.train.goal_curated import load_config,prepare_batch,TextContextCache
     from openwam.dataloader.curated_goal import CuratedGoalDataset
@@ -114,10 +132,21 @@ def main():
                 if index%25==0 or row['status']=='failed':print(json.dumps(status|{'repo':row['repo'],'error':row.get('error')}),flush=True)
         atomic_json(output/'prepare_summary.json',status)
         return int(failed>0)
-    if json.loads((output/'identity.json').read_text())!=identity:
-        raise ValueError('preparation identity changed; use a fresh output directory')
-    entries=[json.loads(line) for line in manifest.read_text().splitlines()]
-    if [r['repo_index'] for r in entries]!=list(range(len(data.repos))):raise ValueError('incomplete source coverage')
+    if args.replay_from:
+        previous=json.loads((args.replay_from/'identity.json').read_text())
+        entries=[json.loads(line) for line in (args.replay_from/'samples.jsonl').read_text().splitlines()]
+        entries=select_replay_entries(entries,previous,identity,data.repos,args.families,args.shard_index,args.shards)
+        if manifest.exists():raise ValueError('choose a fresh replay output directory')
+        atomic_json(output/'identity.json',identity|{'replay':dict(source=str(args.replay_from.resolve()),
+            previous_git_sha=previous.get('git_sha'),families=args.families,shards=args.shards,shard_index=args.shard_index)})
+        for row in entries:append(manifest,row)
+    else:
+        if args.families or args.shards!=1 or args.shard_index:p.error('family/shard options require --replay-from')
+        if json.loads((output/'identity.json').read_text())!=identity:
+            raise ValueError('preparation identity changed; use a fresh output directory')
+        entries=[json.loads(line) for line in manifest.read_text().splitlines()]
+        if [r['repo_index'] for r in entries]!=list(range(len(data.repos))):raise ValueError('incomplete source coverage')
+    if not entries:raise ValueError('empty forward selection')
     if (output/'results.jsonl').exists():raise ValueError('diagnostic already started; preserve existing results')
     from openwam.train.goal_trainer import bootstrap_components,_seed
     from openwam.model.goal.query_expert import QueryGoalExpert
@@ -140,7 +169,7 @@ def main():
                            max_entries=config.get('text_cache_size',128))
     expert.eval().requires_grad_(False)
     gc.collect();passed=failed=0;started=time.monotonic()
-    for entry in entries:
+    for ordinal,entry in enumerate(entries):
         index=entry['repo_index'];repo=data.repos[index];row=dict(entry)
         begin=time.monotonic();phase='metadata';batch=cpu=out=None
         torch.cuda.reset_peak_memory_stats(device)
@@ -148,6 +177,11 @@ def main():
             if entry['status']!='prepared':raise ValueError('preparation failed: '+entry['error'])
             _seed(seed+index);data._history_draw_id=index
             meta=data._episode(repo,entry['episode'])
+            if args.replay_from:
+                ranges=[r for r in repo['ranges'] if r[0]==entry['episode']]
+                actual=choose_pair(meta,ranges,identity['sample_fps'])
+                if actual!=(entry['level'],entry['segment'],entry['anchor'],entry['goal']):
+                    raise ValueError('replay sample labels or anchor changed')
             phase='decode'
             record,cpu=data._materialize(repo,entry['episode'],meta,entry['segment'],entry['anchor'],entry['goal'],entry['level'])
             phase='encode';batch=prepare_batch(record,cpu,device=device,dtype=dtype,context_cache=cache)
@@ -173,7 +207,7 @@ def main():
             append(output/'results.jsonl',row)
             del batch,cpu,out
             if row['status']=='failed':gc.collect();torch.cuda.empty_cache()
-        status=dict(phase='forward',attempted=index+1,total=len(entries),passed=passed,failed=failed,
+        status=dict(phase='forward',attempted=ordinal+1,total=len(entries),passed=passed,failed=failed,
                     elapsed_s=time.monotonic()-started,updated_at=time.time(),last_repo=repo['repo'],
                     last_loss=row.get('losses'),last_error=row.get('error'),last_step_s=row['elapsed_s'])
         atomic_json(output/'progress.json',status)

@@ -15,10 +15,9 @@ export PATH="$(dirname "$OPENWAM_PYTHON"):$PATH"
 export PYTHONPATH="$OPENWAM_CODE_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
-if [[ "$mode" == train && -n "${STAGE12_PREPARATION_STATUS:-}" ]]; then
-    : "${STAGE12_PREPARED_MARKER:?Set shared preparation marker}"
-    "$OPENWAM_PYTHON" scripts/pai/preparation_gate.py --wait \
-      --status "$STAGE12_PREPARATION_STATUS" --marker "$STAGE12_PREPARED_MARKER"
+if [[ "$mode" == train ]]; then
+    : "${STAGE12_PREPARED_MARKER:?Complete offline preparation on CPFS before submitting GPU training}"
+    "$OPENWAM_PYTHON" scripts/pai/preparation_gate.py --check --marker "$STAGE12_PREPARED_MARKER" --config "$STAGE12_CONFIG"
 fi
 "$OPENWAM_PYTHON" - "$mode" <<'PY'
 import importlib, os, sys
@@ -26,6 +25,8 @@ from pathlib import Path
 from openwam.train.stage12 import load_pipeline
 from openwam.train.goal_curated import load_config
 cfg=load_pipeline(os.environ['STAGE12_CONFIG'])
+if sys.argv[1]=='train' and Path(os.environ['STAGE12_PREPARED_MARKER']).resolve()!=(Path(cfg['output_dir'])/'prepared.json').resolve():
+    raise RuntimeError('Prepared marker does not belong to the selected pipeline output')
 assert (cfg['world_size'],cfg.get('nnodes'),cfg.get('gpus_per_node'))==(32,4,8), 'This DLC entry requires 4 x 8 GPUs'
 stage1=load_config(cfg['stage1_config'],source_yaml=cfg['source_yaml'])
 assert float(stage1['sample_fps'])==3., 'This entry requires 3 FPS Stage1'

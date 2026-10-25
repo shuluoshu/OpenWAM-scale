@@ -124,6 +124,7 @@ class CuratedGoalDataset:
         import pyarrow.parquet as pq
         from scripts.data.prepare_goal_labels import task_text
         from openwam.dataloader.native_stage2_io import read_episode_metadata
+        from openwam.dataloader.episode_data import episode_data_path,read_episode_table
         from openwam.dataloader.subtask_goal import contiguous_subtasks
         key=(repo['path'],episode)
         if key in self._episodes:
@@ -136,17 +137,18 @@ class CuratedGoalDataset:
         if info['features'].get(head,{}).get('dtype')!='video':raise ValueError(f'unverified head camera schema: {head}')
         cameras=resolve_native_cameras(repo['repo'],info) if self.observation_mode=='multiview' else [head,None,None]
         ep=read_episode_metadata(root,episode);length=int(ep['length'])
-        data=root/info['data_path'].format(episode_index=episode,chunk_index=int(ep['data/chunk_index']),file_index=int(ep['data/file_index']))
+        data=episode_data_path(root,info,ep)
         names=pq.ParquetFile(data).schema_arrow.names
         ann=root/'meta/sub_tasks.parquet';has_annotations=ann.exists()
         columns=['frame_index','task_index']
+        if repo['family']=='mecka':columns+=['source_frame_index']
         columns += [key for key in ('canonical.frame_valid','training.valid') if key in names]
         if has_annotations:
             if 'subtask_index' not in names:raise ValueError('present annotations lack frame subtask_index')
             columns+=['subtask_index']
             if 'subtask_unannotated' in names:columns+=['subtask_unannotated']
-        labels=pq.read_table(data,columns=columns,filters=[('episode_index','=',episode)]).sort_by('frame_index').to_pydict()
-        if labels['frame_index']!=list(range(length)):raise ValueError('source frame indices must be dense unique complete')
+        table,data_files=read_episode_table(root,info,ep,columns)
+        labels=table.to_pydict()
         annotations=None
         if has_annotations:
             annotation_names=pq.ParquetFile(ann).schema_arrow.names
@@ -162,7 +164,10 @@ class CuratedGoalDataset:
             subtasks=external;ann=Path(repo['native_metadata']['annotation_file']);has_annotations=True
         for _,start,end in (s for s in repo['ranges'] if s[0]==episode):
             if end>length:raise ValueError('curated range exceeds original episode')
-        result=dict(root=root,info=info,ep=ep,length=length,data=data,head=head,cameras=cameras,tasks=tasks,subtasks=subtasks,annotation_file=str(ann) if has_annotations else None)
+        result=dict(root=root,info=info,ep=ep,length=length,data=data,data_files=data_files,head=head,cameras=cameras,tasks=tasks,subtasks=subtasks,annotation_file=str(ann) if has_annotations else None)
+        if repo['family']=='mecka':
+            from openwam.dataloader.video_alignment import mecka_video_ordinals
+            result['video_ordinals']=mecka_video_ordinals(labels,ep)
         from openwam.dataloader.native_stage2_io import source_frame_validity
         result['source_valid']=source_frame_validity(labels,length)
         if self.history.enabled:result['history_source_valid']=result['source_valid']
@@ -234,7 +239,8 @@ class CuratedGoalDataset:
             except (KeyError,TypeError,ValueError,OverflowError) as exc:
                 raise ValueError(f'malformed present camera video metadata: {camera}: {exc}') from exc
             if not video.is_file():raise FileNotFoundError(f'camera video missing: {camera}: {video}')
-            images,alignment=decode_frames(video,offset,fps,indices,sequential=repo['family']=='mecka')
+            images,alignment=decode_frames(video,offset,fps,indices,sequential=repo['family']=='mecka',
+                video_ordinals=m['video_ordinals'] if repo['family']=='mecka' else None)
             return video,images,alignment
         video,images,alignment=decode(m['head'],[anchor,goal])
         frames=[images[anchor],None,None];view_valid=[True,False,False]
@@ -249,7 +255,8 @@ class CuratedGoalDataset:
                 frames[i]=wrist_images[anchor];view_valid[i]=True
                 observed_views[VIEW_NAMES[i]]=dict(camera=camera,available=True,mask_reason=None,
                     source_video=str(wrist_video),alignment=wrist_alignment[anchor])
-        rows=pq.read_table(m['data'],filters=[('episode_index','=',episode),('frame_index','=',goal)]).to_pylist()
+        from openwam.dataloader.episode_data import read_episode_rows
+        rows=read_episode_rows(m,episode,filters=[('frame_index','=',goal)]).to_pylist()
         if len(rows)!=1:raise ValueError('goal geometry source row not unique')
         projection=dict(uv=np.zeros((2,2),np.float32),projection_valid=np.zeros(2,bool),in_frame=np.zeros(2,bool),visibility=np.full(2,-1,np.int8))
         if repo['family']=='posttrain_native':
@@ -295,7 +302,7 @@ class CuratedGoalDataset:
             instruction_start=segment['start'],instruction_end_exclusive=segment['end_exclusive'],
             anchor_source_frame=anchor,goal_source_frame=goal,head=m['head'],label_kind=level+'_end',success_verified=False,
             observed_image_path=str(folder/'observed.png'),goal_image_path=str(folder/'goal.png'),target_path=str(folder/'targets.npz'),
-            provenance=dict(source_parquet=str(m['data']),source_video=str(video),annotation_file=m['annotation_file'],
+            provenance=dict(source_parquet=str(m['data']),source_parquets=[str(p) for p in m['data_files']],source_video=str(video),annotation_file=m['annotation_file'],
                 subtask_availability=('annotations_absent' if m['annotation_file'] is None else 'available_in_selected_ranges' if self._options(m,[s for s in repo['ranges'] if s[0]==episode],'subtask') else 'no_usable_subtask_intersects_selected_observation_ranges'),
                 observed_video=alignment[anchor],goal_video=alignment[goal],goal_source_frame=goal,
                 endpoint=endpoint,camera=cam_meta,calibration_eligibility_record=qa,
@@ -311,7 +318,8 @@ class CuratedGoalDataset:
             history_seed=int(hashlib.sha256(f'{self.seed}:{self._history_draw_id}:{identity}'.encode()).hexdigest()[:15],16)
             fields,trace=materialize_head_history(m['root'],m['info'],m['ep'],m['head'],anchor,start,
                 self.history,np.random.default_rng(history_seed),not self._evaluating,
-                sequential=repo['family']=='mecka',dtype=self.dtype,source_valid=m['history_source_valid'])
+                sequential=repo['family']=='mecka',dtype=self.dtype,source_valid=m['history_source_valid'],
+                video_ordinals=m['video_ordinals'] if repo['family']=='mecka' else None)
             batch.update({k:v.unsqueeze(0) for k,v in fields.items()})
             record['provenance']['head_history']=clean_json(trace)
         return record,batch

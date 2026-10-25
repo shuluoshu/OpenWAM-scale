@@ -20,10 +20,12 @@ def report_goal_target(dataset, repo, episode, metadata, sample):
         video = metadata['root'] / info['video_path'].format(video_key=camera, episode_index=episode,
             chunk_index=int(ep[prefix+'chunk_index']), file_index=int(ep[prefix+'file_index']))
         frames, _ = decode_frames(video, float(ep[prefix+'from_timestamp']), float(info['fps']), [goal],
-            sequential=repo['family']=='mecka')
+            sequential=repo['family']=='mecka',
+            video_ordinals=metadata['video_ordinals'] if repo['family']=='mecka' else None)
         image = frames[goal]
         target['source_wh'] = list(image.size)
-        rows = pq.read_table(metadata['data'], filters=[('episode_index','=',episode), ('frame_index','=',goal)]).to_pylist()
+        from openwam.dataloader.episode_data import read_episode_rows
+        rows = read_episode_rows(metadata, episode, filters=[('frame_index','=',goal)]).to_pylist()
         if len(rows) != 1:
             raise ValueError('report goal row not unique')
         endpoint = goal_source_tcp(repo['family'], rows[0], tcp_from_eef=recorded_tcp_transform(repo['family'], info))
