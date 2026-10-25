@@ -15,6 +15,9 @@ import subprocess
 import sys
 import time
 import traceback
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from copy import copy
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
@@ -48,6 +51,28 @@ def append(path,row):
         f.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+'\n');f.flush()
 
 
+def prepare_one(data,index,repo,sample_fps):
+    # Each worker owns its metadata LRU; no decoding, assets or CUDA in workers.
+    data=copy(data);data._episodes=OrderedDict();data.max_cached_episodes=1
+    row=dict(repo_index=index,repo=repo['repo'],path=repo['path'],family=repo['family'])
+    try:
+        empty=[]
+        for ep in sorted({r[0] for r in repo['ranges']}):
+            row['episode']=ep
+            meta=data._episode(repo,ep)
+            ranges=[r for r in repo['ranges'] if r[0]==ep]
+            try:
+                level,segment,anchor,goal=choose_pair(meta,ranges,sample_fps)
+                break
+            except NoLegalPair:empty.append(ep)
+        else:raise NoLegalPair('no valid sampled anchor in any selected episode')
+        row.update(status='prepared',level=level,segment=segment,anchor=anchor,goal=goal,
+                   source_length=meta['length'],source_fps=meta['info']['fps'],no_pair_episodes=empty)
+    except Exception as exc:
+        row.update(status='failed',error=f'{type(exc).__name__}: {exc}',traceback=traceback.format_exc())
+    return row
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     mode=p.add_mutually_exclusive_group(required=True)
@@ -76,30 +101,17 @@ def main():
         if manifest.exists():raise ValueError('choose a fresh output directory')
         atomic_json(output/'identity.json',identity)
         passed=failed=0;started=time.monotonic()
-        for index,repo in enumerate(data.repos):
-            row=dict(repo_index=index,repo=repo['repo'],path=repo['path'],family=repo['family'])
-            try:
-                empty=[]
-                for ep in sorted({r[0] for r in repo['ranges']}):
-                    row['episode']=ep
-                    meta=data._episode(repo,ep)
-                    ranges=[r for r in repo['ranges'] if r[0]==ep]
-                    try:
-                        level,segment,anchor,goal=choose_pair(meta,ranges,identity['sample_fps'])
-                        break
-                    except NoLegalPair:empty.append(ep)
-                else:raise NoLegalPair('no valid sampled anchor in any selected episode')
-                row.update(status='prepared',level=level,segment=segment,anchor=anchor,goal=goal,
-                           source_length=meta['length'],source_fps=meta['info']['fps'],no_pair_episodes=empty)
-                passed+=1
-            except Exception as exc:
-                row.update(status='failed',error=f'{type(exc).__name__}: {exc}')
-                append(output/'errors.jsonl',dict(phase='prepare',**row,traceback=traceback.format_exc()));failed+=1
-            append(manifest,row)
-            status=dict(phase='prepare',attempted=index+1,total=len(data.repos),passed=passed,failed=failed,
-                        elapsed_s=time.monotonic()-started,updated_at=time.time())
-            atomic_json(output/'progress.json',status)
-            if index%25==0 or row['status']=='failed':print(json.dumps(status|{'repo':repo['repo'],'error':row.get('error')}),flush=True)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            rows=pool.map(lambda pair:prepare_one(data,*pair,identity['sample_fps']),enumerate(data.repos))
+            for index,row in enumerate(rows):
+                if row['status']=='prepared':passed+=1
+                else:
+                    append(output/'errors.jsonl',dict(phase='prepare',**row));failed+=1
+                append(manifest,row)
+                status=dict(phase='prepare',attempted=index+1,total=len(data.repos),passed=passed,failed=failed,
+                            elapsed_s=time.monotonic()-started,updated_at=time.time())
+                atomic_json(output/'progress.json',status)
+                if index%25==0 or row['status']=='failed':print(json.dumps(status|{'repo':row['repo'],'error':row.get('error')}),flush=True)
         atomic_json(output/'prepare_summary.json',status)
         return int(failed>0)
     if json.loads((output/'identity.json').read_text())!=identity:
