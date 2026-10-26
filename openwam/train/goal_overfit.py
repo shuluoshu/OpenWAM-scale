@@ -30,13 +30,14 @@ class FP32MasterAdamW:
     whole-model intermediate allocation. Both gradient sets are absent at return
     from step(), including before generation/checkpointing.
     """
-    def __init__(self, parameter_groups, *, weight_decay=.01):
+    def __init__(self, parameter_groups, *, weight_decay=.01, master_device=None):
         self.parameter_pairs = []
         groups = []
         for group in parameter_groups:
             masters = []
             for parameter in group['params']:
-                master = torch.nn.Parameter(parameter.detach().to(dtype=torch.float32, copy=True))
+                master = torch.nn.Parameter(parameter.detach().to(device=master_device or parameter.device,
+                                                                  dtype=torch.float32, copy=True))
                 self.parameter_pairs.append((parameter, master))
                 masters.append(master)
             groups.append({**group, 'params': masters})
@@ -54,7 +55,7 @@ class FP32MasterAdamW:
     def step(self):
         for parameter, master in self.parameter_pairs:
             gradient = parameter.grad
-            master.grad = None if gradient is None else gradient.detach().to(dtype=torch.float32)
+            master.grad = None if gradient is None else gradient.detach().to(device=master.device,dtype=torch.float32)
             parameter.grad = None
             del gradient
         self.optimizer.step()

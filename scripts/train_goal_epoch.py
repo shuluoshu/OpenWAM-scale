@@ -105,7 +105,8 @@ def main(argv=None):
             learning_rate=config['learning_rate'],history_learning_rate=config.get('history_learning_rate',1e-4),
             checkpoint_every=config.get('checkpoint_every',5000),eval_every=config.get('eval_every',500),
             sampling_steps=config.get('sampling_steps',20),resume=args.resume,
-            bootstrap_workers_per_node=config.get('bootstrap_workers_per_node',2))
+            bootstrap_workers_per_node=config.get('bootstrap_workers_per_node',2),
+            optimizer_device=config.get('optimizer_device','model'))
         if rank==0:print(json.dumps(result,indent=2))
     finally:
         if dist.is_initialized():dist.destroy_process_group()

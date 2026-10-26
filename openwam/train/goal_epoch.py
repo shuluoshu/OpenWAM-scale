@@ -120,7 +120,7 @@ def verify_completion(output,identity):
 
 def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
                 learning_rate=1e-5,history_learning_rate=1e-4,checkpoint_every=5000,
-                eval_every=500,sampling_steps=20,resume=False,bootstrap_workers_per_node=2):
+                eval_every=500,sampling_steps=20,resume=False,bootstrap_workers_per_node=2,optimizer_device='model'):
     from openwam.train.goal_curated import prepare_batch,goal_parameter_groups,_export_cases
     from openwam.train.goal_overfit import FP32MasterAdamW
     from openwam.train.goal_trainer import _seed
@@ -132,6 +132,7 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
     if world!=identity['world_size'] or len(dataset)!=identity['total_samples'] or not len(dataset):raise ValueError('population/world identity mismatch')
     if any(not isinstance(v,int) or v<1 for v in (checkpoint_every,eval_every,sampling_steps)):raise ValueError('invalid training intervals')
     if not math.isfinite(learning_rate) or learning_rate<=0:raise ValueError('invalid learning rate')
+    if optimizer_device not in ('model','cpu'):raise ValueError('optimizer_device must be model or cpu')
     # The cursor counts permutation positions, not source-contiguous dataset IDs.
     # Validate on every rank and propagate failures before any rank starts DDP.
     order=None;order_error=None
@@ -169,7 +170,8 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
     if (output/'epoch_complete.json').exists():
         proof=verify_completion(output,identity);expert.freeze();return proof
     expert.train_stage_a()
-    optimizer=FP32MasterAdamW(goal_parameter_groups(expert,learning_rate,history_learning_rate))
+    optimizer=FP32MasterAdamW(goal_parameter_groups(expert,learning_rate,history_learning_rate),
+                            master_device='cpu' if optimizer_device=='cpu' else None)
     cursor=update=0
     if resume and (output/'latest.json').exists():
         # Bound transient host RAM per node while other nodes restore in parallel.
@@ -189,7 +191,8 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
         cursor,update=run_bootstrap_in_waves(restore,local_rank=local_rank,
             local_world_size=local_world,workers_per_node=concurrency)
     event('resume' if resume else 'started',cursor=cursor,step=update,identity=identity,
-          sampling=order.contract,sampling_sha256=order.sha256,sampling_host_bytes=order.nbytes)
+          sampling=order.contract,sampling_sha256=order.sha256,sampling_host_bytes=order.nbytes,
+          optimizer_device=optimizer_device)
     model=expert
     if distributed:
         from torch.nn.parallel import DistributedDataParallel

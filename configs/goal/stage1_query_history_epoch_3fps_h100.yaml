@@ -1,0 +1,3 @@
+# Same model/data/shuffle/augmentation; FP32 optimizer state uses host memory.
+base_config: stage1_query_history_epoch_3fps.yaml
+optimizer_device: cpu

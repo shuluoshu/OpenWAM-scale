@@ -70,6 +70,22 @@ def load_pipeline(path):
     return config
 
 
+def stage2_path_overrides(stage1,stage2):
+    """Pin Stage2 to the same source paths checked against the Stage1 index."""
+    aliases=stage1.get('dataset',{}).get('path_aliases')
+    if not aliases:return []
+    if not isinstance(aliases,str):raise ValueError('pipeline path_aliases must be a JSON file path')
+    stage2['dataloader']['path_aliases']=aliases
+    return ['++dataloader.path_aliases='+json.dumps(aliases)]
+
+
+def validate_stage2_overrides(extra):
+    protected=('goal.', 'model.goal_representation', 'model.query_', 'dataloader.source_yaml', 'dataloader.history',
+               'dataloader.normalization_registry', 'dataloader.path_aliases', 'training.resume_ckpt_path', 'training.finetune_ckpt_path', 'project.output_dir')
+    if any(str(v).lstrip('+~').startswith(protected) for v in extra):
+        raise ValueError('stage2_overrides cannot replace the shared source/query/history/checkpoint contract')
+
+
 def main(argv=None, *, _runner=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',default=str(ROOT/'configs/goal/stage12_query_history_posttrain.yaml'))
@@ -106,6 +122,7 @@ def main(argv=None, *, _runner=None):
     stage2['dataloader']['source_yaml']=source
     stage2['dataloader']['metadata_only']=True
     stage2['dataloader']['normalization_registry']=None
+    path_overrides=stage2_path_overrides(stage1,stage2)
     if stage1['model']['query_goal']!=stage2['model']['query_goal'] or stage1['model']['query_history']!=stage2['model']['query_history']:
         raise ValueError('Stage1/Stage2 query or history configuration mismatch')
     if args.prepare:
@@ -148,11 +165,8 @@ def main(argv=None, *, _runner=None):
     if args.stage2_resume:overrides += ['training.finetune_ckpt_path=null',f'training.resume_ckpt_path={Path(args.stage2_resume).resolve()}']
     else:overrides += [f'training.finetune_ckpt_path={config["stage2_baseline"]}']
     extra=config.get('stage2_overrides',[])
-    protected=('goal.', 'model.goal_representation', 'model.query_', 'dataloader.source_yaml', 'dataloader.history',
-               'dataloader.normalization_registry', 'training.resume_ckpt_path', 'training.finetune_ckpt_path', 'project.output_dir')
-    if any(str(v).lstrip('+~').startswith(protected) for v in extra):
-        raise ValueError('stage2_overrides cannot replace the shared source/query/history/checkpoint contract')
-    overrides+=extra
+    validate_stage2_overrides(extra)
+    overrides+=path_overrides+extra
     common2=[str(ROOT/'scripts/train.py'),'--config-name',config['stage2_config'],*overrides]
     baseline=Path(config['stage2_baseline'])
     if baseline.is_file():
@@ -162,6 +176,7 @@ def main(argv=None, *, _runner=None):
     contract=dict(stage2_composed=stage2,stage2_max_steps=config.get('stage2_max_steps',100000),
         stage2_overrides=extra,baseline={str(p):sha256(p) for p in assets},
         registry_sha256=sha256(registry),output=str(output/'stage2'))
+    if path_overrides:contract['path_aliases_sha256']=sha256(stage1['dataset']['path_aliases'])
     pipeline_identity=hashlib.sha256(json.dumps(contract,sort_keys=True).encode()).hexdigest()
     atomic_json(output/f'stage2_contract_{pipeline_identity}.json',contract)
     execute_stages(output,identity,command1,[*torchrun,*common2,'goal.preflight=false'],runner=run,resume=args.resume,pipeline_identity=pipeline_identity,

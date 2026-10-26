@@ -39,7 +39,11 @@ def parse_curated_yaml(path, data_root=None, path_aliases=None):
         data_root=roots[0]
     root=Path(data_root).resolve();selection=selections[0];repos=[]
     native=document.get('curation',{}).get('post_training_additions',{}).get('sources',{})
+    if isinstance(path_aliases,(str,Path)):
+        path_aliases=json.loads(Path(path_aliases).read_text())
     path_aliases=path_aliases or {}
+    if not isinstance(path_aliases,dict) or any(not isinstance(k,str) or not isinstance(v,str) for k,v in path_aliases.items()):
+        raise ValueError('path_aliases must map source names to directory paths')
     weights=selection.get('repo_weights',{})
     for name,ranges in selection['segments_by_repo'].items():
         weight=float(weights.get(name,0))

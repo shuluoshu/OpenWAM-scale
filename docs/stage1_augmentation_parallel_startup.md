@@ -63,3 +63,17 @@ sample_order: global_shuffle
 新增测试覆盖真实解码样例的输入/GT/历史边界、断点重放、缺失相机、干净评估、query 前向反向、入口接线和真实 Gloo 多进程并发/故障传播。实际 32 卡 NCCL 启动耗时仍需新 DLC 测量，不能把 32 次串行变为 4 波次直接宣称为实测 8 倍加速。
 
 2026-10-26 验证：193 项相关回归测试通过，独立审查未发现需修正的问题；另在单张 NVIDIA H20-3e 上加载完整 baseline，使用真实 LightWheel 样本完成一次前向、反向及 FP32-master AdamW 更新。该次触发颜色扰动和头部视角 dropout，8 帧有效历史、2 个有效 TCP 点，loss/梯度有限；加载约 217.19 秒、更新约 3.78 秒，峰值已分配显存 96.63 GiB。这是单样本功能验证，不是收敛或多节点性能结论。记录位于 CPFS `outputs/shuffle_fix_20261026/augmented_gpu_result.json`。
+
+## H100 与 H200 提交差异
+
+H200 使用 `stage1_query_history_epoch_3fps.yaml`，FP32 optimizer masters/moments 保留在模型设备。H100 使用 `stage1_query_history_epoch_3fps_h100.yaml`，仅增加 `optimizer_device: cpu`，将 FP32 master 权重、AdamW 状态及优化器梯度放到主存；模型前后向和 DDP 梯度归约仍在 GPU。
+
+这是为降低前述 96.63 GiB 峰值而增加的有限 epoch 入口配置。学习率、权重衰减、模型、数据总体、shuffle、增强、历史、评估和 Stage2 设置相同。每步将模型梯度传到 CPU，更新后拷回模型；相应 PCIe/CPU 开销需在实际 H100 节点测量。checkpoint 继续保存 FP32 masters 和 AdamW 状态，恢复时保留 CPU optimizer 放置。其他 Stage1 入口和旧配置默认行为不变。
+
+每个 DLC 使用独立 CPFS 输出目录及固定代码快照，避免同时排队/运行时覆盖评估、checkpoint 和 pipeline 状态。离线 population 和统计只读复用；旧任务保持运行。
+
+### 固定离线准备时的数据路径
+
+若共享数据入口的软链接被更换，可在 Stage1 配置中设置 `dataset.path_aliases`，值为 CPFS 上的 JSON 文件绝对路径。文件将源目录名映射到离线索引记录的原始目录。Stage1 仍执行完整索引身份和依赖校验，Stage2 自动使用同一映射；`stage2_overrides` 不允许覆盖它。不会修改共享源目录、原始 YAML 或已准备的 SQLite。
+
+2026-10-26 提交检查发现 `interndata_a1` 的 590 个入口解析路径已改变；固定回索引记录的 V0_1 路径后，5904 源的选择摘要及完整索引身份均与原准备结果一致。

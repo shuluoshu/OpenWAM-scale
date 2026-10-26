@@ -23,8 +23,8 @@ class CuratedStage2Dataset(Dataset):
     """
     def __init__(self,source_yaml,*,data_root=None,seed=42,normalization_registry=None,
                  split='train',max_cached_episodes=2,max_cache_bytes=256*1024*1024,
-                 observation_augmentation=None,gripper_state_filter=None,draws_per_epoch=100000,history=None):
-        self.selection=parse_curated_yaml(source_yaml,data_root);self.repos=self.selection['repos']
+                 observation_augmentation=None,gripper_state_filter=None,draws_per_epoch=100000,history=None,path_aliases=None):
+        self.selection=parse_curated_yaml(source_yaml,data_root,path_aliases);self.repos=self.selection['repos']
         self.seed=int(seed);self.split=split;self.draws_per_epoch=int(draws_per_epoch)
         self.history=history if isinstance(history,HistorySamplingConfig) else HistorySamplingConfig(**(history or {}))
         self.source_yaml_sha256=hashlib.sha256(Path(source_yaml).read_bytes()).hexdigest()
@@ -53,7 +53,7 @@ class CuratedStage2Dataset(Dataset):
         source=get_cfg(config,'source_yaml') if split=='train' else get_cfg(config,'evaluation_source_yaml')
         if not source:raise ValueError('explicit source_yaml required' if split=='train' else 'independent evaluation_source_yaml required')
         keys=('data_root','seed','normalization_registry','max_cached_episodes','max_cache_bytes',
-              'observation_augmentation','gripper_state_filter','draws_per_epoch','history')
+              'observation_augmentation','gripper_state_filter','draws_per_epoch','history','path_aliases')
         kwargs={k:get_cfg(config,k) for k in keys if get_cfg(config,k) is not None}
         if split!='train':
             stats=get_cfg(config,'evaluation_normalization_registry')

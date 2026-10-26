@@ -34,6 +34,8 @@ def load_config(path, *, source_yaml=None, data_root=None):
             config=OmegaConf.merge(read(filename.parent/base,seen|{filename}),config)
         return config
     config=OmegaConf.to_container(read(path,set()),resolve=True)
+    if config.get('optimizer_device','model') not in ('model','cpu'):
+        raise ValueError('optimizer_device must be model or cpu')
     representation = config.get('model', {}).get('goal_representation', 'patch_denoise')
     if representation not in ('patch_denoise', 'query_latent'):
         raise ValueError('unsupported model.goal_representation')
@@ -59,6 +61,10 @@ def load_config(path, *, source_yaml=None, data_root=None):
             if section.get(key):
                 value=Path(os.path.expandvars(os.path.expanduser(str(section[key]))))
                 section[key]=str(value if value.is_absolute() else ROOT/value)
+    aliases=config.get('dataset',{}).get('path_aliases')
+    if isinstance(aliases,str):
+        value=Path(os.path.expandvars(os.path.expanduser(aliases)))
+        config['dataset']['path_aliases']=str(value if value.is_absolute() else ROOT/value)
     token=config.get('tokenizer',{}).get('kwargs',{})
     if token.get('name'):
         value=Path(os.path.expandvars(os.path.expanduser(token['name'])))
