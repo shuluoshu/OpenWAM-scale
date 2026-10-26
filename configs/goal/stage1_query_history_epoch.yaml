@@ -1,6 +1,7 @@
 # Finite epoch size is determined by the SQLite population, never max_steps.
 base_config: stage1_query_history_3000h.yaml
 seed: 42
+sample_order: global_shuffle
 text_device: cuda
 text_cache_size: 128
 checkpoint_every: 5000

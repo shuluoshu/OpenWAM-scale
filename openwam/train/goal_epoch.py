@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import time
 import uuid
+from collections import Counter
 import torch
 import torch.distributed as dist
 
@@ -126,10 +127,28 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
     from openwam.train.goal_patch import evaluate_patch
     from openwam.train.goal_history import render_goal_history
     from openwam.model.goal.history import history_kwargs
+    from openwam.train.epoch_order import EpochOrder
     distributed=dist.is_initialized();rank=dist.get_rank() if distributed else 0;world=dist.get_world_size() if distributed else 1
     if world!=identity['world_size'] or len(dataset)!=identity['total_samples'] or not len(dataset):raise ValueError('population/world identity mismatch')
     if any(not isinstance(v,int) or v<1 for v in (checkpoint_every,eval_every,sampling_steps)):raise ValueError('invalid training intervals')
     if not math.isfinite(learning_rate) or learning_rate<=0:raise ValueError('invalid learning rate')
+    # The cursor counts permutation positions, not source-contiguous dataset IDs.
+    # Validate on every rank and propagate failures before any rank starts DDP.
+    order=None;order_error=None
+    try:
+        order=EpochOrder(identity.get('sampling'))
+        if order.total!=len(dataset) or order.contract['seed']!=identity['seed']:
+            raise ValueError('sampling contract population/seed mismatch')
+    except Exception as exc:order_error=f'{type(exc).__name__}: {exc}'
+    order_state=dict(error=order_error,contract=order.contract if order is not None else None,
+                     sha256=order.sha256 if order is not None else None)
+    order_states=[order_state]
+    if distributed:
+        order_states=[None]*world
+        dist.all_gather_object(order_states,order_state)
+    if any(s['error'] for s in order_states):
+        raise ValueError('sampling initialization failed: '+str([s['error'] for s in order_states]))
+    if any(s!=order_states[0] for s in order_states):raise ValueError('sampling order differs between ranks')
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
     p=next(expert.parameters());device,dtype=p.device,p.dtype
     def primary(call):
@@ -170,7 +189,8 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
             message=[error]
             if distributed:dist.broadcast_object_list(message,src=loading_rank,device=device)
             if message[0]:raise RuntimeError(message[0])
-    event('resume' if resume else 'started',cursor=cursor,step=update,identity=identity)
+    event('resume' if resume else 'started',cursor=cursor,step=update,identity=identity,
+          sampling=order.contract,sampling_sha256=order.sha256,sampling_host_bytes=order.nbytes)
     model=expert
     if distributed:
         from torch.nn.parallel import DistributedDataParallel
@@ -202,17 +222,23 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
         event('report_ready',step=update,cursor=cursor,directory=directory)
     started=time.monotonic()
     while cursor<len(dataset):
-        index,weight=rank_sample(cursor,len(dataset),rank,world)
+        position,weight=rank_sample(cursor,len(dataset),rank,world)
+        index=order[position]
         _seed(identity['seed']+index);expert.train_stage_a();optimizer.zero_grad()
-        error=None;batch=None
+        error=None;batch=None;composition=None
         try:
             record,cpu=dataset.sample(index)
             batch=prepare_batch(record,cpu,device=device,dtype=dtype,context_cache=context_cache)
+            if weight>0:composition=dict(family=record.get('family','unknown'),granularity=record.get('granularity','unknown'))
         except Exception as exc:error=f'rank {rank}: {type(exc).__name__}: {exc}'
-        errors=[None]*world
-        if distributed:dist.all_gather_object(errors,error)
-        else:errors=[error]
+        prepared=dict(error=error,composition=composition);preparations=[prepared]
+        if distributed:
+            preparations=[None]*world
+            dist.all_gather_object(preparations,prepared)
+        errors=[r['error'] for r in preparations if r['error']]
         if any(errors):raise RuntimeError('sample preparation failed: '+str(errors))
+        family_counts=dict(Counter(r['composition']['family'] for r in preparations if r['composition']))
+        granularity_counts=dict(Counter(r['composition']['granularity'] for r in preparations if r['composition']))
         out=model(batch['observed'],batch['context'],batch['targets'],context_lens=batch.get('context_lens'),
                   observed_view_valid=batch.get('observed_view_valid'),**history_kwargs(batch))
         finite=torch.tensor(int(torch.isfinite(out['loss']).item()),device=device)
@@ -222,12 +248,15 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
         norm=torch.nn.utils.clip_grad_norm_(expert.parameters(),1.,error_if_nonfinite=True,foreach=False)
         optimizer.step()
         losses={k:float(v.detach())*weight/world for k,v in out.items() if k.endswith('loss') and isinstance(v,torch.Tensor) and v.numel()==1}
-        values=torch.tensor(list(losses.values()),dtype=torch.float64,device=device)
+        valid_tcp=int(out['valid_points']) if weight>0 else 0
+        values=torch.tensor([*losses.values(),valid_tcp,int(valid_tcp>0)],dtype=torch.float64,device=device)
         if distributed:dist.all_reduce(values)
-        losses=dict(zip(losses,values.tolist()))
+        reduced=values.tolist();losses=dict(zip(losses,reduced[:-2]))
         cursor+=min(world,len(dataset)-cursor);update+=1
         del out,batch,cpu
-        event('update',step=update,cursor=cursor,total_samples=len(dataset),gradient_norm=float(norm),elapsed_s=time.monotonic()-started,**losses)
+        event('update',step=update,cursor=cursor,total_samples=len(dataset),gradient_norm=float(norm),elapsed_s=time.monotonic()-started,
+              family_counts=family_counts,granularity_counts=granularity_counts,
+              valid_tcp_points=int(reduced[-2]),samples_with_tcp=int(reduced[-1]),**losses)
         if update%eval_every==0 or cursor==len(dataset):primary(evaluate)
         if update%checkpoint_every==0 or cursor==len(dataset):
             primary(lambda:save_epoch_checkpoint(expert,optimizer,output,identity=identity,cursor=cursor,update=update,dependencies=dependencies))

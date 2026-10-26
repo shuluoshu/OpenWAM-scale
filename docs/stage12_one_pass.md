@@ -11,7 +11,7 @@
 - 当前帧必须严格早于对应指令的原始终止帧。task 使用 task 区间最后一帧，subtask 使用连续 subtask 区间最后一帧，均不把随机训练 chunk 的最后一帧改成目标。
 - `training.valid` / `canonical.frame_valid` 无效当前帧被排除并计数；历史有效性、TCP 有效性继续沿用各自 mask。末帧只是弱目标，不自动成为成功标注。
 - 所有符合条件的 `(源目录, episode, 指令区间, task/subtask, 当前帧)` 恰好覆盖一次。两类指令共享当前帧是两个不同的训练样本。
-- SQLite 用紧凑区间保存总体，按目录、episode、语言层级和帧序遍历。**没有全局随机打乱**；这样保持源读取局部性。它保证覆盖，不保证这一采样顺序的训练效果最优。
+- SQLite 用紧凑区间保存总体，训练默认 `sample_order: global_shuffle`：固定 seed 对全部有效样本做全局无放回随机排列，再按全局游标和 rank 分配。task/subtask 和数据源按实际样本数混合，不按 YAML 权重重采样，也不强制每类等量；整轮覆盖一次的定义保持不变。历史顺序遍历实现会导致连续训练单一来源，已修复。
 - 一轮更新数是 `ceil(total_samples / world_size)`。8 卡每卡 1 个样本，无梯度累积；尾批缺口用零权重占位，真实样本梯度按有效数量重新加权，不丢最后几个样本。
 
 不能从“3000 小时”直接得到精确样本数：还要计算指令重叠、无效帧和末帧排除。以最终 `population.json` 为准；不按旧 `max_steps: 5000/100000` 截断 Stage1。
@@ -105,6 +105,20 @@ export PYTHON=/root/miniconda3/envs/openwam/bin/python
 ```
 
 恢复保持相同 world size；当前不支持弹性改变卡数。`progress.jsonl` 保留中断前记录，以 `latest.json` 中 cursor 为提交边界，不能把日志最大 step 当作已保存进度。数据索引按依赖文件 size/mtime 和投影后的标签/有效性 SHA 检查；源数据应保持不可变。
+
+### Shuffle 与运行监控
+
+- 默认 seed 42、NumPy PCG64 的全局排列。53822139 个样本使用 uint32，额外主机内存 215288556 字节（约 205 MiB）/rank，不占显存；每个 rank 启动时独立构建相同排列，首次训练前比较排列 SHA256。
+- cursor 表示排列中的位置。算法、NumPy 版本、seed 和总体大小都写入恢复身份；顺序遍历旧 checkpoint 不能在新模式下直接 `--resume`，需要使用新输出目录开始新实验。原数据 YAML、SQLite 索引和统计注册表可复用。
+- 每步记录 `family_counts`、`granularity_counts`、`valid_tcp_points`、`samples_with_tcp`。尾批零权重占位不计入这些数量。没有有效点时 TCP loss 为零，须结合有效点数解释。
+- 随机访问会减少 episode/图像缓存命中率。旧顺序读取的秒/步不能直接作为 shuffle 的性能估计，须重测实际吞吐。
+- 离线检查前 1000 个 32 卡 batch 和全排列覆盖（只读取索引，不解码视频）：
+
+```bash
+python scripts/data/audit_epoch_order.py \
+  --index /CPFS/已有实验/population.sqlite --source-yaml /CPFS/已有实验/source.yaml \
+  --out /CPFS/新实验/shuffle_audit.json --world-size 32 --batches 1000 --verify-full
+```
 
 ## 已验证与边界
 

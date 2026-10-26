@@ -53,6 +53,7 @@ def test_cpu_epoch_finishes_exactly_and_can_resume_without_retraining(tmp_path):
     from test_query_goal import make_query
     from test_multiview_patch import multiview_batch
     from openwam.model.goal.dependencies import dependency_identity
+    from openwam.train.epoch_order import sampling_contract
     torch.set_num_threads(2)
     expert=make_query();obs,ctx,target,valid=multiview_batch(1)
     class Data:
@@ -63,6 +64,7 @@ def test_cpu_epoch_finishes_exactly_and_can_resume_without_retraining(tmp_path):
         def evaluation_samples(self):return [self.sample(0)]
         def scope_summary(self):return {'total_samples':3}
     identity={'index_sha256':'a'*64,'source_yaml_sha256':'b'*64,'total_samples':3,'world_size':1,'seed':42,'config_sha256':'c'*64}
+    identity['sampling']=sampling_contract({'seed':42},3)
     deps=dependency_identity(expert.codec.vae,text_dim=expert.text_dim,precomputed_text_fingerprint='d'*64)
     result=train_epoch(expert,Data(),None,tmp_path,identity=identity,dependencies=deps,
         learning_rate=1e-5,history_learning_rate=1e-4,checkpoint_every=2,eval_every=2,sampling_steps=2)
