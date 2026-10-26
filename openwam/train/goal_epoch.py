@@ -120,7 +120,7 @@ def verify_completion(output,identity):
 
 def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
                 learning_rate=1e-5,history_learning_rate=1e-4,checkpoint_every=5000,
-                eval_every=500,sampling_steps=20,resume=False):
+                eval_every=500,sampling_steps=20,resume=False,bootstrap_workers_per_node=2):
     from openwam.train.goal_curated import prepare_batch,goal_parameter_groups,_export_cases
     from openwam.train.goal_overfit import FP32MasterAdamW
     from openwam.train.goal_trainer import _seed
@@ -172,23 +172,22 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
     optimizer=FP32MasterAdamW(goal_parameter_groups(expert,learning_rate,history_learning_rate))
     cursor=update=0
     if resume and (output/'latest.json').exists():
-        # Restoring full FP32 masters/moments on eight ranks concurrently can
-        # multiply transient host RAM by eight. Serialize loading, not training.
-        for loading_rank in range(world):
-            error=None
-            if rank==loading_rank:
-                try:
-                    from safetensors import safe_open
-                    directory,_=_checkpoint(output,identity)
-                    with safe_open(str(directory/'query_goal.safetensors'),framework='pt',device='cpu') as bundle:
-                        stored=json.loads(bundle.metadata()['query_goal_bundle'])['dependencies']
-                    if any(stored.get(k)!=v for k,v in dependencies.items()):
-                        raise ValueError('resume frozen dependency identity mismatch')
-                    cursor,update=restore_epoch_checkpoint(expert,optimizer,output,identity)
-                except Exception as exc:error=f'{type(exc).__name__}: {exc}'
-            message=[error]
-            if distributed:dist.broadcast_object_list(message,src=loading_rank,device=device)
-            if message[0]:raise RuntimeError(message[0])
+        # Bound transient host RAM per node while other nodes restore in parallel.
+        from openwam.train.bootstrap import run_bootstrap_in_waves
+        def restore():
+            from safetensors import safe_open
+            directory,_=_checkpoint(output,identity)
+            with safe_open(str(directory/'query_goal.safetensors'),framework='pt',device='cpu') as bundle:
+                stored=json.loads(bundle.metadata()['query_goal_bundle'])['dependencies']
+            if any(stored.get(k)!=v for k,v in dependencies.items()):
+                raise ValueError('resume frozen dependency identity mismatch')
+            return restore_epoch_checkpoint(expert,optimizer,output,identity)
+        local_world=int(os.environ.get('LOCAL_WORLD_SIZE',world))
+        local_rank=int(os.environ.get('LOCAL_RANK',rank))
+        concurrency=bootstrap_workers_per_node
+        if type(concurrency) is int and concurrency>0:concurrency=min(concurrency,local_world)
+        cursor,update=run_bootstrap_in_waves(restore,local_rank=local_rank,
+            local_world_size=local_world,workers_per_node=concurrency)
     event('resume' if resume else 'started',cursor=cursor,step=update,identity=identity,
           sampling=order.contract,sampling_sha256=order.sha256,sampling_host_bytes=order.nbytes)
     model=expert

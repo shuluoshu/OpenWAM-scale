@@ -4,6 +4,8 @@
 
 本入口针对当前 **query latent + 10 帧头部历史** 方案。先训练 Stage1 图像/TCP 辅助任务，覆盖全部选定的有效当前帧与指令配对；最后一个更新完成并保存完整检查点后，自动启动原 Stage2 action/video mutual 训练。代码位于 `outputs/query_latent_20261020/code` 的 `codex/query-latent-goal` checkout。
 
+2026-10-26 更新：multiview Stage1 preset 开启当前图像颜色/局部遮挡/单路 dropout；完整 epoch 启动和 checkpoint 恢复改为各节点并行、节点内默认 2 个 rank。配置、GT 边界及新实验要求见 [随机扰动与并行启动说明](stage1_augmentation_parallel_startup.md)。运行中的旧 checkout 不会随远程提交自动切换。
+
 ## 一轮的定义：方案 2
 
 - 源视频按 15 FPS 网格取当前帧，本批数据的源 FPS 全为 30，因此取偶数 ordinal；不复制帧来补采样率。

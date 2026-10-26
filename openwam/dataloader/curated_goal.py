@@ -95,7 +95,8 @@ def language_intervals(labels, task_mapping, annotations, length):
 
 class CuratedGoalDataset:
     def __init__(self,source_yaml,cache_dir,seed=42,subtask_probability=.5,
-                 max_cached_episodes=8,dtype=torch.bfloat16,data_root=None,observation_mode='head',history=None,path_aliases=None):
+                 max_cached_episodes=8,dtype=torch.bfloat16,data_root=None,observation_mode='head',history=None,path_aliases=None,
+                 observation_augmentation=None):
         if observation_mode not in OBSERVATION_MODES:raise ValueError(f'invalid observation_mode: {observation_mode}')
         if not 0<=subtask_probability<=1:raise ValueError('invalid subtask probability')
         if max_cached_episodes<1:raise ValueError('max_cached_episodes must be positive')
@@ -104,6 +105,8 @@ class CuratedGoalDataset:
         self.seed=int(seed);self.subtask_probability=subtask_probability;self.max_cached_episodes=max_cached_episodes
         self.dtype=getattr(torch,dtype) if isinstance(dtype,str) else dtype
         self.observation_mode=observation_mode
+        from openwam.dataloader.transforms.goal_observation import GoalObservationAugmentation
+        self.observation_augmentation=GoalObservationAugmentation(observation_augmentation,observation_mode=observation_mode)
         self.history=history if isinstance(history,HistorySamplingConfig) else HistorySamplingConfig(**(history or {}))
         self._history_draw_id=0
         self._episodes=OrderedDict();self._evaluations=None;self._asset_slot=0;self._evaluating=False
@@ -293,9 +296,13 @@ class CuratedGoalDataset:
         if self.observation_mode=='multiview':
             canvas=clean_multiview(frames,torch.tensor(view_valid,dtype=torch.bool))
             rgb=((canvas[:,0]+1)*127.5).round().byte().permute(1,2,0).numpy()
-            Image.fromarray(rgb).save(folder/'observed.png')
+            observed=Image.fromarray(rgb)
         else:
-            images[anchor].resize((320,256),Image.Resampling.BILINEAR).save(folder/'observed.png')
+            observed=images[anchor].resize((320,256),Image.Resampling.BILINEAR)
+        augmentation_seed=int(hashlib.sha256(f'goal_observation:{self.seed}:{self._history_draw_id}:{identity}'.encode()).hexdigest()[:15],16)
+        observed,augmentation_trace=self.observation_augmentation(observed,view_valid,
+            seed=augmentation_seed,training=not self._evaluating)
+        observed.save(folder/'observed.png')
         np.savez_compressed(folder/'targets.npz',**{k:projection[k] for k in ('uv','projection_valid','in_frame','visibility')})
         record=dict(id=ident,metric_key=ident,family=repo['family'],granularity=level,instruction=segment['text'],
             source_repo=str(m['root']),source_episode=episode,source_episode_length=m['length'],
@@ -310,6 +317,8 @@ class CuratedGoalDataset:
         if self.observation_mode=='multiview':
             record.update(observation_mode='multiview',view_valid=view_valid)
             record['provenance']['observed_views']=observed_views
+        if augmentation_trace is not None:
+            record['provenance']['observation_augmentation']=augmentation_trace
         record=clean_json(record)
         batch=prepare_overfit_images([record],device='cpu',dtype=self.dtype)[0]
         batch.update(instruction=record['instruction'],id=ident,family=repo['family'],granularity=level)

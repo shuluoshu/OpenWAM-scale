@@ -2,7 +2,6 @@
 """Build an exact configured-FPS population or train it once with torchrun."""
 from pathlib import Path
 import argparse
-import gc
 import hashlib
 import json
 import os
@@ -92,40 +91,21 @@ def main(argv=None):
         from openwam.train.stage12 import epoch_identity
         identity=epoch_identity(config,finite.summary,world)
         if rank==0:atomic_json(output/'identity.json',identity)
-        from openwam.train.goal_trainer import bootstrap_components,_seed
-        from openwam.model.goal.query_expert import QueryGoalExpert
-        from openwam.model.goal.dependencies import dependency_identity
         from openwam.model.video_backbone.wan.encode import encode_text
-        expert=text_encoder=tokenizer=dependencies=None
-        # Bound transient host RAM: bootstrap only one rank at a time.
-        for loading_rank in range(world):
-            error=None
-            if rank==loading_rank:
-                try:
-                    _seed(seed)
-                    original,text_encoder,tokenizer=bootstrap_components(config,device='cpu',dtype=dtype)
-                    expert=QueryGoalExpert(original.dit,original.codec,dit_config=original.dit_config,
-                        query_config=config['model'].get('query_goal'),history_config=config['model'].get('query_history'),
-                        observation_mode=config['observation_mode'],shift=config.get('shift',5.),
-                        lambda_image=config.get('lambda_image',.5),lambda_tcp=config.get('lambda_tcp',1.),
-                        lambda_query_image=config.get('lambda_query_image',.1),lambda_query_tcp=config.get('lambda_query_tcp',.1),
-                        use_gradient_checkpointing=config.get('gradient_checkpointing',True)).to(device=device,dtype=dtype)
-                    del original
-                    expert.codec.vae.to(device=device,dtype=dtype).eval().requires_grad_(False)
-                    text_device=device if config.get('text_device','cuda')=='cuda' else torch.device(config['text_device'])
-                    text_encoder.to(device=text_device,dtype=dtype).eval().requires_grad_(False)
-                    dependencies=dependency_identity(expert.codec.vae,text_dim=expert.text_dim,text_encoder=text_encoder,tokenizer=tokenizer)
-                    gc.collect()
-                except Exception as exc:error=f'{type(exc).__name__}: {exc}'
-            message=[error]
-            if world>1:dist.broadcast_object_list(message,src=loading_rank,device=device)
-            if message[0]:raise RuntimeError('bootstrap failed: '+message[0])
+        from openwam.train.bootstrap import run_bootstrap_in_waves,bootstrap_query_components
+        local_world=int(os.environ.get('LOCAL_WORLD_SIZE',world))
+        concurrency=config.get('bootstrap_workers_per_node',2)
+        if type(concurrency) is int and concurrency>0:concurrency=min(concurrency,local_world)
+        expert,text_encoder,tokenizer,dependencies=run_bootstrap_in_waves(
+            lambda:bootstrap_query_components(config,device=device,dtype=dtype),
+            local_rank=local,local_world_size=local_world,workers_per_node=concurrency)
         text_device=next(text_encoder.parameters()).device
         cache=TextContextCache(lambda prompt:encode_text([prompt],tokenizer=tokenizer,text_encoder=text_encoder,device=text_device),max_entries=config.get('text_cache_size',128))
         result=train_epoch(expert,finite,cache,output,identity=identity,dependencies=dependencies,
             learning_rate=config['learning_rate'],history_learning_rate=config.get('history_learning_rate',1e-4),
             checkpoint_every=config.get('checkpoint_every',5000),eval_every=config.get('eval_every',500),
-            sampling_steps=config.get('sampling_steps',20),resume=args.resume)
+            sampling_steps=config.get('sampling_steps',20),resume=args.resume,
+            bootstrap_workers_per_node=config.get('bootstrap_workers_per_node',2))
         if rank==0:print(json.dumps(result,indent=2))
     finally:
         if dist.is_initialized():dist.destroy_process_group()

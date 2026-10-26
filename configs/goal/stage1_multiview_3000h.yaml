@@ -4,3 +4,8 @@ observation_mode: multiview
 dataset:
   observation_mode: multiview
   cache_dir: outputs/stage1_multiview_3000h/cache
+  observation_augmentation:
+    enabled: true
+    color_jitter: {p: 0.8, brightness: 0.2, contrast: 0.2, saturation: 0.2}
+    patch_mask: {p: 0.5, area_range: [0.05, 0.2], aspect_range: [0.5, 2.0]}
+    view_dropout: {p: 0.1, keep_one_view: true}
