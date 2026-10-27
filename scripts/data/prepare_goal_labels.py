@@ -165,6 +165,13 @@ def goal_camera(family, values, head, info, decoded_wh, *, geometry_eligible=Tru
         for key in ('source.camera.world_to_camera_valid','observation.states.camera.valid'):
             if key in values and not bool(np.asarray(values[key]).reshape(-1)[0]>.5):raise ValueError(f'{key} false')
         e=np.asarray(values[ek],float).reshape(4,4)
+        # Present fields can still mean unavailable calibration (all-NaN rows).
+        # Use the projection routines' own checks before returning a camera;
+        # the caller then keeps image supervision and masks only TCP targets.
+        # Empty points validate calibration without inventing a test endpoint.
+        from scripts.data.trajectory_projection import transform_points,project_points
+        transform_points(e,np.empty((0,3)))
+        project_points(np.empty((0,3)),k,model=model,distortion=d)
         provenance.update(model=model,native_wh=list(native_wh),K=k.tolist(),world_to_camera=e.tolist(),distortion=None if d is None else d.tolist(),
                           resize_affine_pixel_centers={'scale':[320/native_wh[0],256/native_wh[1]],'translation':[.5*320/native_wh[0]-.5,.5*256/native_wh[1]-.5]})
         return (k,e,model,d,native_wh),provenance
