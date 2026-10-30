@@ -288,11 +288,21 @@ class DualSystemMoTDriver:
         next layer's iteration in ``run_joint_loop``.
         """
         outer_payload = astate.payload
+        # Never close over the mutable outer containers: after checkpoint()
+        # returns they receive its outputs. Keeping them in the saved closure
+        # forms an output -> closure -> state -> output cycle, retaining the
+        # unused final video branch in action-only training on every update.
+        video_template = copy.copy(vstate)
+        video_template.hidden_states = None
+        action_template = copy.copy(astate)
+        payload_template = copy.copy(outer_payload)
+        payload_template.x_action = None
+        action_template.payload = payload_template
 
         def _run(vx: Tensor, ax: Tensor, gk, gv) -> Tuple[Tensor, Tensor]:
-            local_vstate = copy.copy(vstate)
-            local_astate = copy.copy(astate)
-            local_payload = copy.copy(outer_payload)
+            local_vstate = copy.copy(video_template)
+            local_astate = copy.copy(action_template)
+            local_payload = copy.copy(payload_template)
             local_astate.payload = local_payload
             local_vstate.hidden_states = vx
             local_payload.x_action = ax
@@ -364,7 +374,8 @@ class DualSystemMoTDriver:
             from openwam.model.goal.conditioning import append_goal_mask
             if self.attention_mask_mode != "mutual" or self.vb.video_attention_mask_mode != "first_frame_causal":
                 raise ValueError("goal memory requires mutual + first_frame_causal")
-            attn_mask = append_goal_mask(attn_mask, goal_token_valid, self._video_tokens_per_frame(vstate))
+            attn_mask = append_goal_mask(attn_mask, goal_token_valid, self._video_tokens_per_frame(vstate),
+                                        num_tokens=goal_keys.shape[-2])
 
         for layer_id in range(self.num_layers):
             vstate, astate = self.step(

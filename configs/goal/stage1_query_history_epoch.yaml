@@ -1,0 +1,13 @@
+# Finite epoch size is determined by the SQLite population, never max_steps.
+base_config: stage1_query_history_3000h.yaml
+seed: 42
+bootstrap_workers_per_node: 2
+sample_order: global_shuffle
+text_device: cuda
+text_cache_size: 128
+checkpoint_every: 5000
+eval_every: 500
+batch_size: 1
+dataset:
+  source_yaml: outputs/stage12_posttrain_selection/source.yaml
+baseline_checkpoint: ${oc.env:OPENWAM_BASELINE_CHECKPOINT,/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/curated_gripper_human_20261014/gripper_human_aug_lr0.0001_b320/checkpoints/2026-10-15_21-16-09/checkpoint_step_1000.safetensors}

@@ -1,0 +1,18 @@
+data_root_dir: /mnt/data/cpfs/b5big/pretrain_data_release/pretrain_datasetsV0_2
+repo_weights:
+  abc_130k/train/build_the_wood_block_tower: 1.0
+  robochallenge_v2/hold_the_tray_with_both_hands/dual_arm__parallel_gripper: 1.0
+  interndata_a1/basic_tasks/gather_toothbrush_and_toothpaste_part3/lift2__parallel_gripper: 1.0
+segments_by_repo:
+  abc_130k/train/build_the_wood_block_tower:
+  - - 0
+    - 0
+    - 2432
+  robochallenge_v2/hold_the_tray_with_both_hands/dual_arm__parallel_gripper:
+  - - 0
+    - 0
+    - 945
+  interndata_a1/basic_tasks/gather_toothbrush_and_toothpaste_part3/lift2__parallel_gripper:
+  - - 472
+    - 0
+    - 571

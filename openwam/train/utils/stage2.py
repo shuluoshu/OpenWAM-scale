@@ -108,10 +108,41 @@ def build_stage2_parameter_groups(architecture,training):
 
 
 def validate_stage2_config(cfg):
-    from openwam.model.goal.runtime import goal_observation_mode
-    goal_observation_mode(OmegaConf.to_container(cfg.goal,resolve=True))
-    required={'goal.enabled':True,'goal.conditioning':'image_memory',
-        'goal.mode':'predicted','goal.num_steps':20,
+    from openwam.model.goal.runtime import goal_observation_mode, goal_representation
+    goal_config=OmegaConf.to_container(cfg.goal,resolve=True)
+    from openwam.model.goal.runtime import validate_goal_model_config
+    from openwam.model.goal.history import HistoryConfig
+    validate_goal_model_config(goal_config, OmegaConf.to_container(cfg.model,resolve=True))
+    history = HistoryConfig(**goal_config.get('history', {}))
+    sampling = OmegaConf.select(cfg,'dataloader.history',default={})
+    sampling = OmegaConf.to_container(sampling,resolve=True) if OmegaConf.is_config(sampling) else dict(sampling)
+    if sampling.get('enabled', False) != history.enabled or sampling.get('num_frames',10) != history.num_frames:
+        raise ValueError('dataloader history disagrees with goal.history')
+    if history.enabled and (sampling.get('mean_interval_s',1.) != 1. or sampling.get('jitter_fraction',.5) not in (0., .5)):
+        raise ValueError('history requires 1s intervals and either fixed or 50% jitter sampling')
+    goal_observation_mode(goal_config)
+    representation=goal_representation(goal_config)
+    if OmegaConf.select(cfg,'model.goal_representation',default='patch_denoise')!=representation:
+        raise ValueError('model.goal_representation disagrees with goal representation')
+    query=representation=='query_latent'
+    visual=representation=='visual_history_masked_sa'
+    token_memory=query or visual
+    future_mode = OmegaConf.select(cfg, 'model.architecture.future_video_mode', default='joint')
+    if future_mode not in ('joint', 'none'):
+        raise ValueError("future_video_mode must be 'joint' or 'none'")
+    if future_mode == 'none':
+        if not token_memory:
+            raise ValueError("future_video_mode='none' requires query_latent or visual_history_masked_sa Stage2")
+        if OmegaConf.select(cfg, 'model.architecture.variant') != 'joint_self_attn':
+            raise ValueError("future_video_mode='none' requires joint_self_attn")
+
+    if query:
+        from openwam.model.goal.query_expert import QueryConfig
+        model_query=OmegaConf.to_container(cfg.model.query_goal,resolve=True)
+        if QueryConfig(**model_query)!=QueryConfig(**goal_config.get('query',{})):
+            raise ValueError('model.query_goal disagrees with goal.query')
+    required={'goal.enabled':True,'goal.conditioning':'visual_history_memory' if visual else 'query_memory' if query else 'image_memory',
+        'goal.mode':'predicted','goal.num_steps':1 if token_memory else 20,
         'model.architecture.action_dim':112,'model.architecture.state_dim':112,
         'model.architecture.use_proprioception':True,'model.architecture.attention_mask_mode':'mutual',
         'model.architecture.video_attention_mask_mode':'first_frame_causal',
@@ -159,9 +190,10 @@ def validate_stage2_launch(cfg,*,metadata_only=False):
     baseline_cfg = OmegaConf.load(str(Path(directory)/'config.yaml'))
     goal_directory = directory if is_stage2(baseline_cfg) else None
     if goal_directory:
-        from openwam.model.goal.runtime import goal_observation_mode
-        if goal_observation_mode(OmegaConf.to_container(cfg.goal,resolve=True)) != goal_observation_mode(OmegaConf.to_container(baseline_cfg.goal,resolve=True)):
-            raise ValueError('Stage2 configured goal policy/mode disagrees with saved checkpoint')
+        from openwam.model.goal.runtime import validate_goal_compatibility
+        requested=OmegaConf.to_container(cfg.goal,resolve=True)
+        saved_goal=OmegaConf.to_container(baseline_cfg.goal,resolve=True)
+        validate_goal_compatibility(requested,saved_goal)
         from omegaconf import open_dict
         with open_dict(cfg):
             cfg.goal = baseline_cfg.goal
@@ -186,15 +218,41 @@ def validate_stage2_launch(cfg,*,metadata_only=False):
     goal=resolve_goal_asset(OmegaConf.to_container(cfg.goal, resolve=True), goal_directory)
     if not goal.is_file():raise FileNotFoundError('STAGE1_GOAL_CHECKPOINT must name a patch bundle')
     with safe_open(str(goal),framework='pt',device='cpu') as handle:
-        metadata=json.loads((handle.metadata() or {}).get('patch_goal_bundle','{}'))
+        representation=cfg.goal.get('representation','patch_denoise')
+        metadata_key={'query_latent':'query_goal_bundle', 'visual_history_masked_sa':'visual_history'}.get(representation,'patch_goal_bundle')
+        metadata=json.loads((handle.metadata() or {}).get(metadata_key,'{}'))
     from openwam.model.goal.runtime import goal_observation_mode
     from openwam.model.goal.observation import observation_metadata
     mode=goal_observation_mode(OmegaConf.to_container(cfg.goal,resolve=True))
     if metadata.get('format')!=cfg.goal.format:raise ValueError('Stage1 patch bundle metadata format mismatch')
-    if metadata.get('observation_mode', 'head')!=mode:raise ValueError('Stage1 patch bundle observation mode mismatch')
-    if mode=='multiview' and metadata.get('observation')!=json.loads(json.dumps(observation_metadata(mode))):
+    if metadata_key=='query_goal_bundle':
+        from openwam.model.goal.query_expert import QueryConfig
+        from openwam.model.goal.history import HistoryConfig
+        if HistoryConfig(**metadata.get('history_config', {})) != HistoryConfig(**dict(cfg.goal.get('history', {}))):
+            raise ValueError('Stage1 history bundle configuration mismatch')
+        if metadata.get('representation')!='query_latent' or QueryConfig(**metadata['query_config'])!=QueryConfig(**OmegaConf.to_container(cfg.goal.query,resolve=True)):
+            raise ValueError('Stage1 query bundle model configuration mismatch')
+    if metadata_key=='visual_history':
+        from openwam.model.goal.runtime import visual_history_config
+        options=visual_history_config(OmegaConf.to_container(cfg.goal,resolve=True))
+        if metadata.get('dit_config',{}).get('dim')!=options['dim']:
+            raise ValueError('Stage1 visual history bundle model dimensions mismatch')
+        if metadata.get('dit_config',{}).get('patch_size')!=[1,2,2]:
+            raise ValueError('Stage1 visual history bundle patch geometry mismatch')
+        if not metadata.get('history'):
+            raise ValueError('Stage1 visual history pool configuration missing')
+    if metadata.get('observation_mode', 'multiview' if metadata_key=='visual_history' else 'head')!=mode:raise ValueError('Stage1 patch bundle observation mode mismatch')
+    if mode=='multiview' and metadata_key!='visual_history' and metadata.get('observation')!=json.loads(json.dumps(observation_metadata(mode))):
         raise ValueError('Stage1 patch bundle multiview observation contract mismatch')
-    if metadata.get('codec',{}).get('latent_shape')!=[48,1,16,20]:raise ValueError('Stage1 patch bundle codec mismatch')
+    if metadata_key=='visual_history':
+        # Original visual-history v1 bundles predate explicit codec metadata.
+        # Their fixed codec is enforced by the loader and VAE identity; when
+        # present, validate the entire declared codec rather than only its shape.
+        from openwam.model.goal.codec import GoalCodecSpec
+        if 'codec' in metadata and metadata['codec']!=json.loads(json.dumps(asdict(GoalCodecSpec()))):
+            raise ValueError('Stage1 visual history bundle codec mismatch')
+    elif metadata.get('codec',{}).get('latent_shape')!=[48,1,16,20]:
+        raise ValueError('Stage1 patch bundle codec mismatch')
     if not metadata.get('dependencies'):raise ValueError('Stage1 patch bundle dependencies missing')
     for key in ('action_dim','state_dim','attention_mask_mode','video_attention_mask_mode'):
         if OmegaConf.select(baseline_cfg,'model.architecture.'+key)!=OmegaConf.select(cfg,'model.architecture.'+key):

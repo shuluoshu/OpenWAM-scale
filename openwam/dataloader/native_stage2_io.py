@@ -29,40 +29,43 @@ class ByteLRU(OrderedDict):
 
 
 def read_episode_metadata(root,episode):
-    import pyarrow.dataset as ds
-    files=sorted((root/'meta/episodes').glob('chunk-*/*.parquet'))
-    if not files:raise ValueError(f'{root}:{episode}: missing episode metadata')
-    dataset=ds.dataset([str(p) for p in files],format='parquet')
-    columns=[n for n in dataset.schema.names if not n.startswith('stats/')]
-    table=dataset.to_table(columns=columns,filter=ds.field('episode_index')==episode)
-    if len(table)!=1:raise ValueError(f'{root}:{episode}: nonunique episode metadata')
-    return table.to_pylist()[0]
+    from openwam.dataloader.episode_metadata import read_episode_metadata as read
+    return read(root,episode)
 
 
 def load_episode(repo,episode,filter_config,max_bytes):
     import pyarrow.parquet as pq
+    from openwam.dataloader.episode_data import episode_data_path,read_episode_table
     from scripts.data.prepare_goal_labels import task_text
     from openwam.dataloader.utils.fk_supervision import FKSupervisionBuilder
     root=Path(repo['path']);raw_info=(root/'meta/info.json').read_bytes();info=json.loads(raw_info)
-    profile=resolve_native_profile(repo['repo'],info);rep=MoraHeadTCPRepresentation(info,**profile['representation'])
+    declared=repo.get('native_metadata',{})
+    if declared.get('required_data_path_override'):info=dict(info,data_path=declared['required_data_path_override'])
+    if 'fps' in declared and float(declared['fps'])!=float(info['fps']):raise ValueError('native FPS differs from declared selection')
+    from openwam.dataloader.posttrain_physical import representation_info, augment_posttrain_episode
+    profile=resolve_native_profile(repo['repo'],info);rep=MoraHeadTCPRepresentation(representation_info(info,profile),**profile['representation'])
     rep.contract['gripper_state_filter']=filter_config
     rep.contract['native_profile_id']=profile['profile_id']
     fk=FKSupervisionBuilder(profile['fk_supervision'],rep,info) if profile['fk_supervision'] else None
     ep=read_episode_metadata(root,episode);length=int(ep['length'])
     head_eligible,head_qa=calibration_eligibility(root,repo['family'],episode)
-    path=root/info['data_path'].format(episode_index=episode,chunk_index=int(ep['data/chunk_index']),file_index=int(ep['data/file_index']))
+    path=episode_data_path(root,info,ep)
     available=pq.ParquetFile(path).schema_arrow.names
     ann=root/'meta/sub_tasks.parquet'
     keys=list(dict.fromkeys(['frame_index','task_index',*rep.columns,
         *(fk.columns if fk else []),*[k for k in VALIDITY_COLUMNS if k in info['features']]]))
+    if profile['family']=='mecka':keys=list(dict.fromkeys([*keys,'source_frame_index']))
+    if profile['family']=='posttrain_native':
+        keys=list(dict.fromkeys(['frame_index','task_index',*profile['source_columns'],*[k for k in VALIDITY_COLUMNS if k in info['features']]]))
     if ann.exists():
         if 'subtask_index' not in available:raise ValueError(f'{root}:{episode}: annotations lack subtask_index')
         keys+=['subtask_index']
         if 'subtask_unannotated' in available:keys+=['subtask_unannotated']
     # Reject oversized episodes before allocating their projected arrays. No full parquet/pandas conversion.
     estimate=length*sum(max(1,int(np.prod(info['features'].get(k,{}).get('shape',[1]))))*8 for k in keys)
+    if profile['family']=='posttrain_native':estimate+=length*(2*7+16)*8
     if estimate>max_bytes:raise ValueError(f'{root}:{episode}: cache_byte_budget needs >= {estimate}')
-    table=pq.read_table(path,columns=keys,filters=[('episode_index','=',episode)]).sort_by('frame_index')
+    table,data_files=read_episode_table(root,info,ep,keys,max_bytes=max_bytes)
     if table.nbytes>max_bytes:raise ValueError(f'{root}:{episode}: cache_byte_budget')
     columns={k:np.asarray(table[k].to_pylist()) for k in keys}
     if not np.array_equal(columns['frame_index'],np.arange(length)):
@@ -74,16 +77,31 @@ def load_episode(repo,episode,filter_config,max_bytes):
         if not {'episode_index','subtask_index','subtask'}.issubset(ns):raise ValueError('malformed present subtask annotations')
         annotations=pq.read_table(ann,columns=[k for k in ['episode_index','subtask_index','subtask','start_frame','end_frame'] if k in ns],filters=[('episode_index','=',episode)]).to_pylist()
     tasks,subs=language_intervals(labels,{int(i):task_text(root,int(i)) for i in set(labels['task_index'])},annotations,length)
+    from openwam.dataloader.posttrain_annotations import external_subtasks
+    external=external_subtasks(repo,episode,length)
+    if external is not None:
+        if subs:raise ValueError('conflicting native and external subtask annotations')
+        subs=external;ann=Path(repo['native_metadata']['annotation_file'])
+    if profile['family']=='posttrain_native':
+        info,columns,profile,geometry=augment_posttrain_episode(info,ep,columns,profile)
+        rep=MoraHeadTCPRepresentation(info,**profile['representation'])
+        rep.contract['gripper_state_filter']=filter_config
+        rep.contract['native_profile_id']=profile['profile_id']
+        head_eligible=True;head_qa=profile.get('geometry_provenance')
     for e,a,b in repo['ranges']:
         if e==episode and not 0<=a<b<=length:raise ValueError(f'{root}:{episode}: invalid_segment_bounds')
     commands,valid=rep.gripper_commands.align(columns,length)
     bad,reasons=gripper_state_outliers(rep.measured_grippers(columns,length),commands,rep.gripper_commands.controller_valid(valid),filter_config)
     columns[ALIGNED_COMMAND]=commands;columns[ALIGNED_VALID]=valid
     result=dict(root=root,info=info,info_hash=__import__('hashlib').sha256(raw_info).hexdigest(),profile=profile,
-        representation=rep,fk=fk,ep=ep,length=length,data=path,columns=columns,tasks=tasks,subtasks=subs,
+        representation=rep,fk=fk,ep=ep,length=length,data=path,data_files=data_files,columns=columns,tasks=tasks,subtasks=subs,
         head_calibration_eligible=head_eligible,head_calibration_qa=head_qa,calibration_sha256=calibration_file_hash(root),
         bad=bad,bad_prefix=np.r_[0,np.cumsum(bad)],filter_reasons=reasons,annotation_file=str(ann) if ann.exists() else None)
+    if profile['family']=='mecka':
+        from openwam.dataloader.video_alignment import mecka_video_ordinals
+        result['video_ordinals']=mecka_video_ordinals(columns,ep)
     size=sum(v.nbytes for v in columns.values())+bad.nbytes+result['bad_prefix'].nbytes+len(raw_info)
+    if size>max_bytes:raise ValueError(f'{root}:{episode}: cache_byte_budget needs {size}')
     return result,size
 
 
@@ -209,6 +227,10 @@ def calibration_eligibility(root,family,episode):
 
 
 def calibration_file_hash(root):
+    from openwam.dataloader.posttrain_physical import is_posttrain_native, physical_dependency_hash
+    info_path=Path(root)/'meta/info.json'
+    if info_path.exists() and is_posttrain_native(json.loads(info_path.read_text())):
+        return physical_dependency_hash(root)
     path=Path(root)/'meta/camera_geometry_eligibility.jsonl'
     if not path.exists():return None
     digest=__import__('hashlib').sha256()

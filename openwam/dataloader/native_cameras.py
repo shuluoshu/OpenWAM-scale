@@ -14,7 +14,9 @@ def resolve_native_cameras(repo, info):
     camera is an error, rather than evidence that a view is unavailable.
     """
     family = repo.split('/')[0]
-    if family not in HEAD_CAMERAS:
+    native=repo.startswith('/') and any('observation.images.'+role+suffix in info['features']
+        for role in ('head','left','right') for suffix in ('','_undistorted'))
+    if family not in HEAD_CAMERAS and not native:
         raise ValueError(f'{repo}: unsupported_family')
     features = info['features']
 
@@ -29,6 +31,8 @@ def resolve_native_cameras(repo, info):
                     raise ValueError(f'{repo}: malformed present camera shape: {key}: {shape}')
         return next((key for key in candidates if key in features), None)
 
+    if native:
+        return [choose([f'observation.images.{role}_undistorted',f'observation.images.{role}']) for role in ('head','left','right')]
     return [choose([HEAD_CAMERAS[family]])] + [choose([
         f'observation.images.cam_{side}_wrist', f'observation.images.camera_{side}',
         f'observation.images.{side}_wrist', f'observation.images.cam_{side}'

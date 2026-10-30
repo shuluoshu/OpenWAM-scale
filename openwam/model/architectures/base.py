@@ -188,6 +188,18 @@ class BaseWAMArchitecture(ABC, nn.Module):
         if cfg is not None:
             self._init_video_backbone(cfg)
 
+    @property
+    def future_video_mode(self) -> str:
+        """Whether Stage2 includes predicted future video tokens."""
+        mode = self._cfg_get(self.cfg, "future_video_mode", "joint")
+        if mode not in ("joint", "none"):
+            raise ValueError("future_video_mode must be 'joint' or 'none'")
+        if mode == "none" and self.video_backbone is not None:
+            from openwam.model.video_backbone.wan_backbone import Wan22Ti2v
+            if not isinstance(self.video_backbone, Wan22Ti2v):
+                raise ValueError("future_video_mode='none' currently requires the Wan22 TI2V backbone")
+        return mode
+
     def train(self, mode: bool = True):
         super().train(mode)
         if (getattr(self, 'goal_expert', None) is not None
@@ -881,6 +893,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
         Delegates to ``video_backbone.preprocess_input_for_train()``. External code
         (trainer) should call this instead of touching video_backbone directly.
         """
+        if self.future_video_mode == "none":
+            kwargs = dict(kwargs)
+            kwargs["frames"] = [clip[:1] for clip in kwargs["frames"]]
+            kwargs["vace_videos"] = None
         return self.video_backbone.preprocess_input_for_train(**kwargs)
 
     def set_training_runtime(
@@ -1044,6 +1060,14 @@ class BaseWAMArchitecture(ABC, nn.Module):
                     masks.append(mask)
             kwargs = ({'goal_observed_multiview':torch.stack(observations),
                        'goal_view_valid':torch.stack(masks)} if mode == 'multiview' else {})
+            from openwam.model.goal.history import HISTORY_FIELDS, move_history
+            for field in HISTORY_FIELDS:
+                present = [field in sample for sample in batch]
+                if any(present):
+                    if not all(present): raise ValueError('history fields must be present for every sample')
+                    kwargs[field] = torch.stack([sample[field] for sample in batch])
+            history = move_history(kwargs, _device, _dtype)
+            kwargs.update(history)
             preprocessed.update(prepare_goal_inputs(self, None if mode == 'multiview' else torch.stack(observations), all_prompts,
                 preprocessed['context'], context_lens=preprocessed.get('seq_lens'),
                 head_valid=torch.tensor([sample['goal_head_valid'] for sample in batch],
@@ -1086,6 +1110,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
             inputs["action_is_pad"] = torch.stack([~m for m in all_action_masks], dim=0).to(device=_device)
         if any(sample.get("fk_supervision") is not None for sample in samples):
             inputs["fk_supervision"] = [sample.get("fk_supervision") for sample in samples]
+        if self.future_video_mode == "none":
+            return inputs
+
         if all_video_masks[0] is not None:
             # ``latent[0]`` is a clean conditioning frame (and must be excluded
             # from the loss mask) when either:
@@ -1186,20 +1213,32 @@ class BaseWAMArchitecture(ABC, nn.Module):
         min_tb = int(inputs.pop("min_timestep_boundary", 0) * len(vb.scheduler.timesteps))
         B = inputs["input_latents"].shape[0]
 
-        # --- Sample video timesteps ---
-        video_timestep_ids = torch.randint(min_tb, max_tb, (B,))
+        action_only = self.future_video_mode == "none"
+        if action_only:
+            if actions is None or lambda_action <= 0:
+                raise ValueError("future_video_mode='none' requires action targets and positive lambda_action")
+            current = inputs.get("first_frame_latents")
+            if current is None:
+                current = inputs["input_latents"][:, :, :1]
+            inputs["latents"] = current
+            inputs["first_frame_latents"] = current
+            inputs["num_frames"] = 1
+            video_timesteps = torch.zeros(B, device=_device, dtype=_dtype)
+        else:
+            # --- Sample video timesteps ---
+            video_timestep_ids = torch.randint(min_tb, max_tb, (B,))
 
-        video_timesteps = vb.scheduler.timesteps[video_timestep_ids].to(dtype=_dtype, device=_device)
-        video_sigmas = vb.scheduler.sigmas[video_timestep_ids].to(dtype=_dtype, device=_device)
+            video_timesteps = vb.scheduler.timesteps[video_timestep_ids].to(dtype=_dtype, device=_device)
+            video_sigmas = vb.scheduler.sigmas[video_timestep_ids].to(dtype=_dtype, device=_device)
 
-        # --- Add video noise (flow-matching: linear interp + velocity target) ---
-        video_noise = torch.randn_like(inputs["input_latents"])
-        sigma_bc = video_sigmas.view(B, 1, 1, 1, 1)
-        inputs["latents"] = (1 - sigma_bc) * inputs["input_latents"] + sigma_bc * video_noise
-        video_target = video_noise - inputs["input_latents"]
+            # --- Add video noise (flow-matching: linear interp + velocity target) ---
+            video_noise = torch.randn_like(inputs["input_latents"])
+            sigma_bc = video_sigmas.view(B, 1, 1, 1, 1)
+            inputs["latents"] = (1 - sigma_bc) * inputs["input_latents"] + sigma_bc * video_noise
+            video_target = video_noise - inputs["input_latents"]
 
-        if inputs.get("first_frame_latents") is not None:
-            inputs["latents"][:, :, 0:1] = inputs["first_frame_latents"]
+            if inputs.get("first_frame_latents") is not None:
+                inputs["latents"][:, :, 0:1] = inputs["first_frame_latents"]
 
         # --- Prepare action noise ---
         noisy_actions, action_target, action_timesteps, action_timestep_ids, action_sigmas, a_sigma_bc = (
@@ -1259,13 +1298,16 @@ class BaseWAMArchitecture(ABC, nn.Module):
         )
 
         # --- Video loss ---
-        loss_video = self._compute_video_loss(
-            video_noise_pred,
-            video_target,
-            video_timestep_ids,
-            inputs,
-            _device,
-        )
+        if action_only:
+            loss_video = torch.zeros((), device=_device)
+        else:
+            loss_video = self._compute_video_loss(
+                video_noise_pred,
+                video_target,
+                video_timestep_ids,
+                inputs,
+                _device,
+            )
 
         if (lambda_fk_position or lambda_fk_rotation) and action_noise_pred is None:
             raise ValueError("FK supervision requires an action prediction")
@@ -1511,6 +1553,11 @@ class BaseWAMArchitecture(ABC, nn.Module):
         goal_observed_head=None,
         goal_observed_multiview=None,
         goal_view_valid=None,
+        history_images=None,
+        history_latents=None,
+        history_ages=None,
+        history_valid=None,
+        history_episode_id=None,
         goal_head_valid: bool = True,
         goal_seed: Optional[int] = None,
         **extra_pipeline_inputs: Any,
@@ -1585,7 +1632,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
             prompt=prompt,
             vace_video=vace_video,
             first_frame_image=first_frame_image,
-            num_frames=num_frames,
+            num_frames=1 if self.future_video_mode == "none" else num_frames,
             height=height,
             width=width,
             seed=seed,
@@ -1605,6 +1652,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
             inputs_shared.update(prepare_inference_goal_inputs(self, goal_observed_head,
                 [prompt], inputs_shared['context'], head_valid=[goal_head_valid],
                 goal_observed_multiview=goal_observed_multiview, goal_view_valid=goal_view_valid,
+                history_images=history_images, history_latents=history_latents,
+                history_ages=history_ages, history_valid=history_valid, history_episode_id=history_episode_id,
                 seeds=[seed if goal_seed is None else goal_seed],
                 context_lens=inputs_shared.get('seq_lens', inputs_shared.get('context_lens'))))
 
@@ -1663,7 +1712,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
             sigma_v_next = t_v_next / num_train_ts_v
             sigma_a_next = t_a_next / num_train_ts_a
 
-            video_stepping = sigma_v != sigma_v_next
+            video_stepping = self.future_video_mode != "none" and sigma_v != sigma_v_next
             action_stepping = sigma_a != sigma_a_next
 
             if not video_stepping and not action_stepping:
@@ -1673,7 +1722,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
             # the forward context: under a v→a-visible attention mask, dropping
             # its tokens would change the other stream's prediction. Freezing
             # only gates the *update* below, never the forward inputs.
-            v_timestep = torch.tensor([t_v], dtype=dtype, device=device)
+            v_timestep = torch.tensor([0 if self.future_video_mode == "none" else t_v], dtype=dtype, device=device)
             a_timestep = torch.tensor([t_a], dtype=dtype, device=device)
 
             if (
@@ -1737,7 +1786,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         # VAE decode. Fail-fast when the backbone is wired to an irreversible
         # external encoder — silently returning None would mask a config
         # mismatch (caller asked for pixels but the encoder cannot produce them).
-        if decode_video:
+        if decode_video and self.future_video_mode != "none":
             _assert_decode_video_supported(vb)
             video_frames = vb.decode_video(inputs_shared["latents"], tiled=tiled)
         else:
@@ -1797,8 +1846,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
             )
             torch.compiler.cudagraph_mark_step_begin()
             merged_noise, merged_action = self.forward(exp_al, exp_at, **expanded, timestep=exp_vt)
-            uncond_noise, cond_noise = merged_noise.chunk(2, dim=0)
-            noise_pred = _combine_cfg(uncond_noise, cond_noise, cfg_scale)
+            noise_pred = None
+            if merged_noise is not None:
+                uncond_noise, cond_noise = merged_noise.chunk(2, dim=0)
+                noise_pred = _combine_cfg(uncond_noise, cond_noise, cfg_scale)
             if isinstance(merged_action, Tensor):
                 uncond_action, cond_action = merged_action.chunk(2, dim=0)
                 action_noise_pred = _combine_cfg(uncond_action, cond_action, cfg_scale)
@@ -1818,7 +1869,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         finally:
             inputs_shared["context"] = saved_context
 
-        noise_pred = _combine_cfg(uncond_noise, cond_noise, cfg_scale)
+        noise_pred = None if cond_noise is None else _combine_cfg(uncond_noise, cond_noise, cfg_scale)
         if isinstance(cond_action, Tensor) and isinstance(uncond_action, Tensor):
             action_noise_pred = _combine_cfg(uncond_action, cond_action, cfg_scale)
         else:

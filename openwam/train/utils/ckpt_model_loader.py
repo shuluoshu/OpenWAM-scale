@@ -258,9 +258,9 @@ def build_architecture_from_ckpt_dir(ckpt_dir: str, *, weights_required: bool, o
         from openwam.train.utils.stage2 import validate_stage2_checkpoint, validate_stage2_config
         validate_stage2_config(override_cfg)
         if OmegaConf.select(ckpt_cfg,'goal.enabled',default=False):
-            from openwam.model.goal.runtime import goal_observation_mode
-            if goal_observation_mode(OmegaConf.to_container(override_cfg.goal,resolve=True)) != goal_observation_mode(OmegaConf.to_container(ckpt_cfg.goal,resolve=True)):
-                raise ValueError('Stage2 configured goal policy/mode disagrees with saved checkpoint')
+            from openwam.model.goal.runtime import validate_goal_compatibility
+            validate_goal_compatibility(OmegaConf.to_container(override_cfg.goal,resolve=True),
+                                        OmegaConf.to_container(ckpt_cfg.goal,resolve=True))
         if weights_required:
             validate_stage2_checkpoint(override_cfg, explicit_weights or find_latest_weights(ckpt_dir))
     resolved_arch = resolve_architecture_config(model_cfg)
@@ -294,7 +294,7 @@ def build_architecture_from_ckpt_dir(ckpt_dir: str, *, weights_required: bool, o
     stage2_checkpoint = bool(OmegaConf.select(ckpt_cfg, 'goal.enabled', default=False))
     if stage2_checkpoint:
         from openwam.model.goal.runtime import configure_goal_adapter, configure_goal
-        configure_goal_adapter(architecture)
+        configure_goal_adapter(architecture, OmegaConf.to_container(ckpt_cfg.goal, resolve=True))
     if stage2_checkpoint and not weights_required:
         from openwam.train.utils.checkpointing import find_latest_accel_state, validate_stage2_full_state
         import json

@@ -94,7 +94,8 @@ def audit_selection(dataset):
         try:
             raw=(Path(repo['path'])/'meta/info.json').read_bytes();info=json.loads(raw)
             profile=resolve_native_profile(repo['repo'],info)
-            rep=MoraHeadTCPRepresentation(info,**profile['representation']);rep.contract['gripper_state_filter']=dataset.filter_config
+            from openwam.dataloader.posttrain_physical import representation_info
+            rep=MoraHeadTCPRepresentation(representation_info(info,profile),**profile['representation']);rep.contract['gripper_state_filter']=dataset.filter_config
             rep.contract['native_profile_id']=profile['profile_id']
             key=fingerprint(rep.contract)
             metadata,failures=audit_episode_metadata(repo)

@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - stage2_query_history_3000h
+  - _self_
+model:
+  architecture:
+    future_video_mode: none
+training:
+  lambda_video: 0.0
+project:
+  name: openwam-stage2-z-action-3000h

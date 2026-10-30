@@ -11,6 +11,11 @@ FORMAT='openwam.goal.subtask.v1'
 
 
 def contiguous_subtasks(frames,annotations,episode_length):
+    """Split on frame-label changes AND explicit annotation occurrence boundaries.
+
+    A subtask ID identifies text, not a unique occurrence. Adjacent occurrences
+    can share that ID but must retain their own terminal goal frames.
+    """
     if frames['frame_index']!=list(range(episode_length)):
         raise ValueError('source frame indices must be dense, unique and complete')
     if any(len(frames[k])!=episode_length for k in ('task_index','subtask_index')):
@@ -21,12 +26,20 @@ def contiguous_subtasks(frames,annotations,episode_length):
         if not isinstance(text,str) or not text.strip():continue
         if idx in mapping and mapping[idx]!=text:raise ValueError('conflicting subtask text')
         mapping[idx]=text;by_index.setdefault(idx,[]).append(annotation)
+    boundaries={}
+    for idx,rows in by_index.items():
+        intervals=sorted((int(a['start_frame']),int(a['end_frame'])) for a in rows
+                         if 'start_frame' in a and 'end_frame' in a)
+        if any(a[1]>b[0] for a,b in zip(intervals,intervals[1:])):
+            raise ValueError(f'overlapping subtask annotation intervals: {idx}')
+        boundaries[idx]={edge for interval in intervals for edge in interval}
     unannotated=frames.get('subtask_unannotated',[False]*episode_length)
     if len(unannotated)!=episode_length:raise ValueError('unannotated mask length mismatch')
     keys=[(int(t),int(s) if s is not None else -1,bool(u)) for t,s,u in zip(frames['task_index'],frames['subtask_index'],unannotated)]
     segments=[];start=0
     for end in range(1,episode_length+1):
-        if end!=episode_length and keys[end]==keys[start]:continue
+        if (end!=episode_length and keys[end]==keys[start]
+                and end not in boundaries.get(keys[start][1],())):continue
         task,idx,unmarked=keys[start];text=mapping.get(idx);reasons=[]
         if idx<0:reasons.append('negative_or_missing_subtask_index')
         if unmarked:reasons.append('source_subtask_unannotated')

@@ -91,7 +91,7 @@ class PatchGoalExpert(nn.Module):
             return self.codec
         return GoalCodec(self.codec.vae, GoalCodecSpec(
             name='wan22_vae48_multiview_single_frame',
-            image_shape=MULTIVIEW_IMAGE_SHAPE, latent_shape=MULTIVIEW_LATENT_SHAPE))
+            image_shape=MULTIVIEW_IMAGE_SHAPE, latent_shape=MULTIVIEW_LATENT_SHAPE),cache=self.codec.cache)
 
     def encode_observation(self, observed, *, observed_view_valid=None):
         if self.observation_mode == 'multiview':
@@ -100,8 +100,16 @@ class PatchGoalExpert(nn.Module):
             raise ValueError('head observation mode does not accept observed_view_valid')
         return self.observation_codec.encode(observed)
 
+    @property
+    def context_width(self):
+        return self.dit.text_embedding[0].in_features
+
+    def embed_context(self, context):
+        return self.dit.text_embedding(context)
+
     def velocity(self, observed_latent, noisy_goal, noisy_tcp, timestep, context, *,
-                 context_lens=None, return_observation=False, observed_view_valid=None):
+                 context_lens=None, return_observation=False, observed_view_valid=None,
+                 observation_tokens=None):
         """Return (goal velocity, TCP velocity[, observation velocity]).
 
         TCP patches use Wan's head flattening order, whereas Conv3d's kernel is
@@ -119,7 +127,7 @@ class PatchGoalExpert(nn.Module):
         if timestep.shape != (b,):
             raise ValueError('patch timestep must be [B]')
         if (context.ndim != 3 or context.shape[0] != b
-                or context.shape[-1] != d.text_embedding[0].in_features):
+                or context.shape[-1] != self.context_width):
             raise ValueError('incompatible patch goal text context [B,L,text_dim]')
 
         # Preserve the legacy combined patchify operation and 2-D attention mask
@@ -140,6 +148,13 @@ class PatchGoalExpert(nn.Module):
             n_obs, n = obs_h * obs_w, h * w
             image_tokens = torch.cat((observed_patches.flatten(2).transpose(1, 2),
                                       goal_patches.flatten(2).transpose(1, 2)), dim=1)
+        if observation_tokens is not None:
+            if (observation_tokens.shape != (b, n_obs, d.dim)
+                    or observation_tokens.device != image_tokens.device
+                    or observation_tokens.dtype != image_tokens.dtype
+                    or not torch.isfinite(observation_tokens).all()):
+                raise ValueError('observation_tokens must be finite native [B,n_obs,dim] tokens')
+            image_tokens = torch.cat((observation_tokens, image_tokens[:, n_obs:]), dim=1)
         tcp_volume = d.unpatchify(noisy_tcp[:, None].to(observed_latent), (1, 1, 1))
         tcp_tokens = d.patchify(tcp_volume).flatten(2).transpose(1, 2)
         tokens = torch.cat((image_tokens, tcp_tokens), dim=1)
@@ -180,7 +195,8 @@ class PatchGoalExpert(nn.Module):
                 raise ValueError('invalid patch context lengths')
             context_mask = (torch.arange(context.shape[1], device=tokens.device)[None]
                             < context_lens[:, None])[:, None, None]
-        embedded_context = d.text_embedding(context)
+            context = torch.where(context_mask[:, 0, 0, :, None], context, 0.)
+        embedded_context = self.embed_context(context)
         for block in d.blocks:
             if self.training and self.use_gradient_checkpointing:
                 tokens = checkpoint(block, tokens, embedded_context, modulation, frequencies,
@@ -199,7 +215,8 @@ class PatchGoalExpert(nn.Module):
         return (*result, observation_output) if return_observation else result
 
     def forward(self, observed, context, targets, *, timestep_indices=None, noise=None,
-                tcp_noise=None, context_lens=None, observed_view_valid=None):
+                tcp_noise=None, context_lens=None, observed_view_valid=None,
+                observation_tokens=None):
         observed_latent = self.encode_observation(observed, observed_view_valid=observed_view_valid)
         image_valid = targets.image_valid.bool()
         safe_image = torch.where(image_valid[:, None, None, None, None], targets.image,
@@ -230,8 +247,10 @@ class PatchGoalExpert(nn.Module):
         s_tcp = sigma[:, None]
         noisy_image = (1 - s_image) * clean_image + s_image * noise
         noisy_tcp = (1 - s_tcp) * clean_tcp + s_tcp * tcp_noise
+        condition_kwargs = {} if observation_tokens is None else dict(observation_tokens=observation_tokens)
         image_velocity, tcp_velocity = self.velocity(observed_latent, noisy_image, noisy_tcp,
-            timesteps, context, context_lens=context_lens, observed_view_valid=observed_view_valid)
+            timesteps, context, context_lens=context_lens, observed_view_valid=observed_view_valid,
+            **condition_kwargs)
         weights = self.scheduler.linear_timesteps_weights.to(clean_image.device)[idx]
         image_error = torch.where(image_valid[:, None, None, None, None],
                                   image_velocity.float() - (noise.float() - clean_image.float()),
@@ -248,12 +267,13 @@ class PatchGoalExpert(nn.Module):
                     clean_latent=estimated_image, observed_latent=observed_latent,
                     noisy_latent=noisy_image, velocity=image_velocity, sigma=sigma,
                     noisy_tcp_patch=noisy_tcp, clean_tcp_patch=estimated_tcp,
+                    target_latent=clean_image,
                     tcp_velocity=tcp_velocity, tcp_noise=tcp_noise, tcp_valid=point_valid,
                     uv=decode_tcp_patch(estimated_tcp))
 
     @torch.no_grad()
     def generate(self, observed, context, *, num_steps=20, seed=0, context_lens=None,
-                 observed_view_valid=None):
+                 observed_view_valid=None, observation_tokens=None):
         """Joint Euler integration from independent image and 192D TCP noise."""
         if self.training:
             raise RuntimeError('patch goal generation requires eval()')
@@ -275,10 +295,12 @@ class PatchGoalExpert(nn.Module):
         tcp = torch.cat(tcp_noise, dim=0)
         scheduler = FlowMatchScheduler(template='Wan')
         scheduler.set_timesteps(num_steps, shift=self.shift)
+        condition_kwargs = {} if observation_tokens is None else dict(observation_tokens=observation_tokens)
         for timestep in scheduler.timesteps:
             times = timestep.to(device=image.device, dtype=image.dtype).expand(b)
             image_v, tcp_v = self.velocity(observed_latent, image, tcp, times, context,
-                                          context_lens=context_lens, observed_view_valid=observed_view_valid)
+                                          context_lens=context_lens, observed_view_valid=observed_view_valid,
+                                          **condition_kwargs)
             image = scheduler.step(image_v, timestep, image)
             tcp = scheduler.step(tcp_v, timestep, tcp)
         image_tokens = math.prod(self.codec.spec.latent_shape[1:]) // math.prod(self.dit.patch_size)

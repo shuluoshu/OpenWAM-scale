@@ -1,0 +1,5 @@
+base_config: stage1_multiview_sample.yaml
+model:
+  goal_representation: query_latent
+dataset:
+  cache_dir: outputs/stage1_query_sample/cache

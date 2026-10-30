@@ -1,0 +1,13 @@
+# @package _global_
+defaults:
+  - stage2_multiview_sample
+  - _self_
+model:
+  goal_representation: query_latent
+goal:
+  format: openwam.goal.query.v1
+  conditioning: query_memory
+  query: ${model.query_goal}
+  num_steps: 1
+project:
+  name: openwam-stage2-query-sample

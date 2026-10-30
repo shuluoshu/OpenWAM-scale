@@ -142,7 +142,8 @@ def evaluate_patch(expert,batches,output_dir,*,step=0,seed=42,num_steps=20):
     cards=[]; metrics={}; aggregate=[[],[]]; maes=[]
     for index,b in enumerate(batches):
         if b['observed'].shape[0]!=1: raise ValueError('one case per batch required')
-        prediction=expert.generate(b['observed'],b['context'],seed=seed+index,num_steps=num_steps,context_lens=b.get('context_lens'),observed_view_valid=b.get('observed_view_valid'))
+        from openwam.model.goal.history import history_kwargs
+        prediction=expert.generate(b['observed'],b['context'],seed=seed+index,num_steps=num_steps,context_lens=b.get('context_lens'),observed_view_valid=b.get('observed_view_valid'),**history_kwargs(b))
         decoded=expert.codec.decode(prediction.latent)
         if not torch.isfinite(decoded).all(): raise FloatingPointError('nonfinite generated image')
         uv=prediction.uv.float(); target=b['targets']; valid=point_mask(target)[0].cpu().tolist()
@@ -156,8 +157,10 @@ def evaluate_patch(expert,batches,output_dir,*,step=0,seed=42,num_steps=20):
         image.save(output_dir/f'{name}_generated_clean.png'); goal.save(output_dir/f'{name}_target.png')
         _prediction_overlay(image,pred_px).save(output_dir/f'{name}_generated.png')
         overlay_goal_targets(goal,gt_px,valid).save(output_dir/f'{name}_target_points.png')
-        mae=float(np.abs(np.asarray(image,dtype=np.float32)-np.asarray(goal,dtype=np.float32)).mean()); maes.append(mae)
-        cards.append(dict(id=name,source=b['sources'][0],target_point_valid=valid,
+        image_valid=bool(target.image_valid[0])
+        mae=float(np.abs(np.asarray(image,dtype=np.float32)-np.asarray(goal,dtype=np.float32)).mean()) if image_valid else None
+        if mae is not None:maes.append(mae)
+        cards.append(dict(id=name,source=b['sources'][0],target_point_valid=valid,target_image_valid=image_valid,
             observed_shape=list(b['observed'].shape),
             observed_view_valid=b['observed_view_valid'].detach().cpu().tolist() if 'observed_view_valid' in b else None,
             target_uv_px=[p if v else None for p,v in zip(gt_px,valid)],predicted_uv_px=pred_px,
@@ -167,7 +170,7 @@ def evaluate_patch(expert,batches,output_dir,*,step=0,seed=42,num_steps=20):
     metrics['overall']={side:dict(count=len(errors),pixel_error=float(np.mean(errors)) if errors else None,
         pck=float(np.mean(np.asarray(errors)<=16)) if errors else None,pck_threshold_px=16.)
         for side,errors in zip(('left','right'),aggregate)}
-    result=dict(step=step,point_metrics=metrics,image_mae_uint8=float(np.mean(maes)),review=cards,
+    result=dict(step=step,point_metrics=metrics,image_mae_uint8=float(np.mean(maes)) if maes else None,review=cards,
         evaluation_split='train',semantic_success='not measured',prediction='joint flow sampled TCP; continuous UV; no clamp')
     from openwam.train.mixed_metrics import aggregate_mixed_metrics, render_group_table
     result['group_metrics']=aggregate_mixed_metrics(cards)
@@ -180,7 +183,8 @@ def evaluate_patch(expert,batches,output_dir,*,step=0,seed=42,num_steps=20):
         eligible=[v for v in sides.values() if v.get('count',0)>0 and v.get('pixel_error') is not None]
         count=sum(v['count'] for v in eligible)
         mean=(f"{sum(v['pixel_error']*v['count'] for v in eligible)/count:.2f} px" if count else '—（无有效 GT）')
-        labels=f'<p data-case-error-metrics="true"><strong>图像 MAE：{card["image_mae_uint8"]:.2f} / 255 · TCP 平均误差：{mean}</strong></p>'
+        image_error=f'{card["image_mae_uint8"]:.2f}' if card['image_mae_uint8'] is not None else '—（无有效 GT）'
+        labels=f'<p data-case-error-metrics="true"><strong>图像 MAE：{image_error} / 255 · TCP 平均误差：{mean}</strong></p>'
         figures=''.join(f'<figure><figcaption>{label}</figcaption><img width="320" height="256" src="{name}_{file}"></figure>' for label,file in [('实际目标 + 有效 GT 方框','target_points.png'),('联合生成图像 + TCP 圆圈' if supported else '生成图像；缺失 TCP GT，原始点仅供诊断',suffix)])
         articles.append(f'<article><h2>{html.escape(card["source"])}</h2><p>{html.escape(card.get("instruction",""))}</p>{labels}<div class="panels">{figures}</div><a href="{name}_generated.png">原始预测点诊断</a><pre>{html.escape(json.dumps(card,ensure_ascii=False,indent=2))}</pre></article>')
     (output_dir/'index.html').write_text('<!doctype html><html lang="zh"><meta charset="utf-8"><title>Joint patch denoising</title><style>body{font:16px system-ui;margin:24px}.panels{display:flex;gap:16px}figure{margin:0}pre{white-space:pre-wrap}</style>'+f'<h1>联合去噪 · 第 {step} 步</h1><a href="../timeline.html">全部历史</a><p>TCP 来自去噪 patch 的固定分组平均解码；连续坐标，不裁剪到图像边界。GT 左红右蓝方框，预测圆圈。缺失 GT 不计算点误差。</p>'+render_group_table(result['group_metrics'])+''.join(articles)+'</html>')

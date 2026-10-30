@@ -1,0 +1,30 @@
+# @package _global_
+# Frozen optimized Stage1 C* memory; native joint video/action denoising.
+defaults:
+  - stage2_multiview_sample
+  - _self_
+model:
+  goal_representation: visual_history_masked_sa
+  query_history: {enabled: true, num_frames: 10}
+  visual_history: {dim: 3072, num_tokens: 120}
+  architecture:
+    future_video_mode: joint
+    mot_checkpoint_mixed_attn: true
+goal:
+  format: openwam.visual_history.v1
+  conditioning: visual_history_memory
+  num_steps: 1
+  history: ${model.query_history}
+  visual_history: ${model.visual_history}
+dataloader:
+  observation_augmentation: {enabled: false}
+  history:
+    enabled: true
+    num_frames: 10
+    mean_interval_s: 1.0
+    jitter_fraction: 0.0
+    frame_dropout_prob: 0.0
+training:
+  max_steps: 500
+project:
+  name: openwam-stage2-visual-history-joint

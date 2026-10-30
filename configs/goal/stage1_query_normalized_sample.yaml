@@ -1,0 +1,3 @@
+base_config: stage1_query_history_sample.yaml
+model:
+  query_conditioning: normalized_cross_attention

@@ -1,4 +1,4 @@
 interface:
-  display_name: "OpenWAM 数据可视化"
-  short_description: "TCP/FK videos, model inputs and offline HTML audits"
-  default_prompt: "使用 $openwam-visualization，生成指定数据集的轨迹视频、模型输入对比和可离线打开的 HTML，并说明坐标系、端点与 mask。"
+  display_name: "OpenWAM 预测与轨迹可视化"
+  short_description: "完整指令两排视频：GT/预测、三视图与32步轨迹"
+  default_prompt: "使用 $openwam-visualization，每数据集选1–2个episode，优先完整subtask，按每10源帧新推理，生成GT上排/预测下排的四列视频：当前头图与双腕图各叠32步轨迹，第四列为Stage1关键帧和TCP；缺腕图留黑，可播放暂停拖动。"

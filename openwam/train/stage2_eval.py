@@ -114,6 +114,8 @@ def generation_conditions(sample, *, seed, num_steps, observation_mode='head', o
         _proprio_sample_mask=sample['proprio_mask'].unsqueeze(0), active_action_mask=active,
         goal_observed_head=None if head is None else head.unsqueeze(0),
         goal_head_valid=bool(sample['goal_head_valid']), goal_seed=int(sample['goal_seed']), decode_video=True)
+    from openwam.model.goal.history import history_kwargs
+    result.update({key:value.unsqueeze(0) for key,value in history_kwargs(sample).items()})
     if observation_mode == 'multiview':
         observed, valid = _clean_multiview_condition(sample)
         if observation_dtype is not None:observed=observed.to(dtype=observation_dtype)
@@ -152,6 +154,10 @@ def _conditions_sha(sample, kwargs):
         digest.update(_json(['multiview',MULTIVIEW_PREPROCESSING_VERSION,str(kwargs['goal_observed_multiview'].dtype)]).encode())
         for key in ('goal_observed_multiview','goal_view_valid'):
             digest.update(np.ascontiguousarray(_array(kwargs[key])).tobytes())
+    from openwam.model.goal.history import history_kwargs
+    for key, value in history_kwargs(kwargs).items():
+        digest.update(_json([key,list(value.shape),str(value.dtype)]).encode())
+        digest.update(np.ascontiguousarray(_array(value)).tobytes())
     for image in kwargs['first_frame_image']: digest.update(image.tobytes())
     return digest.hexdigest()
 
@@ -304,21 +310,21 @@ def prediction_metrics(result, diagnostics, goal_image, sample):
     predicted=np.asarray(result['normalized_actions'])
     if predicted.shape!=(32,112) or not np.isfinite(predicted).all():raise ValueError('invalid normalized_actions generation output')
     video=result['video']
-    if len(video)!=9 or any(not isinstance(i,Image.Image) or i.size!=(320,384) for i in video):
+    if video is not None and (len(video)!=9 or any(not isinstance(i,Image.Image) or i.size!=(320,384) for i in video)):
         raise ValueError('prediction must contain exactly 9 PIL 320x384 canvases')
     metrics=action_metrics(predicted,sample)
     view_mask=_array(sample['video_view_mask']).astype(bool)&_array(sample['video_mask']).astype(bool)[:,None]
     total=0.;count=0
-    for t in range(1,9):
+    for t in (range(1,9) if video is not None else ()):
         gt=np.asarray(sample['video'][t],dtype=np.float32);pred=np.asarray(video[t],dtype=np.float32)
         for view,(x0,y0,x1,y1) in enumerate(TILES):
             if view_mask[t,view]:
                 error=np.abs(pred[y0:y1,x0:x1]-gt[y0:y1,x0:x1]);total+=float(error.sum());count+=error.size
     metrics['future_video_mae']=dict(value=total/count if count else None,sum=total,valid_count=count,
-        sample_count=int(count>0),status='available' if count else 'unavailable')
-    valid_goal=bool(_array(diagnostics['image_token_valid']).any())
+        sample_count=int(count>0),status='not_applicable' if video is None else ('available' if count else 'unavailable'))
+    valid_goal=bool(_array(diagnostics['image_token_valid']).any()) and diagnostics.get('goal_decode_available', True)
     target=sample['_eval'].get('report_goal')
-    metrics['goal_image_mae']=_metric(np.abs(np.asarray(goal_image,dtype=float)-np.asarray(target.convert('RGB').resize((320,256),Image.Resampling.BILINEAR),dtype=float)) if target is not None and valid_goal else [])
+    metrics['goal_image_mae']=_metric(np.abs(np.asarray(goal_image,dtype=float)-np.asarray(target.convert('RGB').resize((320,256),Image.Resampling.BILINEAR),dtype=float)) if target is not None and goal_image is not None and valid_goal else [])
     projection=sample['_eval'].get('projection');uv=_array(diagnostics['predicted_uv'])[0]
     if projection is not None and valid_goal:
         valid=np.asarray(projection['projection_valid'],bool)&np.asarray(projection['in_frame'],bool)
@@ -365,6 +371,10 @@ def _fixed_assets(sample, folder, *, observation_mode='head', actual_goal_inputs
     identity.update(_json([trace_identity,sample['report_target'],sample['prompt'],sample['goal_seed']]).encode())
     if observation_mode=='multiview':
         identity.update(b'multiview'+str(observed.dtype).encode()+_array(observed).tobytes()+_array(valid).tobytes())
+    from openwam.model.goal.history import history_kwargs
+    fixed_history=history_kwargs(sample if actual_goal_inputs is None else actual_goal_inputs)
+    for key, value in fixed_history.items():
+        identity.update(_json([key,list(value.shape),str(value.dtype)]).encode()+_array(value).tobytes())
     signature=identity.hexdigest();manifest=folder/'manifest.json'
     if manifest.exists():
         saved=json.loads(manifest.read_text())
@@ -384,6 +394,7 @@ def _fixed_assets(sample, folder, *, observation_mode='head', actual_goal_inputs
         from openwam.model.goal.observation import observation_token_mask
         tensors['goal_observation_token_valid']=(_array(observation_token_mask(valid[None])[0]) if valid[0] else np.zeros(120,bool))
     elif head is not None:tensors['goal_observed_head']=_array(head)
+    tensors.update({key:_array(value) for key,value in fixed_history.items()})
     tensors['active_action_mask']=_array(sample['_eval']['active_action_mask'])
     np.savez_compressed(folder/'supervision.npz',**tensors)
     trace=dict(trace=sample['trace'],report_target=sample['report_target'],prompt=sample['prompt'],goal_seed=sample['goal_seed'])
@@ -395,12 +406,14 @@ def _fixed_assets(sample, folder, *, observation_mode='head', actual_goal_inputs
 def _curves(folder, predicted, sample):
     # Self-contained SVG panels avoid a heavyweight plotting dependency on workers.
     gt=_array(sample['action']);mask=_array(sample['action_mask']).astype(bool)
-    svg=['<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="2520" viewBox="0 0 1920 2520"><rect width="100%" height="100%" fill="white"/>']
+    svg=['<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="2560" viewBox="0 0 1920 2560"><rect width="100%" height="100%" fill="white"/>']
+    svg.append('<line x1="25" y1="20" x2="65" y2="20" stroke="#dd3344" stroke-width="3"/><text x="75" y="25" font-size="16">Prediction (red)</text><line x1="260" y1="20" x2="300" y2="20" stroke="#116677" stroke-width="3"/><text x="310" y="25" font-size="16">Valid GT (teal)</text><text x="520" y="25" font-size="16">No valid GT: excluded from metrics; masked GT is omitted.</text>')
     for channel in range(112):
-        ox=(channel%8)*240;oy=(channel//8)*180
+        ox=(channel%8)*240;oy=(channel//8)*180+40
+        channel_label=f'channel {channel}'+(' (no valid GT)' if not mask[:,channel].any() else '')
         values=np.r_[predicted[:,channel],gt[:,channel][mask[:,channel]]]
         lo=float(values.min());hi=float(values.max());span=max(hi-lo, .1)
-        svg.append(f'<g transform="translate({ox},{oy})"><text x="25" y="15" font-size="12">channel {channel} [{lo:.3g}, {hi:.3g}]</text><path d="M25 25V150H230" fill="none" stroke="#bbb"/>')
+        svg.append(f'<g transform="translate({ox},{oy})"><text x="25" y="15" font-size="12">{channel_label} [{lo:.3g}, {hi:.3g}]</text><path d="M25 25V150H230" fill="none" stroke="#bbb"/>')
         def point(t,v):return f'{25+t*205/31:.2f},{145-(v-lo)*110/span:.2f}'
         svg.append('<polyline fill="none" stroke="#dd3344" stroke-width="1" points="'+' '.join(point(t,v) for t,v in enumerate(predicted[:,channel]))+'"/>')
         indices=np.flatnonzero(mask[:,channel])
@@ -417,27 +430,33 @@ def _curves(folder, predicted, sample):
 
 
 def _case_assets(folder, result, diagnostics, goal_image, sample):
-    folder.mkdir();goal_image.save(folder/'goal_prediction.png')
-    overlay=goal_image.copy();draw=ImageDraw.Draw(overlay);uv=_array(diagnostics['predicted_uv'])[0]
-    for point,color in zip(uv,('red','blue')):
-        if np.isfinite(point).all():
-            x,y=point*[319,255];draw.ellipse((x-4,y-4,x+4,y+4),outline=color,width=2)
-    overlay.save(folder/'goal_uv.png')
+    folder.mkdir()
+    uv=_array(diagnostics['predicted_uv'])[0]
+    if goal_image is not None:
+        goal_image.save(folder/'goal_prediction.png')
+        overlay=goal_image.copy();draw=ImageDraw.Draw(overlay)
+        for point,color in zip(uv,('red','blue')):
+            if np.isfinite(point).all():
+                x,y=point*[319,255];draw.ellipse((x-4,y-4,x+4,y+4),outline=color,width=2)
+        overlay.save(folder/'goal_uv.png')
     projection=sample['_eval'].get('projection')
     _write_json(folder/'goal_points.json',dict(predicted_uv=[p.tolist() if np.isfinite(p).all() else None for p in uv],
-        image_token_valid=_array(diagnostics['image_token_valid']),target=projection))
-    side=[]
-    for gt,pred in zip(sample['video'],result['video']):
-        canvas=Image.new('RGB',(640,384));canvas.paste(gt,(0,0));canvas.paste(pred,(320,0));side.append(canvas)
-    _save_video(folder/'future_gt_prediction.mp4',side)
-    side[1].save(folder/'future_preview.png')
+        image_token_valid=_array(diagnostics['image_token_valid']),target=projection,
+        goal_decode_available=diagnostics.get('goal_decode_available',True),
+        representation=diagnostics.get('representation','patch_denoise')))
+    if result['video'] is not None:
+        side=[]
+        for gt,pred in zip(sample['video'],result['video']):
+            canvas=Image.new('RGB',(640,384));canvas.paste(gt,(0,0));canvas.paste(pred,(320,0));side.append(canvas)
+        _save_video(folder/'future_gt_prediction.mp4',side)
+        side[1].save(folder/'future_preview.png')
     np.savez_compressed(folder/'predictions.npz',normalized_actions=result['normalized_actions'],predicted_uv=_array(diagnostics['predicted_uv']),predicted_latent=_array(diagnostics['predicted_latent']))
     _curves(folder,np.asarray(result['normalized_actions']),sample)
 
 
 def _metric_table(metrics):
     return '<table><tr><th>metric</th><th>value</th><th>valid count</th><th>samples</th></tr>'+''.join(
-        f'<tr><td>{html.escape(name)}</td><td>{"unavailable" if m["value"] is None else format(m["value"],".6g")}</td><td>{m["valid_count"]}</td><td>{m["sample_count"]}</td></tr>' for name,m in metrics.items())+'</table>'
+        f'<tr><td>{html.escape(name)}</td><td>{("not applicable" if m.get("status")=="not_applicable" else "unavailable") if m["value"] is None else format(m["value"],".6g")}</td><td>{m["valid_count"]}</td><td>{m["sample_count"]}</td></tr>' for name,m in metrics.items())+'</table>'
 
 
 def _page(body):
@@ -447,6 +466,8 @@ def _page(body):
 def _step_html(folder, report):
     body=f'<h1>Stage2 update {report["step"]}</h1><p>{html.escape(_json(report["coverage"]))}</p>'
     body+='<p>Predicted frozen Stage1 goals stay constant for fixed input/seed. Future video and actions measure Stage2 learning. Task report endpoints are true episode ends; subtask report endpoints are instruction interval ends. Success is not verified. Video: GT left, prediction right. MAE pixels use 0–255; joints rad, gripper openness, FK m/rad. Counts exclude invalid labels. All ranks generate identical cases; counts come from rank zero once.</p>'
+    if report.get('goal_representation') == 'query_latent':
+        body+='<p>Query latent mode: Stage2 loads only the frozen encoder. Goal image/TCP auxiliary decoders are absent; their predictions and errors are unavailable here. Stage1 evaluation retains those diagnostics. Latent tokens and action predictions are saved; future video predictions are saved when enabled.</p>'
     body+=_metric_table(report['aggregate'])
     for group,metrics in report['by_family_granularity'].items():
         body+='<details><summary>'+html.escape(group)+'</summary>'+_metric_table(metrics)+'</details>'
@@ -457,7 +478,11 @@ def _step_html(folder, report):
             if (folder/file).exists():body+=f'<figure><figcaption>{label}</figcaption><img src="{file}"></figure>'
             else:body+=f'<figure>{label}: unavailable</figure>'
         body+='</div><p>Endpoint: '+html.escape(str(case['report_target'].get('goal_source_frame')))+'; '+html.escape(case['goal_visibility'])+'</p>'+_metric_table(case['metrics'])
-        body+=f'<video controls preload="none" poster="{name}/future_preview.png" src="{name}/future_gt_prediction.mp4"></video><p>GT / prediction video includes observed index0 for context; future MAE excludes it.</p><p>Action curves: GT teal, prediction red; missing GT is omitted. Channel numbers refer to unified112.</p><img loading="lazy" src="{name}/action_curves.svg"><p>Action channel × time validity (white valid)</p><img src="{name}/action_mask.png"><p>Video head / left wrist / right wrist × time validity</p><img src="{name}/video_mask.png">'
+        if case.get('future_video_mode', report.get('future_video_mode', 'joint')) == 'none':
+            body+='<p>Stage2 future video: not applicable (action-only). No predicted video is produced.</p>'
+        else:
+            body+=f'<video controls preload="none" poster="{name}/future_preview.png" src="{name}/future_gt_prediction.mp4"></video><p>GT / prediction video includes observed index0 for context; future MAE excludes it.</p>'
+        body+=f'<p>Action curves: GT teal, prediction red; missing GT is omitted. Channel numbers refer to unified112.</p><img loading="lazy" src="{name}/action_curves.svg"><p>Action channel × time validity (white valid)</p><img src="{name}/action_mask.png"><p>Video head / left wrist / right wrist × time validity</p><img src="{name}/video_mask.png">'
         body+=f'<p><a href="{fixed}/trace.json">GT, geometry and source trace</a> · <a href="{name}/goal_points.json">Continuous goal UV and validity</a> · <a href="{name}/predictions.npz">Predicted points, latent and actions</a> · <a href="{fixed}/supervision.npz">All supervision/masks</a></p></section>'
     (folder/'index.html').write_text(_page(body),encoding='utf-8')
 
@@ -468,9 +493,10 @@ def _aggregate(cases):
         for name,m in case['metrics'].items():
             a=result.setdefault(name,dict(sum=0.,valid_count=0,sample_count=0))
             for key in a:a[key]+=m[key]
-    for m in result.values():
+    for name,m in result.items():
         m['value']=m['sum']/m['valid_count'] if m['valid_count'] else None
-        m['status']='available' if m['valid_count'] else 'unavailable'
+        not_applicable=all(case['metrics'].get(name,{}).get('status')=='not_applicable' for case in cases)
+        m['status']='available' if m['valid_count'] else ('not_applicable' if not_applicable else 'unavailable')
     return result
 
 
@@ -508,6 +534,7 @@ def evaluate_stage2(architecture,cases,output_dir,*,step,seed,num_steps=20):
     root=Path(output_dir);final=root/f'eval_step_{int(step):06d}';rank=_rank()
     if not _distributed() and final.exists():raise FileExistsError(final)
     observation_mode=getattr(architecture.goal_expert,'observation_mode','head')
+    future_video_mode=getattr(architecture,'future_video_mode','joint')
     error=None
     try:
         if int(step)<0 or int(num_steps)<1 or len(cases)<1:raise ValueError('nonnegative step, positive denoise steps and nonempty cases required')
@@ -515,7 +542,7 @@ def evaluate_stage2(architecture,cases,output_dir,*,step,seed,num_steps=20):
     except Exception as exc:error=f'{type(exc).__name__}: {exc}'
     _agree_error(error,'setup')
     descriptors=getattr(cases,'descriptors',None)
-    _same(_json(dict(count=len(cases),descriptors=descriptors,step=int(step),seed=int(seed),num_steps=int(num_steps),goal_observation_mode=observation_mode)))
+    _same(_json(dict(count=len(cases),descriptors=descriptors,step=int(step),seed=int(seed),num_steps=int(num_steps),goal_observation_mode=observation_mode,future_video_mode=future_video_mode)))
     work=root/f'.eval_step_{int(step):06d}-{uuid.uuid4().hex}' if rank==0 else None
     rows=[];error=None
     if rank==0:
@@ -533,6 +560,7 @@ def evaluate_stage2(architecture,cases,output_dir,*,step,seed,num_steps=20):
                     observation_dtype=getattr(architecture,'dtype',None))
             except Exception as exc:error=f'{type(exc).__name__}: {exc}'
             _agree_error(error,f'case {index} validation')
+            kwargs['decode_video'] = future_video_mode != 'none'
             condition_sha=_conditions_sha(sample,kwargs);_same(condition_sha)
             random.seed(int(seed)+index);np.random.seed((int(seed)+index)%(2**32))
             torch.random.set_rng_state(torch.Generator(device='cpu').manual_seed(int(seed)+index).get_state())
@@ -552,14 +580,17 @@ def evaluate_stage2(architecture,cases,output_dir,*,step,seed,num_steps=20):
             error=None
             if rank==0:
                 try:
+                    if (result.get('video') is None) != (future_video_mode == 'none'):
+                        raise ValueError('generated video availability disagrees with future_video_mode')
                     diagnostics=architecture.goal_diagnostics
-                    goal_image=_pil_goal(architecture.goal_expert.codec.decode(diagnostics['predicted_latent']))
+                    goal_image=(_pil_goal(architecture.goal_expert.codec.decode(diagnostics['predicted_latent']))
+                                if diagnostics.get('goal_decode_available',True) else None)
                     metrics=prediction_metrics(result,diagnostics,goal_image,sample)
                     name=f'case_{index:03d}';_fixed_assets(sample,root/'fixed_inputs'/name,observation_mode=observation_mode,actual_goal_inputs=kwargs)
                     _case_assets(work/name,result,diagnostics,goal_image,sample)
                     rows.append(dict(name=name,family=sample['_eval']['family'],granularity=sample['granularity'],
                         prompt=sample['prompt'],goal_seed=int(sample['goal_seed']),generation_seed=int(seed)+index,
-                        goal_observation_mode=observation_mode,
+                        goal_observation_mode=observation_mode,future_video_mode=future_video_mode,
                         goal_view_valid=(_array(kwargs['goal_view_valid'])[0].tolist() if observation_mode=='multiview' else None),
                         goal_input_dtype=(str(kwargs['goal_observed_multiview'].dtype) if observation_mode=='multiview' else None),
                         goal_input_shape=(list(kwargs['goal_observed_multiview'].shape) if observation_mode=='multiview' else [1,3,1,256,320]),
@@ -575,6 +606,8 @@ def evaluate_stage2(architecture,cases,output_dir,*,step,seed,num_steps=20):
             try:
                 coverage=getattr(cases,'coverage',dict(mode='explicit supplied cases',selected_cases=len(cases)))
                 report=dict(schema=SCHEMA,step=int(step),seed=int(seed),num_steps=int(num_steps),coverage=coverage,sample_count=len(rows),
+                    future_video_mode=future_video_mode,
+                    goal_representation=getattr(architecture.goal_expert,'representation','patch_denoise'),
                     goal_observation_mode=observation_mode,metric_rank_policy='rank0 authoritative; same cases generated on all ranks',cases=rows,aggregate=_aggregate(rows))
                 report['by_family_granularity']={f'{family}/{level}':_aggregate([r for r in rows if r['family']==family and r['granularity']==level])
                     for family,level in sorted({(r['family'],r['granularity']) for r in rows})}

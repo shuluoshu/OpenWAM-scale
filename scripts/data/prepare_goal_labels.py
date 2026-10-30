@@ -73,17 +73,18 @@ def read_episode(root, episode):
 
 def source_rows(row, ep, info):
     import pyarrow.parquet as pq
+    from openwam.dataloader.episode_data import episode_data_path,read_episode_table
     root=Path(row['source'])
-    path=root/info['data_path'].format(episode_index=row['episode'],chunk_index=int(ep['data/chunk_index']),file_index=int(ep['data/file_index']))
+    path=episode_data_path(root,info,ep)
     if path.resolve()!=Path(row['source_parquet']).resolve():raise ValueError('source parquet disagreement')
     available=pq.ParquetFile(path).schema_arrow.names
-    ids=pq.read_table(path,columns=['frame_index','task_index'],filters=[('episode_index','=',row['episode'])]).sort_by('frame_index').to_pydict()
-    if ids['frame_index']!=list(range(int(ep['length']))):raise ValueError('source frame indices are not dense unique full episode')
+    table,data_files=read_episode_table(root,info,ep,['frame_index','task_index'])
+    ids=table.to_pydict()
     task=ids['task_index'];segments=[];start=0
     for i in range(1,len(task)+1):
         if i==len(task) or task[i]!=task[start]:segments.append((start,i,task[start]));start=i
     # Do not concatenate disjoint task runs or infer goals across task boundaries.
-    return path,available,segments
+    return path,available,segments,data_files
 
 
 def task_text(root,task):
@@ -126,8 +127,10 @@ def decode_goal(video_path, offset_s, frame_index):
             previous_time=pts_s
             if decoded!=ordinal:continue
             if offset_s and nonuniform:raise ValueError('VFR time offset has no verified ordinal mapping')
-            image=frame.to_image().convert('RGB')
+            from openwam.dataloader.utils.video_color import canonical_video_rgb, video_color_policy
+            image=canonical_video_rgb(frame.to_image(),video_path)
             return image,dict(video_path=str(video_path),video_ordinal=ordinal,video_pts=frame.pts,
+                              image_color_policy=video_color_policy(video_path),
                               video_pts_seconds=pts_s,video_fps=fps,video_offset_s=offset_s,
                               decoded_wh=list(image.size),decode_alignment='sequential_ordinal',
                               video_first_pts=first_pts,stream_start_time=stream.start_time,
@@ -164,6 +167,13 @@ def goal_camera(family, values, head, info, decoded_wh, *, geometry_eligible=Tru
         for key in ('source.camera.world_to_camera_valid','observation.states.camera.valid'):
             if key in values and not bool(np.asarray(values[key]).reshape(-1)[0]>.5):raise ValueError(f'{key} false')
         e=np.asarray(values[ek],float).reshape(4,4)
+        # Present fields can still mean unavailable calibration (all-NaN rows).
+        # Use the projection routines' own checks before returning a camera;
+        # the caller then keeps image supervision and masks only TCP targets.
+        # Empty points validate calibration without inventing a test endpoint.
+        from scripts.data.trajectory_projection import transform_points,project_points
+        transform_points(e,np.empty((0,3)))
+        project_points(np.empty((0,3)),k,model=model,distortion=d)
         provenance.update(model=model,native_wh=list(native_wh),K=k.tolist(),world_to_camera=e.tolist(),distortion=None if d is None else d.tolist(),
                           resize_affine_pixel_centers={'scale':[320/native_wh[0],256/native_wh[1]],'translation':[.5*320/native_wh[0]-.5,.5*256/native_wh[1]-.5]})
         return (k,e,model,d,native_wh),provenance
@@ -188,7 +198,7 @@ def prepare(manifest, output_dir, *, label_kind='reviewed_success', reviewed_man
     for row in rows:
         try:
             root=Path(row['source']);info=json.loads((root/'meta/info.json').read_text());ep=read_episode(root,row['episode'])
-            data_path,columns,segments=source_rows(row,ep,info)
+            data_path,columns,segments,data_files=source_rows(row,ep,info)
             if len(segments)!=1:raise ValueError('ambiguous/multi-instruction episode: explicit segment review required')
             start,end,task=segments[0];instruction=task_text(root,task);instruction_id=f'task:{task}:{start}'
             identity=source_key(row['source'],row['episode']);split=assignments[identity]
@@ -199,7 +209,8 @@ def prepare(manifest, output_dir, *, label_kind='reviewed_success', reviewed_man
                     raise ValueError('formal mode requires an originally verified reviewed_success label; weak/unverified input cannot be upgraded')
             goal=int(ep['length'])-1 if label_kind=='episode_end' else int(selected['goal_source_frame'])
             evidence={} if selected is None else selected.get('success_evidence',{})
-            values=pq.read_table(data_path,filters=[('episode_index','=',row['episode']),('frame_index','=',goal)]).to_pylist()
+            from openwam.dataloader.episode_data import read_episode_rows
+            values=read_episode_rows(dict(data=data_path,data_files=data_files),row['episode'],filters=[('frame_index','=',goal)]).to_pylist()
             if len(values)!=1:raise ValueError('goal row is not unique')
             values=values[0]
             prefix=f'videos/{row["head"]}/'
@@ -227,7 +238,7 @@ def prepare(manifest, output_dir, *, label_kind='reviewed_success', reviewed_man
                 if projection['in_frame'][hand]:
                     x,y=projection['uv'][hand]*[319,255];draw.ellipse((x-4,y-4,x+4,y+4),outline=color,width=2)
             overlay.save(assets/'overlay.png')
-            metadata=dict(source_episode_id=identity,source_parquet=str(data_path),source_image_path=str(image_path),head_image_path=str(image_path),
+            metadata=dict(source_episode_id=identity,source_parquet=str(data_path),source_parquets=[str(p) for p in data_files],source_image_path=str(image_path),head_image_path=str(image_path),
                           target_path=str(assets/'targets.npz'),goal_source_frame=goal,video=video_meta,endpoint=endpoint,camera=cam_meta,
                           source_curation={k:v for k,v in ep.items() if k.startswith('data_curation/')},
                           geometry_review_status='pending_review',calibration_eligibility_record=eligibility_record,

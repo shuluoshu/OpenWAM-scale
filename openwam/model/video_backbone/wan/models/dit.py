@@ -268,7 +268,8 @@ class DiTBlock(nn.Module):
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, attn_mask=self_attn_mask))
-        x = x + self.cross_attn(self.norm3(x), context, ctx_mask=context_mask)
+        if context is not None:  # Query prefix ablation carries all conditions in self-attention.
+            x = x + self.cross_attn(self.norm3(x), context, ctx_mask=context_mask)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x

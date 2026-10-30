@@ -211,7 +211,7 @@ def load_from_checkpoint_dir(
     stage2 = bool(OmegaConf.select(cfg, 'goal.enabled', default=False))
     if stage2:
         from openwam.model.goal.runtime import configure_goal_adapter, configure_goal
-        configure_goal_adapter(architecture)
+        configure_goal_adapter(architecture, OmegaConf.to_container(cfg.goal, resolve=True))
     architecture.load_checkpoint(ckpt_path)
     if stage2:
         configure_goal(architecture, cfg, checkpoint_dir=ckpt_dir)

@@ -19,16 +19,22 @@ from scripts.data.prepare_subtask_goals import (read_episode,task_text,decode_fr
 
 
 def rebuild_task_for_release(task,sub,out):
+    from openwam.dataloader.episode_data import episode_data_path,read_episode_table,read_episode_rows
     root=Path(sub['source_repo']);epid=sub['source_episode'];info=json.loads((root/'meta/info.json').read_text())
     ep=read_episode(root,epid);n=int(ep['length']);head=sub['head'];fps=float(info['fps']);goal=n-1;anchor=task['anchor_source_frame']
-    data=root/info['data_path'].format(episode_index=epid,chunk_index=int(ep['data/chunk_index']),file_index=int(ep['data/file_index']))
-    labels=pq.read_table(data,columns=['frame_index','task_index'],filters=[('episode_index','=',epid)]).sort_by('frame_index').to_pydict()
+    data=episode_data_path(root,info,ep)
+    columns=['frame_index','task_index']+(['source_frame_index'] if sub['family']=='mecka' else [])
+    table,data_files=read_episode_table(root,info,ep,columns)
+    labels=table.to_pydict()
     if labels['frame_index']!=list(range(n)) or len(set(labels['task_index']))!=1:raise ValueError('task must have dense frames and one episode-level instruction')
     instruction=task_text(root,labels['task_index'][0]);prefix='videos/'+head+'/'
     video=root/info['video_path'].format(video_key=head,chunk_index=int(ep[prefix+'chunk_index']),file_index=int(ep[prefix+'file_index']))
-    images,alignment=decode_frames(video,float(ep[prefix+'from_timestamp']),fps,[anchor,goal],sequential=sub['family']=='mecka')
+    from openwam.dataloader.video_alignment import mecka_video_ordinals
+    ordinals=mecka_video_ordinals(labels,ep) if sub['family']=='mecka' else None
+    images,alignment=decode_frames(video,float(ep[prefix+'from_timestamp']),fps,[anchor,goal],
+        sequential=sub['family']=='mecka',video_ordinals=ordinals)
     fields=[k for k in pq.ParquetFile(data).schema_arrow.names if k.startswith(('observation.states.','states.','source.','canonical.'))]
-    rr=pq.read_table(data,columns=['frame_index']+fields,filters=[('episode_index','=',epid),('frame_index','=',goal)]).to_pylist()
+    rr=read_episode_rows(dict(data=data,data_files=data_files),epid,columns=['frame_index']+fields,filters=[('frame_index','=',goal)]).to_pylist()
     if len(rr)!=1:raise ValueError('nonunique geometry row')
     row=rr[0];eligible,qa=camera_eligibility(sub['family'],root,epid)
     endpoint=goal_source_tcp(sub['family'],row,tcp_from_eef=recorded_tcp_transform(sub['family'],info))
@@ -43,7 +49,7 @@ def rebuild_task_for_release(task,sub,out):
     return {**task,'source_repo':str(root),'source_episode_length':n,'anchor_source_frame':anchor,'goal_source_frame':goal,
         'clip_start':task['clip_start'],'clip_end_exclusive':task['clip_end_exclusive'],'instruction_start':0,'instruction_end_exclusive':n,'instruction':instruction,
         'observed_image_path':str(folder/'observed.png'),'goal_image_path':str(folder/'goal.png'),'target_path':str(folder/'targets.npz'),
-        'provenance':clean_json(dict(source_parquet=str(data),goal_source_frame=goal,observed_video=alignment[anchor],goal_video=alignment[goal],
+        'provenance':clean_json(dict(source_parquet=str(data),source_parquets=[str(p) for p in data_files],goal_source_frame=goal,observed_video=alignment[anchor],goal_video=alignment[goal],
             source_video=str(video),source_info_sha256=sha(root/'meta/info.json'),endpoint=endpoint,camera=cam_meta,
             calibration_eligibility_record=qa,missing_reasons=endpoint['missing_reasons']+cam_meta['missing_reasons'],
             geometry_review_status='pending_review',release_choice='same annotated release as paired subtasks'))}

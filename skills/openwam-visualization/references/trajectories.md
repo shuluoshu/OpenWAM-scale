@@ -43,6 +43,25 @@ pixel = project_model(K_t, distortion_t, T_camera_world(t) @ p_world(k))
 - URDF零位inv(T_base_flange)@T_base_tcp只能在相对链固定时作常量；穿过夹爪可动关节要逐cfg FK。具名gripper_center未必是接触TCP。核对joint顺序、mimic和末端轴。
 - 第k项（k从0开始）joint relative为q[t+k+1]-q[t]。FK前按该stats反归一化，加q[t]，再转真实基座/工具链，对同端点GT报告位置m/mm和旋转角度。
 
+## TCP 偏离夹爪中心时
+
+先判断点的来源，不能见到偏移就加工具长度：
+
+| 点的来源 | 可核验路径 | 偏离时应检查 |
+|---|---|---|
+| Stage1 预测 | `decode_tcp_patch` → 归一化 UV → `stage1_tcp_report.py`，当前320×256用 `[319,255]` | 是学到的二维输出。GT0时没有可信误差基准，离夹爪很远可能是模型预测错误；这里没有可“修正”的相机外参。保留预测原值。 |
+| GT 端点 | `scripts/data/trajectory_projection.py::goal_source_tcp` → `project_goal_tcp`；源字段、mask、相机及端点变换 | 确认 source EEF 是腕/法兰/工具/TCP，接触中心是否需要特定变换；检查目标帧、K/E方向、畸变、pixel-center resize/crop。 |
+| Stage2 direct | 原生表示和反归一化 → 观测锚点 → `stage12_projection.py` | 相对坐标基准、源 mask、动作步对齐、每帧相机、TCP变换是否一致；未训练/无统计的通道不能当物理预测。 |
+| Stage2 FK | `native_stage2_profiles.py` + 匹配URDF/关节顺序/工具变换 → 相机 | 不能把末端link原点直接称为指尖接触中心；检查夹爪可动/mimic链及工具坐标轴。 |
+
+每例列出实际 `definition_id`、`used_fields`、`transforms`、missing reasons 和相机/标定状态。人手 pinch midpoint、手持采集设备TCP、机器人法兰、夹爪接触中点不是一个概念；名称不能全部改成“夹爪中心”。如果用户要求机器人指垫间接触中点，需证明当前定义确实对应它，否则标未验证。
+
+**旧修正的适用范围**：先读当前 `scripts/data/tcp_endpoint_policy.py`。RoboDojo/RobotWin 的+X0.12m是指定源的目视接受定义；部分 Agi +X0.20m 是限定任务/embodiment 的报告预览，不能迁移到 RoboMind、RoboChallenge 或其他型号，也不能反向加到 Stage1 二维预测。Genrobot 的设备端点变换等训练/原生链以 `goal_source_tcp`、`recorded_tcp_transform` 和 `native_stage2_profiles.py` 的实际当前配置为准。核对来源、版本、frame、单位、offset是否已经应用，防止重复平移。
+
+验收分三层：①独立数学实现（如OpenCV或单独相机模型公式）对照原始字段，定位计算错误；②在同源、同帧、同尺寸真实图上单独显示GT，核对端点定义和接触位置；③模型预测与这个GT比较。第一层相等只说明数值自洽，不代表第二层通过。source-anchor拟合、复用同一投影helper重算、marker像素存在，都不能单独证明物理标定正确。
+
+修正经证实的来源/变换/resize错误后，重建受影响报告全部案例和快照；如果标签或训练输入也受影响，明确列出缓存/checkpoint影响并按已授权范围处理。展示修复不能掩盖旧模型学到了错误标签。未经证实的像素平移不作为“夹爪中心修正”。
+
 ## ABC真移动腕视频
 
 完整历史驱动在outputs/curated_smoke_20261010/comparison/：

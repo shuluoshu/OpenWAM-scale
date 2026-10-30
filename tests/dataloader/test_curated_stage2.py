@@ -153,6 +153,29 @@ def test_dataset_native_short_windows_clean_head_and_missing_views(tmp_path,monk
     assert a['report_target']['goal_source_frame']>=anchor
 
 
+def test_native_episode_reads_all_parquet_parts(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from openwam.dataloader.curated_stage2 import CuratedStage2Dataset
+    selection=make_native_source(tmp_path)
+    root=tmp_path/'source/interndata_a1/unit'
+    info=json.loads((root/'meta/info.json').read_text())
+    info['data_path']='data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet'
+    (root/'meta/info.json').write_text(json.dumps(info))
+    rows=pq.read_table(root/'data/episode-0.parquet').to_pylist()
+    paths=[]
+    for chunk,a,b in [(0,0,10),(1,10,24)]:
+        path=root/f'data/chunk-{chunk:03d}/file-000.parquet';path.parent.mkdir()
+        pq.write_table(pa.Table.from_pylist(rows[a:b]),path);paths.append(path)
+    (root/'data/episode-0.parquet').unlink()
+    d=CuratedStage2Dataset(selection)
+    m=d._episode(d.repos[0],0)
+    assert tuple(m['data_files'])==tuple(paths)
+    np.testing.assert_array_equal(m['columns']['frame_index'],np.arange(24))
+    assert m['columns']['states.left_tcp_to_robot_pose'][-1,0]==pytest.approx(.23)
+    assert m['subtasks'][-1]['end_exclusive']==18
+
+
 def test_dataset_selection_split_and_stats_provenance(tmp_path):
     from openwam.dataloader.curated_stage2 import CuratedStage2Dataset
     from openwam.dataloader.native_stage2_stats import prepare_native_stats
@@ -462,3 +485,34 @@ def test_prefixed_mask_implementation_registry_requires_repreparation(tmp_path):
     raw=json.dumps(payload,sort_keys=True,separators=(',',':')).encode()
     old=tmp_path/('registry-'+hashlib.sha256(raw).hexdigest()+'.json');old.write_bytes(raw)
     with pytest.raises(ValueError,match='fingerprint_mismatch'):CuratedStage2Dataset(selection,normalization_registry=old)
+
+
+def test_stage2_history_head_only_range_and_per_draw_seed(tmp_path,monkeypatch):
+    import torch
+    from PIL import Image
+    from openwam.dataloader.curated_stage2 import CuratedStage2Dataset
+    from openwam.dataloader.native_stage2_stats import prepare_native_stats
+    selection=make_native_source(tmp_path)
+    base=CuratedStage2Dataset(selection)
+    registry=prepare_native_stats(base,tmp_path/'stats',max_episodes_per_profile=1,max_windows_per_profile=4)
+    dataset=CuratedStage2Dataset(selection,normalization_registry=registry,history={'enabled':True})
+    repo,episode,m,option,anchor,level=dataset._draw(4)
+    monkeypatch.setattr(dataset,'_decode_views',lambda m,indices:([{'observation.images.cam_high':Image.new('RGB',(40,32))} for _ in indices],{}))
+    m['columns']['canonical.frame_valid']=np.ones(m['length'])
+    m['columns']['training.valid']=np.ones(m['length'])
+    m['columns']['canonical.frame_valid'][0]=0
+    m['columns']['training.valid'][1]=np.nan
+    calls=[]
+    def materialize(root,info,ep,head,anchor,start,config,rng,training,**kwargs):
+        np.testing.assert_array_equal(kwargs['source_valid'][:3],[False,False,True])
+        calls.append((head,anchor,start,float(rng.random()),training))
+        return dict(history_images=torch.zeros(10,3,1,256,320),history_ages=torch.zeros(10),history_valid=torch.zeros(10,dtype=torch.bool)),dict(indices=[-1]*10)
+    monkeypatch.setattr('openwam.dataloader.curated_stage2.materialize_head_history',materialize)
+    a=dataset._sample_selected(repo,episode,m,option,anchor,level,draw_id=1)
+    b=dataset._sample_selected(repo,episode,m,option,anchor,level,draw_id=2)
+    assert a['history_images'].shape==(10,3,1,256,320)
+    assert a['history_valid'].dtype==torch.bool
+    assert calls[0][:3]==('observation.images.cam_high',anchor,option['selected_start'])
+    assert calls[0][3]!=calls[1][3] and calls[0][4]
+    assert a['prompt']==option['instruction']['text']
+    assert a['trace']['head_history']['indices']==[-1]*10

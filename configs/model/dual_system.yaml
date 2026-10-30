@@ -19,6 +19,7 @@ freeze:
 architecture:
   framework: dual_system
   variant: joint_self_attn   # joint_self_attn | joint_cross_attn | idm
+  future_video_mode: joint   # joint | none (TI2V joint_self_attn: current observation + action only)
 
   action_dim: 80             # 80 = unified action space (unify_action=true); raw width otherwise (e.g. robotwin eef=20, joint=14)
   use_proprioception: true   # true = dataloader must provide sample["proprio"], appended as one proprio token

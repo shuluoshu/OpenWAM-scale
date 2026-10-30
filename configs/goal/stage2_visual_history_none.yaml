@@ -1,0 +1,12 @@
+# @package _global_
+# Same frozen C* teacher and native actions; no future video denoising target.
+defaults:
+  - stage2_visual_history_joint
+  - _self_
+model:
+  architecture:
+    future_video_mode: none
+training:
+  lambda_video: 0.0
+project:
+  name: openwam-stage2-visual-history-none

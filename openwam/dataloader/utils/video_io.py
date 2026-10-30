@@ -15,6 +15,7 @@ import logging
 from typing import Dict, List, Optional
 
 from PIL import Image
+from openwam.dataloader.utils.video_color import canonical_video_rgb
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +104,7 @@ def decode_video_frames(video_path: str, frame_indices: List[int], height: int, 
                     continue
                 abs_idx = int(round(frame.pts / pts_per_frame))
                 if abs_idx in target:
-                    idx_map[abs_idx] = frame.to_image()
+                    idx_map[abs_idx] = canonical_video_rgb(frame.to_image(), video_path)
                 if abs_idx >= max_idx:
                     break
             # PTS rounding can drift ±1; if any target missed, fall back to
@@ -128,7 +129,7 @@ def decode_video_frames(video_path: str, frame_indices: List[int], height: int, 
         if not seeked:
             for i, frame in enumerate(container.decode(stream)):
                 if i in target:
-                    idx_map[i] = frame.to_image()
+                    idx_map[i] = canonical_video_rgb(frame.to_image(), video_path)
                 if i >= max_idx:
                     break
     finally:

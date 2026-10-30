@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from openwam.dataloader.head_history import HistorySamplingConfig, materialize_head_history
 from openwam.dataloader.curated_goal import parse_curated_yaml
 from openwam.dataloader.native_stage2_profiles import fingerprint
 from openwam.dataloader.native_stage2_io import ByteLRU, load_episode, window_options, merge_source_masks, source_frame_validity
@@ -22,9 +23,10 @@ class CuratedStage2Dataset(Dataset):
     """
     def __init__(self,source_yaml,*,data_root=None,seed=42,normalization_registry=None,
                  split='train',max_cached_episodes=2,max_cache_bytes=256*1024*1024,
-                 observation_augmentation=None,gripper_state_filter=None,draws_per_epoch=100000):
-        self.selection=parse_curated_yaml(source_yaml,data_root);self.repos=self.selection['repos']
+                 observation_augmentation=None,gripper_state_filter=None,draws_per_epoch=100000,history=None,path_aliases=None):
+        self.selection=parse_curated_yaml(source_yaml,data_root,path_aliases);self.repos=self.selection['repos']
         self.seed=int(seed);self.split=split;self.draws_per_epoch=int(draws_per_epoch)
+        self.history=history if isinstance(history,HistorySamplingConfig) else HistorySamplingConfig(**(history or {}))
         self.source_yaml_sha256=hashlib.sha256(Path(source_yaml).read_bytes()).hexdigest()
         self.filter_config=filter_config(gripper_state_filter)
         self._cache=ByteLRU(max_cached_episodes,max_cache_bytes)
@@ -51,7 +53,7 @@ class CuratedStage2Dataset(Dataset):
         source=get_cfg(config,'source_yaml') if split=='train' else get_cfg(config,'evaluation_source_yaml')
         if not source:raise ValueError('explicit source_yaml required' if split=='train' else 'independent evaluation_source_yaml required')
         keys=('data_root','seed','normalization_registry','max_cached_episodes','max_cache_bytes',
-              'observation_augmentation','gripper_state_filter','draws_per_epoch')
+              'observation_augmentation','gripper_state_filter','draws_per_epoch','history','path_aliases')
         kwargs={k:get_cfg(config,k) for k in keys if get_cfg(config,k) is not None}
         if split!='train':
             stats=get_cfg(config,'evaluation_normalization_registry')
@@ -134,7 +136,8 @@ class CuratedStage2Dataset(Dataset):
             # Native metadata carries the per-file start; decode verifies integral CFR ordinals.
             if prefix+'to_timestamp' in ep and float(ep[prefix+'to_timestamp'])<offset+(max(indices)+1)/fps-1/fps:
                 raise ValueError(f'{path}: invalid_segment_bounds/video_offset')
-            images,alignment=decode_frames(path,offset,fps,indices,sequential=m['profile']['family']=='mecka')
+            images,alignment=decode_frames(path,offset,fps,indices,sequential=m['profile']['family']=='mecka',
+                video_ordinals=m['video_ordinals'] if m['profile']['family']=='mecka' else None)
             for target,index in zip(views,indices):target[camera]=images[index]
             trace[camera]=dict(path=str(path),alignment=alignment)
         return views,trace
@@ -188,7 +191,7 @@ class CuratedStage2Dataset(Dataset):
             goal_observed_head=clean,goal_observed_multiview=clean_canvas,goal_view_valid=current_mask,goal_head_valid=head is not None and bool(frame_valid[0]),goal_seed=goal_seed,
             report_target=dict(goal_source_frame=instruction['end_exclusive']-1,label_kind=level+'_end',success_verified=False),
             trace=dict(identity=identity,draw_id=draw_id,source_repo=str(m['root']),episode=episode,anchor=anchor,last_source=option['last_source'],
-                source_parquet=str(m['data']),info_sha256=m['info_hash'],profile_id=m['profile']['profile_id'],
+                source_parquet=str(m['data']),source_parquets=[str(p) for p in m['data_files']],info_sha256=m['info_hash'],profile_id=m['profile']['profile_id'],
                 raw_action=raw,raw_action_mask=mask,raw_state=state,raw_state_mask=sm,
                 video_source_indices=video_indices.tolist(),video_alignment=alignment,
                 mask_reasons=m['profile']['mask_reasons']+(['head_calibration_ineligible'] if not m['head_calibration_eligible'] else []),
@@ -196,6 +199,14 @@ class CuratedStage2Dataset(Dataset):
                 selected_range=[option['selected_start'],option['selected_end_exclusive']],
                 goal_resize={'source_wh':list(head.size) if head else None,'destination_wh':[320,256]},
                 stats_registry=self.registry_path,normalization_population=stats['population']))
+        if self.history.enabled:
+            history_seed=int(fingerprint([goal_seed,'head_history',draw_id])[:15],16)
+            fields,history_trace=materialize_head_history(m['root'],m['info'],m['ep'],camera,anchor,
+                option['selected_start'],self.history,np.random.default_rng(history_seed),self.split=='train',
+                sequential=m['profile']['family']=='mecka',
+                source_valid=source_frame_validity(m['columns'],m['length']),
+                video_ordinals=m['video_ordinals'] if m['profile']['family']=='mecka' else None)
+            sample.update(fields);sample['trace']['head_history']=history_trace
         if m['fk']:
             sample['fk_supervision']=m['fk'].build(cols,raw,mask,state,sm,
                 {k:np.array(v) for k,v in stats['action'].items() if k!='count'},'quantile',32)
@@ -206,6 +217,8 @@ class CuratedStage2Dataset(Dataset):
             sample=self.augmentation.apply(sample,missing)
         finally:
             random.setstate(old_random);np.random.set_state(old_np);torch.random.set_rng_state(old_torch)
+        from openwam.dataloader.utils.video_color import stamp_stage2_color
+        stamp_stage2_color(sample)
         return sample
 
     def normalization_identity(self):

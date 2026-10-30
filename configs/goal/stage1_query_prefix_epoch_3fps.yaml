@@ -1,0 +1,2 @@
+base_config: stage1_query_prefix_epoch.yaml
+sample_fps: 3.0

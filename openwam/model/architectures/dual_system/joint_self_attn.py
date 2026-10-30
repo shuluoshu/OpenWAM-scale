@@ -211,6 +211,15 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         # pass False.
         pipeline_inputs.setdefault("force_per_token_t_mod", True)
         pipeline_inputs.setdefault("zero_clean_prefix_t_mod", True)
+        if self.future_video_mode == "none":
+            current = pipeline_inputs.get("first_frame_latents")
+            if current is None:
+                raise ValueError("future_video_mode='none' requires clean first_frame_latents")
+            if current.shape[2] != 1:
+                raise ValueError("action-only current observation must have one latent frame")
+            pipeline_inputs["latents"] = current
+            pipeline_inputs["num_frames"] = 1
+            pipeline_inputs["timestep"] = torch.zeros(current.shape[0], device=current.device, dtype=current.dtype)
         vstate = vb.prepare(
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
@@ -258,7 +267,7 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             )
-        return vb.finalize(vstate), ab.extract_prediction(astate)
+        return (None if self.future_video_mode == "none" else vb.finalize(vstate)), ab.extract_prediction(astate)
 
 
 __all__ = ["DualSystemSelfAttnArchitecture"]

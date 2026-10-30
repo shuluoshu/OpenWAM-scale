@@ -120,7 +120,7 @@ def _construct(spec):
     return getattr(importlib.import_module(module),name)(**spec.get('extra_kwargs',{}))
 
 
-def bootstrap_components(config, *, device, dtype):
+def bootstrap_components(config, *, device, dtype, validate_codec=True):
     """Build exactly DiT/VAE/text and tokenizer from baseline + explicit config."""
     components=config['components'];modules={}
     if set(components)!={'dit','vae','text_encoder'}:
@@ -140,8 +140,9 @@ def bootstrap_components(config, *, device, dtype):
     expert=GoalExpert(modules['dit'],GoalCodec(modules['vae']),dit_config=components['dit'].get('extra_kwargs',{}),
                       shift=config.get('shift',5.),use_gradient_checkpointing=config.get('gradient_checkpointing',True)).to(device=device,dtype=dtype)
     # Validate architecture and codec immediately, before any training data loop.
-    with torch.no_grad():
-        expert.codec.encode(torch.zeros(1,3,1,256,320,device=device,dtype=dtype))
+    if validate_codec:
+        with torch.no_grad():
+            expert.codec.encode(torch.zeros(1,3,1,256,320,device=device,dtype=dtype))
     if getattr(modules['text_encoder'],'dim',None)!=expert.dit.text_embedding[0].in_features:
         raise ValueError('bootstrap text encoder is incompatible with goal DiT')
     return expert,modules['text_encoder'],tokenizer

@@ -1,0 +1,12 @@
+# @package _global_
+# Current observation + predicted frozen Z -> action denoising. No future video.
+defaults:
+  - stage2_query_history_sample
+  - _self_
+model:
+  architecture:
+    future_video_mode: none
+training:
+  lambda_video: 0.0
+project:
+  name: openwam-stage2-z-action-sample

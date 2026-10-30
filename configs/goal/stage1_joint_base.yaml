@@ -1,4 +1,13 @@
 # Shared Stage 1: image and 4D TCP patch joint flow matching.
+model:
+  goal_representation: patch_denoise
+  query_goal:
+    num_image_tokens: 64
+    num_tcp_tokens: 2
+    dim: 512
+    num_heads: 8
+    num_layers: 4
+    ffn_dim: 2048
 baseline_checkpoint: ${oc.env:OPENWAM_BASELINE_CHECKPOINT,models/openwam_alpha_v0.1/checkpoint.safetensors}
 shift: 5.0
 dtype: bfloat16

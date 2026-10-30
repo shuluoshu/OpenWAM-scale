@@ -64,32 +64,56 @@ def camera_eligibility(family,root,episode):
     return bool(record and record.get('broadcast_qa_status')=='passed'),record
 
 
-def decode_frames(path,offset_s,fps,indices,*,sequential=False):
-    """Exact CFR PTS seeks; VFR/Mecka uses full decoded ordinal from first PTS."""
+def decode_frames(path,offset_s,fps,indices,*,sequential=False,video_ordinals=None):
+    """Exact CFR PTS seeks, or sequential presentation ordinals for VFR.
+
+    video_ordinals maps episode row indices to explicit raw-video frame indices.
+    Sequential decoding never estimates a frame number from nominal FPS or PTS.
+    """
     import av
+    from itertools import chain
+    if sequential and offset_s!=0:
+        raise ValueError('VFR nonzero time offset needs an explicit ordinal origin')
+    if video_ordinals is not None and not sequential:
+        raise ValueError('explicit video ordinals require sequential decode')
     indices=sorted(set(indices));base=offset_s*fps
     if abs(base-round(base))>1e-3:raise ValueError('nonintegral video offset')
     base=round(base);requested={base+i:i for i in indices};images={};alignment={}
+    if video_ordinals is not None:
+        try:ordinals=[video_ordinals[i] for i in indices]
+        except (KeyError,IndexError) as exc:raise ValueError('incomplete explicit video ordinal mapping') from exc
+        if (any(isinstance(v,(bool,np.bool_)) or not isinstance(v,(int,np.integer)) or v<0 for v in ordinals)
+                or any(a>=b for a,b in zip(ordinals,ordinals[1:]))):
+            raise ValueError('explicit video ordinals must be nonnegative increasing integers')
+        requested={int(v):i for i,v in zip(indices,ordinals)}
     with av.open(str(path)) as container:
         stream=container.streams.video[0];stream.codec_context.thread_count=2
-        if abs(float(stream.average_rate)-fps)>1e-4:raise ValueError('source/video FPS mismatch')
-        first=next(container.decode(stream));first_pts=first.pts;tb=float(stream.time_base)
+        # average_rate is a container timing statistic, not an ordinal contract.
+        # Only the CFR path derives ordinals from FPS and must match that rate.
+        if not sequential and (stream.average_rate is None or abs(float(stream.average_rate)-fps)>1e-4):
+            raise ValueError('source/video FPS mismatch')
+        decoded=container.decode(stream)
+        first=next(decoded);first_pts=first.pts;tb=float(stream.time_base)
         if first_pts is None:raise ValueError('missing first PTS')
         def save(frame,ordinal,method):
-            index=requested[ordinal];images[index]=frame.to_image().convert('RGB')
+            from openwam.dataloader.utils.video_color import canonical_video_rgb, video_color_policy
+            index=requested[ordinal];raw=frame.to_image().convert('RGB')
+            images[index]=canonical_video_rgb(raw,path)
             alignment[index]=dict(source_frame_index=index,video_ordinal=ordinal,pts=frame.pts,
                 first_pts=first_pts,time_base=str(stream.time_base),pts_seconds=frame.pts*tb,
                 offset_seconds=offset_s,offset_frames=base,decode_method=method,native_wh=list(images[index].size),
-                source_rgb_sha256=hashlib.sha256(np.asarray(images[index]).tobytes()).hexdigest())
+                ordinal_mapping=('explicit_source_frame_index' if video_ordinals is not None else 'episode_frame_index'),
+                source_fps=fps,video_average_rate=str(stream.average_rate),
+                source_rgb_sha256=hashlib.sha256(np.asarray(images[index]).tobytes()).hexdigest(),
+                decoded_rgb_sha256=hashlib.sha256(np.asarray(raw).tobytes()).hexdigest(),
+                image_color_policy=video_color_policy(path))
         if sequential:
-            if base!=0:raise ValueError('VFR nonzero time offset needs an explicit ordinal mapping')
-            container.seek(first_pts,stream=stream,backward=True)
-            ordinal=0
-            for frame in container.decode(stream):
-                if frame.pts<first_pts:continue
+            # Count every decoded frame from stream start, including the first;
+            # do not seek, round timestamps, or discard frames on a PTS filter.
+            for ordinal,frame in enumerate(chain((first,),decoded)):
+                if frame.pts is None:raise ValueError('missing decoded PTS')
                 if ordinal in requested:save(frame,ordinal,'sequential_decoded_ordinal')
                 if ordinal>=max(requested):break
-                ordinal+=1
         else:
             remaining=set(requested)
             while remaining:
@@ -122,14 +146,17 @@ def read_selection(reference):
 
 
 def prepare_episode(selection,out):
+    from openwam.dataloader.episode_data import episode_data_path,read_episode_table,read_episode_rows
     family=selection['family'];root=Path(selection['repo']);episode=selection['episode'];head=selection['camera']
     folder=out/'episodes'/selection['id'];folder.mkdir(parents=True,exist_ok=True)
     info_path=root/'meta/info.json';info=json.loads(info_path.read_text());ep=read_episode(root,episode);n=int(ep['length']);fps=float(info['fps'])
-    data=root/info['data_path'].format(episode_index=episode,chunk_index=int(ep['data/chunk_index']),file_index=int(ep['data/file_index']))
+    data=episode_data_path(root,info,ep)
     names=pq.ParquetFile(data).schema_arrow.names
     cols=['frame_index','task_index','subtask_index']
+    if family=='mecka':cols+=['source_frame_index']
     if 'subtask_unannotated' in names:cols.append('subtask_unannotated')
-    labels=pq.read_table(data,columns=cols,filters=[('episode_index','=',episode)]).sort_by('frame_index').to_pydict()
+    table,data_files=read_episode_table(root,info,ep,cols)
+    labels=table.to_pydict()
     ann_path=root/'meta/sub_tasks.parquet';annotations=pq.read_table(ann_path,filters=[('episode_index','=',episode)]).to_pylist()
     segments=contiguous_subtasks(labels,annotations,n)
     if 'reference_segments' in selection:
@@ -146,10 +173,12 @@ def prepare_episode(selection,out):
     prefix='videos/'+head+'/'
     video=root/info['video_path'].format(video_key=head,chunk_index=int(ep[prefix+'chunk_index']),file_index=int(ep[prefix+'file_index']))
     offset=float(ep[prefix+'from_timestamp'])
-    images,alignment=decode_frames(video,offset,fps,indices,sequential=family=='mecka')
+    from openwam.dataloader.video_alignment import mecka_video_ordinals
+    ordinals=mecka_video_ordinals(labels,ep) if family=='mecka' else None
+    images,alignment=decode_frames(video,offset,fps,indices,sequential=family=='mecka',video_ordinals=ordinals)
     projection_fields=[k for k in names if k.startswith(('observation.states.','states.','source.','canonical.'))]
-    values=pq.read_table(data,columns=['frame_index']+projection_fields,
-        filters=[('episode_index','=',episode),('frame_index','in',sorted(indices))]).to_pylist()
+    values=read_episode_rows(dict(data=data,data_files=data_files),episode,columns=['frame_index']+projection_fields,
+        filters=[('frame_index','in',sorted(indices))]).to_pylist()
     by_frame={int(r['frame_index']):r for r in values}
     if len(by_frame)!=len(indices):raise ValueError('geometry frame row mismatch')
     transforms=recorded_tcp_transform(family,info);eligible,qa=camera_eligibility(family,root,episode)
@@ -185,7 +214,7 @@ def prepare_episode(selection,out):
             observed_image_path=str((assets/'observed.png').relative_to(out)),goal_image_path=str((assets/'goal.png').relative_to(out)),
             target_path=str((assets/'targets.npz').relative_to(out)),episode_id=selection['id'],
             sampling_weight_within_episode=1/len(selected),
-            provenance=dict(goal_source_frame=goal,source_parquet=str(data),source_parquet_size=data.stat().st_size,
+            provenance=dict(goal_source_frame=goal,source_parquet=str(data),source_parquets=[str(p) for p in data_files],source_parquet_size=data.stat().st_size,
                 source_repo_resolved=str(root.resolve()),source_info_sha256=sha(info_path),annotation_file=str(ann_path),annotation_sha256=sha(ann_path),
                 frame_labels_sha256=hashlib.sha256(json.dumps(labels,sort_keys=True).encode()).hexdigest(),
                 source_goal_geometry_sha256=hashlib.sha256(json.dumps(clean_json(row),sort_keys=True).encode()).hexdigest(),

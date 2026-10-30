@@ -25,6 +25,10 @@ def main(argv=None):
     parser.add_argument('--dtype',choices=['float32','bfloat16'])
     parser.add_argument('--steps',type=int)
     parser.add_argument('--seed',type=int,default=42)
+    parser.add_argument('--goal-representation', choices=['patch_denoise', 'query_latent', 'visual_history_masked_sa'],
+                        help='override model.goal_representation')
+    for key in ('num_image_tokens', 'num_tcp_tokens', 'dim', 'num_heads', 'num_layers', 'ffn_dim'):
+        parser.add_argument('--query-' + key.replace('_', '-'), type=int, default=None)
     parser.add_argument('--tokenizer-path',help='explicit tokenizer directory override')
     parser.add_argument('--init-goal-checkpoint',help='explicit checked v1 head -> multiview initialization; fresh optimizer')
     args=parser.parse_args(argv)
@@ -34,9 +38,39 @@ def main(argv=None):
     if args.source_yaml and not Path(args.source_yaml).is_absolute():parser.error('--source-yaml must be absolute')
     if args.init_goal_checkpoint and args.preflight:parser.error('--init-goal-checkpoint requires --train or --smoke')
     config=load_config(args.config,source_yaml=args.source_yaml,data_root=args.data_root)
+    model = config.setdefault('model', {})
+    if args.goal_representation:
+        model['goal_representation'] = args.goal_representation
+    representation = model.get('goal_representation', 'patch_denoise')
+    query_options = model.setdefault('query_goal', {})
+    for key in ('num_image_tokens', 'num_tcp_tokens', 'dim', 'num_heads', 'num_layers', 'ffn_dim'):
+        value = getattr(args, 'query_' + key)
+        if value is not None:
+            if representation != 'query_latent':
+                parser.error('--query-* settings require query_latent')
+            query_options[key] = value
+    if representation == 'query_latent':
+        from openwam.model.goal.query_expert import QueryConfig
+        QueryConfig(**query_options)
+        if args.init_goal_checkpoint:
+            parser.error('legacy --init-goal-checkpoint cannot initialize query_latent topology')
+    if representation=='visual_history_masked_sa' and args.init_goal_checkpoint:
+        parser.error('legacy --init-goal-checkpoint cannot initialize visual_history_masked_sa topology')
     observation_mode=config.get('observation_mode','head')
     flow_settings=dict(shift=config.get('shift',5.),lambda_image=config.get('lambda_image',.5),
                        lambda_tcp=config.get('lambda_tcp',1.))
+    def build_expert(dit, codec, dit_config, **kwargs):
+        from openwam.model.goal.patch_expert import PatchGoalExpert
+        if representation=='visual_history_masked_sa':
+            from openwam.model.goal.visual_history import VisualHistoryGoalExpert
+            return VisualHistoryGoalExpert(dit,codec,dit_config=dit_config,**model.get('visual_history',{}),**kwargs)
+        if representation == 'query_latent':
+            from openwam.model.goal.query_expert import QueryGoalExpert
+            return QueryGoalExpert(dit, codec, dit_config=dit_config, query_config=query_options,
+                history_config=model.get('query_history'),
+                conditioning_mode=model.get('query_conditioning', 'legacy_text'),
+                **kwargs)
+        return PatchGoalExpert(dit, codec, dit_config=dit_config, **kwargs)
     if args.init_goal_checkpoint and observation_mode!='multiview':
         parser.error('--init-goal-checkpoint requires a multiview config')
     output=Path(args.output_dir)
@@ -51,15 +85,26 @@ def main(argv=None):
                 observation_mode=observation_mode,text_dim=expert.dit.text_embedding[0].in_features,
                 precomputed_text_fingerprint=fingerprint,device=args.device or 'cpu',**flow_settings)
         else:
-            expert=PatchGoalExpert(expert.dit,expert.codec,dit_config=expert.dit_config,
+            expert=build_expert(expert.dit,expert.codec,dit_config=expert.dit_config,
                 observation_mode=observation_mode,**flow_settings)
+        smoke_dtype = getattr(torch, args.dtype or 'float32')
+        expert.to(device=args.device or 'cpu', dtype=smoke_dtype)
+        expert.codec.vae.to(device=args.device or 'cpu', dtype=smoke_dtype)
         records[0].update(metric_key='synthetic:task:0',granularity='task')
+        if representation=='visual_history_masked_sa' or getattr(getattr(expert,'history_config',None),'enabled',False):
+            for batch in batches:
+                b=len(batch['observed'])
+                batch.update(history_images=torch.zeros(b,10,3,1,256,320),
+                    history_ages=torch.arange(10,0,-1).float().expand(b,-1).clone(),
+                    history_valid=torch.ones(b,10,dtype=torch.bool))
         class SyntheticDataset:
             def evaluation_samples(self):return list(zip(records,batches))
             def sample(self,step):return records[0],batches[0]
             def scope_summary(self):return dict(synthetic=True,families=['synthetic'],observation_mode=observation_mode)
         result=train_curated(expert,dataset=SyntheticDataset(),context_cache=None,output_dir=output,
             steps=args.steps if args.steps is not None else 2,eval_every=500,sampling_steps=2,learning_rate=.001,seed=args.seed,
+            history_learning_rate=config.get('history_learning_rate',1e-4),
+            condition_learning_rate=config.get('condition_learning_rate'),
             precomputed_text_fingerprint=fingerprint,
             training_metadata=dict(synthetic_diagnostic=True,real_wan_blocks=True,config=config))
     else:
@@ -97,7 +142,7 @@ def main(argv=None):
                     use_gradient_checkpointing=config.get('gradient_checkpointing',True),**flow_settings)
                 expert.to(device=device,dtype=dtype)
             else:
-                expert=PatchGoalExpert(original.dit,original.codec,dit_config=original.dit_config,
+                expert=build_expert(original.dit,original.codec,dit_config=original.dit_config,
                     **flow_settings,
                     use_gradient_checkpointing=config.get('gradient_checkpointing',True),
                     observation_mode=observation_mode).to(device=device,dtype=dtype)
@@ -111,6 +156,8 @@ def main(argv=None):
                 return encode_text([prompt],tokenizer=tokenizer,text_encoder=text_encoder,device=text_device)
             cache=TextContextCache(encode,max_entries=config.get('text_cache_size',32))
             result=train_curated(expert,dataset=dataset,context_cache=cache,output_dir=output,
+                history_learning_rate=config.get('history_learning_rate',1e-4),
+                condition_learning_rate=config.get('condition_learning_rate'),
                 steps=args.steps if args.steps is not None else config['max_steps'],eval_every=config.get('eval_every',500),
                 sampling_steps=config.get('sampling_steps',20),learning_rate=config['learning_rate'],seed=args.seed,
                 dependency_identities=identities,dependency_metadata=dict(components=config['components'],tokenizer=config['tokenizer']),

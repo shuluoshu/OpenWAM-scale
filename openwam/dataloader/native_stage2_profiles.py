@@ -21,6 +21,8 @@ def names(feature):
 
 
 def resolve_native_profile(repo, info):
+    from openwam.dataloader.posttrain_physical import is_posttrain_native, resolve_posttrain_profile
+    if is_posttrain_native(info):return resolve_posttrain_profile(repo,info)
     family=repo.split('/')[0]; f=info['features']; m=info.get('starvla_metadata',{})
     if family not in HEAD_CAMERAS:raise ValueError(f'{repo}: unsupported_family')
     robot=m.get('robot_type',m.get('canonical_robot_type',m.get('embodiment',family)))
@@ -74,6 +76,17 @@ def resolve_native_profile(repo, info):
                 source=dict(key=key,index=index,provenance='native metadata declares 0=closed,1=open');break
         if source:rep['gripper_state_sources'][side]=source
     if len(rep['gripper_state_sources'])<2:reasons.append('unverified_gripper_state')
+    if family=='Genrobot':
+        required={'source':'genrobot','device_type':'ego_finger',
+                  'eef_anchor':'finger_device_base_link','eef_coordinate_frame':'world'}
+        if any(m.get(k)!=v for k,v in required.items()) or f.get('observation.states.eef',{}).get('shape')!=[20]:
+            raise ValueError(f'{repo}: unverified_genrobot_tcp: require dual world-frame finger_device_base_link EEF')
+        # Audited finger-device endpoint, matching trajectory_projection.goal_source_tcp
+        # and outputs/fk_consistency/genrobot_wrist_audit/audit.json. TCP axes inherit
+        # the finger-device frame; this is not a human fingertip landmark and does
+        # not infer controller-command gripper semantics or physical calibration.
+        transform=np.eye(4);transform[:3,3]=[.1015,-.0003,-.0398]
+        rep['tcp_from_eef']={side:transform.tolist() for side in SIDES}
     if family=='interndata_a1':
         rep['tcp_pose_keys']={s:f'states.{s}_tcp_to_robot_pose' for s in SIDES if f'states.{s}_tcp_to_robot_pose' in f}
         rep['tcp_reference_to_world_key']='states.robot_to_env_pose'

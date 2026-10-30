@@ -1,0 +1,10 @@
+# C: Wan clean-query prefix with joint image/TCP denoising.
+base_config: stage1_query_history_3000h.yaml
+model:
+  query_conditioning: prefix_self_attention
+condition_learning_rate: 1.0e-4
+history_learning_rate: 1.0e-4
+baseline_checkpoint: ${oc.env:OPENWAM_BASELINE_CHECKPOINT,/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/curated_gripper_human_20261014/gripper_human_aug_lr0.0001_b320/checkpoints/2026-10-15_21-16-09/checkpoint_step_1000.safetensors}
+dataset:
+  source_yaml: ${oc.env:OPENWAM_SOURCE_YAML,/mnt/data/cpfs/b5/yeqingda/pretrain/launch/moravla/train_files/pretrain_v0_3_curated_3000h.yaml}
+  cache_dir: ${oc.env:OPENWAM_GOAL_CACHE,/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/stage1_query_prefix_3000h/cache}

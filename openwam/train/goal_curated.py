@@ -34,6 +34,41 @@ def load_config(path, *, source_yaml=None, data_root=None):
             config=OmegaConf.merge(read(filename.parent/base,seen|{filename}),config)
         return config
     config=OmegaConf.to_container(read(path,set()),resolve=True)
+    if config.get('optimizer_device','model') not in ('model','cpu'):
+        raise ValueError('optimizer_device must be model or cpu')
+    representation = config.get('model', {}).get('goal_representation', 'patch_denoise')
+    if representation not in ('patch_denoise', 'query_latent', 'visual_history_masked_sa'):
+        raise ValueError('unsupported model.goal_representation')
+    from openwam.model.goal.query_conditioning import CONDITIONING_MODES
+    conditioning=config.get('model',{}).get('query_conditioning','legacy_text')
+    if conditioning not in CONDITIONING_MODES:
+        raise ValueError('unsupported model.query_conditioning')
+    condition_lr=config.get('condition_learning_rate')
+    if representation!='query_latent' and (conditioning!='legacy_text' or condition_lr is not None):
+        raise ValueError('query conditioning requires query_latent')
+    if condition_lr is not None and (isinstance(condition_lr,bool) or not isinstance(condition_lr,(int,float)) or not math.isfinite(condition_lr) or condition_lr<=0):
+        raise ValueError('condition_learning_rate must be positive and finite')
+    if representation == 'query_latent':
+        from openwam.model.goal.query_expert import QueryConfig
+        QueryConfig(**config.get('model', {}).get('query_goal', {}))
+    from openwam.model.goal.history import HistoryConfig
+    from openwam.dataloader.head_history import HistorySamplingConfig
+    history=HistoryConfig(**config.get('model',{}).get('query_history',{}))
+    sampling=HistorySamplingConfig(**config.get('dataset',{}).get('history',{}))
+    visual=representation=='visual_history_masked_sa'
+    if history.enabled and representation!='query_latent' and not visual:
+        raise ValueError('history requires query_latent')
+    if not visual and (history.enabled,history.num_frames)!=(sampling.enabled,sampling.num_frames):
+        raise ValueError('model/dataset history configuration mismatch')
+    if visual:
+        if config.get('observation_mode')!='multiview' or not sampling.enabled:
+            raise ValueError('visual_history_masked_sa requires multiview and enabled dataset history')
+        from openwam.model.goal.visual_history import HistoryTokenPool
+        options=config.get('model',{}).get('visual_history',{})
+        if set(options)-{'num_history_tokens','pool_dim','pool_heads','adapter_block'}:
+            raise ValueError('unsupported visual history options')
+        # Validate pool dimensions without constructing the baseline model.
+        HistoryTokenPool(8,options.get('num_history_tokens',32),options.get('pool_dim',256),options.get('pool_heads',8))
     from openwam.model.goal.observation import OBSERVATION_MODES
     mode=config.get('observation_mode','head')
     if mode not in OBSERVATION_MODES or config.get('dataset',{}).get('observation_mode','head')!=mode:
@@ -45,6 +80,10 @@ def load_config(path, *, source_yaml=None, data_root=None):
             if section.get(key):
                 value=Path(os.path.expandvars(os.path.expanduser(str(section[key]))))
                 section[key]=str(value if value.is_absolute() else ROOT/value)
+    aliases=config.get('dataset',{}).get('path_aliases')
+    if isinstance(aliases,str):
+        value=Path(os.path.expandvars(os.path.expanduser(aliases)))
+        config['dataset']['path_aliases']=str(value if value.is_absolute() else ROOT/value)
     token=config.get('tokenizer',{}).get('kwargs',{})
     if token.get('name'):
         value=Path(os.path.expandvars(os.path.expanduser(token['name'])))
@@ -115,8 +154,12 @@ class TextContextCache:
 
 def prepare_batch(record,batch,*,device,dtype,context_cache=None):
     """Copy metadata and transfer this singleton only; retain FP32 UV precision."""
+    from openwam.dataloader.utils.video_color import validate_sample_color
+    validate_sample_color(record,batch)
     result=dict(batch)
     result['observed']=batch['observed'].to(device=device,dtype=dtype)
+    from openwam.model.goal.history import move_history
+    result.update(move_history(batch,device,dtype))
     if 'observed_view_valid' in batch:
         result['observed_view_valid']=batch['observed_view_valid'].to(device=device)
     target=batch['targets'].to(device=device)
@@ -176,15 +219,58 @@ def preflight(dataset,output_dir):
     return summary
 
 
+def goal_parameter_groups(expert, learning_rate, history_learning_rate, condition_learning_rate=None):
+    """Separate history/condition adapters without duplicating or thawing weights."""
+    if not math.isfinite(history_learning_rate) or history_learning_rate<=0:
+        raise ValueError('history_learning_rate must be positive and finite')
+    history=getattr(getattr(expert,'encoder',None),'history',None)
+    extra=[p for p in history.parameters() if p.requires_grad] if history is not None else []
+    if getattr(expert,'representation',None)=='visual_history_masked_sa':
+        extra=[p for module in (expert.history_pool,expert.visual_adapter) for p in module.parameters() if p.requires_grad]
+        if expert.history_gate.requires_grad:extra.append(expert.history_gate)
+    condition=[]
+    if condition_learning_rate is not None:
+        if isinstance(condition_learning_rate,bool) or not isinstance(condition_learning_rate,(int,float)) or not math.isfinite(condition_learning_rate) or condition_learning_rate<=0:
+            raise ValueError('condition_learning_rate must be positive and finite')
+        adapter=getattr(expert,'condition_projection',None)
+        if adapter is None:raise ValueError('condition_learning_rate requires a query condition adapter')
+        condition=[p for p in adapter.parameters() if p.requires_grad]
+    identities={id(p) for p in extra+condition}
+    groups=[dict(params=[p for p in expert.parameters() if p.requires_grad and id(p) not in identities],
+                 lr=learning_rate,name='goal')]
+    if extra:groups.append(dict(params=extra,lr=history_learning_rate,name='history'))
+    if condition:groups.append(dict(params=condition,lr=condition_learning_rate,name='condition'))
+    return groups
+
+
+def goal_bundle_spec(representation):
+    """Bind a representation to its portable asset and embedded metadata key."""
+    if representation=='visual_history_masked_sa':
+        from openwam.train.goal_visual_history import save_visual_history_bundle
+        return 'visual_history.safetensors','visual_history',save_visual_history_bundle
+    if representation=='query_latent':
+        from openwam.train.goal_query import save_query_bundle
+        return 'query_goal.safetensors','query_goal_bundle',save_query_bundle
+    if representation=='patch_denoise':
+        from openwam.train.goal_patch import save_patch_bundle
+        return 'patch_goal.safetensors','patch_goal_bundle',save_patch_bundle
+    raise ValueError('unsupported goal representation: '+str(representation))
+
+
 def train_curated(expert,*,dataset,context_cache,output_dir,steps=5000,eval_every=500,
                   sampling_steps=20,learning_rate=1e-5,seed=42,training_metadata=None,
-                  dependency_metadata=None,dependency_identities=None,precomputed_text_fingerprint=None):
+                  dependency_metadata=None,dependency_identities=None,precomputed_text_fingerprint=None,
+                  history_learning_rate=1e-4,condition_learning_rate=None):
     """Stream indexed samples; keep immutable evaluation directories and history."""
     from openwam.train.goal_overfit import FP32MasterAdamW,_write_json
     from openwam.train.goal_trainer import _seed
     from openwam.train.goal_patch import evaluate_patch,save_patch_bundle
     from openwam.train.goal_history import render_goal_history
+    from openwam.model.goal.history import history_kwargs
     require_single_process()
+    query = getattr(expert, 'representation', 'patch_denoise') == 'query_latent'
+    representation=getattr(expert,'representation','patch_denoise')
+    checkpoint_name,_,save_bundle=goal_bundle_spec(representation)
     if any(not isinstance(v,int) or v<1 for v in (steps,eval_every,sampling_steps)):raise ValueError('positive integer budgets required')
     if not math.isfinite(learning_rate) or learning_rate<=0:raise ValueError('positive finite learning rate required')
     output=_new_output(output_dir);started=time.monotonic()
@@ -197,8 +283,10 @@ def train_curated(expert,*,dataset,context_cache,output_dir,steps=5000,eval_ever
     _seed(seed)
     summary=dict(**(training_metadata or {}))
     summary.update(mode='stage1_joint_curated_streaming',status='running',steps=steps,completed_steps=0,
+        representation=representation, checkpoint=checkpoint_name,
         observation_mode=expert.observation_mode,initialization=getattr(expert,'initialization_metadata',None),
         eval_every=eval_every,sampling_steps=sampling_steps,seed=seed,learning_rate=learning_rate,
+        condition_learning_rate=condition_learning_rate,history_learning_rate=history_learning_rate,
         evaluations=[],scope=dataset.scope_summary(),evaluation_split='train',formal_generalization=False,
         success_verified=False,optimizer='FP32-master AdamW',single_process=True,
         records=[r for r,_ in fixed],valid_points_seen=0,
@@ -216,6 +304,8 @@ def train_curated(expert,*,dataset,context_cache,output_dir,steps=5000,eval_ever
             timeline=output/'timeline.html'
             timeline.write_text(timeline.read_text().replace('href="../index.html"','href="index.html"').replace('href="../g1_concept_and_plan.html"','href="method.html"'))
     (output/'method.html').write_text('<!doctype html><meta charset="utf-8"><h1>Stage A joint flow</h1><p>Clean observation and instruction condition shared Wan blocks. Terminal image and ordered TCP patch receive independent Gaussian noise and share sigma. TCP coordinates repeat 48 times; group means decode continuous UV without clamping. Both task/subtask supervision is weak. Frozen text uses a bounded CPU LRU. Single-process only; checkpoint reload/resume training is not implemented.</p>')
+    if query:
+        (output/'method.html').write_text('<!doctype html><meta charset="utf-8"><h1>Query latent Stage1</h1><p>Current observation and instruction condition learned image/TCP queries in one encoder forward. Only these tokens condition a training-only joint image/TCP flow decoder. Only masked joint image/TCP flow losses supervise the encoder; there is no direct readout head. All images and sampled points shown here are auxiliary joint-flow predictions. Stage2 loads only the frozen encoder, with no auxiliary generation. Single-process; Stage1 optimizer resume is not implemented.</p>')
     (output/'index.html').write_text('<!doctype html><meta charset="utf-8"><h1>Curated Stage A diagnostics</h1><a href="timeline.html">All evaluation steps</a> · <a href="inputs/index.html">Actual inputs and view masks</a> · <a href="inputs/manifest.json">Input provenance</a> · <a href="summary.json">Scope/config</a> · <a href="method.html">Method</a><p>Fixed bounded training examples; no held-out performance or task-success claim.</p>')
     def evaluate(step):
         event('evaluation_started',step=step)
@@ -229,13 +319,14 @@ def train_curated(expert,*,dataset,context_cache,output_dir,steps=5000,eval_ever
     publish(True)
     try:
         evaluate(0)
-        optimizer=FP32MasterAdamW([dict(params=list(expert.parameters()),lr=learning_rate)])
+        expert.train_stage_a()  # Establish active/frozen branches before filtering optimizer params.
+        optimizer=FP32MasterAdamW(goal_parameter_groups(expert,learning_rate,history_learning_rate,condition_learning_rate))
         for step in range(1,steps+1):
             _seed(seed+step);expert.train_stage_a();optimizer.zero_grad()
             record,cpu_batch=dataset.sample(step-1)
             batch=prepare_batch(record,cpu_batch,device=device,dtype=dtype,context_cache=context_cache)
             out=expert(batch['observed'],batch['context'],batch['targets'],context_lens=batch.get('context_lens'),
-                       observed_view_valid=batch.get('observed_view_valid'))
+                       observed_view_valid=batch.get('observed_view_valid'),**history_kwargs(batch))
             if not torch.isfinite(out['loss']):raise FloatingPointError('nonfinite training loss')
             out['loss'].backward()
             norm=torch.nn.utils.clip_grad_norm_(expert.parameters(),1.,error_if_nonfinite=True,foreach=False)
@@ -255,7 +346,7 @@ def train_curated(expert,*,dataset,context_cache,output_dir,steps=5000,eval_ever
             event('train_step',**last);publish()
             if step%eval_every==0 or step==steps:
                 evaluate(step)
-                save_patch_bundle(expert,output/'patch_goal.safetensors',training_metadata={**summary,'selected_step':step},
+                save_bundle(expert,output/checkpoint_name,training_metadata={**summary,'selected_step':step},
                     dependency_metadata=dependency_metadata,dependency_identities=dependency_identities,
                     precomputed_text_fingerprint=precomputed_text_fingerprint)
                 event('checkpoint_saved',step=step)

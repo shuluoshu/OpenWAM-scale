@@ -7,11 +7,20 @@ if [[ "$preset" != sample && "$preset" != 3000h ]] || [[ "$mode" != --preflight 
   exit 2
 fi
 shift 2
-goal_input="${STAGE2_GOAL_INPUT:-head}"
-case "$goal_input" in
-  head) config_prefix=stage2_joint ;;
-  multiview) config_prefix=stage2_multiview ;;
-  *) echo 'STAGE2_GOAL_INPUT must be head or multiview' >&2; exit 2 ;;
+representation="${GOAL_REPRESENTATION:-patch_denoise}"
+case "$representation" in
+  query_latent)
+    if [[ "${STAGE2_GOAL_INPUT:-multiview}" != multiview ]]; then
+      echo 'query launcher presets require STAGE2_GOAL_INPUT=multiview' >&2; exit 2
+    fi
+    config_prefix=stage2_query ;;
+  patch_denoise)
+    case "${STAGE2_GOAL_INPUT:-head}" in
+      head) config_prefix=stage2_joint ;;
+      multiview) config_prefix=stage2_multiview ;;
+      *) echo 'STAGE2_GOAL_INPUT must be head or multiview' >&2; exit 2 ;;
+    esac ;;
+  *) echo 'GOAL_REPRESENTATION must be patch_denoise or query_latent' >&2; exit 2 ;;
 esac
 : "${STAGE1_GOAL_CHECKPOINT:?Set STAGE1_GOAL_CHECKPOINT to the Stage1 patch bundle}"
 : "${STAGE2_BASELINE_CHECKPOINT:?Set STAGE2_BASELINE_CHECKPOINT to baseline weights/run directory}"

@@ -1,0 +1,13 @@
+# Unified native entry for one bounded Stage1 -> frozen Stage2 arm.
+# For the matched two-arm run use scripts/experiments/run_three_episode_stage12.py.
+stage1_config: configs/goal/stage1_visual_history_overfit.yaml
+stage2_config: goal/stage2_visual_history_joint
+source_yaml: ${oc.env:STAGE2_SOURCE_YAML,configs/experiments/three_episode_overfit_20261031.yaml}
+output_dir: ${oc.env:STAGE12_OUTPUT_DIR,outputs/stage12_visual_history_overfit}
+world_size: 1
+stage2_baseline: ${oc.env:STAGE2_BASELINE_CHECKPOINT,/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/curated_gripper_human_20261014/gripper_human_aug_lr0.0001_b320/checkpoints/2026-10-15_21-16-09}
+stats_registry: ${oc.env:STAGE2_STATS_REGISTRY,null}
+stats_episodes_per_profile: 1
+stats_windows_per_profile: 256
+stage2_max_steps: 500
+stage2_overrides: []
