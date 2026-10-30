@@ -57,9 +57,11 @@ def main():
         training_complete=proof.get('status')=='complete',completed_videos=video.get('completed_videos',0),expected_videos=6,
         verified_videos=validation.get('verified_videos',0),video_validation_status=validation.get('status','pending'),
         publication=publication,metrics=metrics,teacher=read(root/'stage1_identity.json'),selection=[{k:s[k] for k in ('family','episode','start','end_exclusive','scope','prompt')} for s in manifest.get('sequences',[])])
+    complete=result['training_complete'] and result['completed_videos']==6 and result['verified_videos']==6 and result['video_validation_status']=='complete'
+    result['training_status']=result['status'];result['overall_complete']=complete
+    result['status']='complete' if complete else ('awaiting_video_validation' if result['training_complete'] else result['training_status'])
     (out/'summary.json').write_text(json.dumps(result,indent=2,ensure_ascii=False)+'\n')
     esc=lambda value:html.escape(str(value))
-    complete=result['training_complete'] and result['completed_videos']==6 and result['verified_videos']==6 and result['video_validation_status']=='complete'
     status='训练及六段视频校验完成' if complete else (f'训练完成；视频生成 {result["completed_videos"]}/6，校验通过 {result["verified_videos"]}/6' if result['training_complete'] else state.get('status','preparing'))
     parts=['<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
         '<title>Stage1 / Stage2 三条 episode 过拟合</title>',
