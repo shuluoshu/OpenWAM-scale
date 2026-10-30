@@ -46,6 +46,7 @@ def main():
     stage1_evaluations=read(root/'stage1/summary.json').get('evaluations',[])
     counts={k:max([r['step'] for r in v],default=0) for k,v in stages.items()}
     video=read(root/'fullspan/report/coverage.json');manifest=read(root/'fullspan/data/manifest.json')
+    validation=read(root/'fullspan/report/validation.json');publication=read(root/'code_publication.json')
     metrics=[]
     for arm in ['joint','none']:
         for folder in sorted((root/'stage2'/arm).glob('eval_*')):
@@ -54,16 +55,26 @@ def main():
                 m=case['metrics'];metrics.append(dict(arm=arm,step=value['step'],family=case['family'],case=case['name'],metrics=m))
     result=dict(status=state.get('status','preparing'),completed_updates=counts,requested_updates=budgets,stage1_evaluations=stage1_evaluations,
         training_complete=proof.get('status')=='complete',completed_videos=video.get('completed_videos',0),expected_videos=6,
-        metrics=metrics,teacher=read(root/'stage1_identity.json'),selection=[{k:s[k] for k in ('family','episode','start','end_exclusive','scope','prompt')} for s in manifest.get('sequences',[])])
+        verified_videos=validation.get('verified_videos',0),video_validation_status=validation.get('status','pending'),
+        publication=publication,metrics=metrics,teacher=read(root/'stage1_identity.json'),selection=[{k:s[k] for k in ('family','episode','start','end_exclusive','scope','prompt')} for s in manifest.get('sequences',[])])
     (out/'summary.json').write_text(json.dumps(result,indent=2,ensure_ascii=False)+'\n')
     esc=lambda value:html.escape(str(value))
-    complete=result['training_complete'] and result['completed_videos']==6
+    complete=result['training_complete'] and result['completed_videos']==6 and result['verified_videos']==6 and result['video_validation_status']=='complete'
+    status='训练及六段视频校验完成' if complete else (f'训练完成；视频生成 {result["completed_videos"]}/6，校验通过 {result["verified_videos"]}/6' if result['training_complete'] else state.get('status','preparing'))
     parts=['<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
         '<title>Stage1 / Stage2 三条 episode 过拟合</title>',
         '<style>body{font:16px system-ui;max-width:1180px;margin:32px auto;padding:0 20px;line-height:1.6;color:#17263b}table{border-collapse:collapse;width:100%}td,th{padding:9px;border-bottom:1px solid #ddd;text-align:left}img{width:100%}a{color:#145ac1}.cards{display:flex;gap:20px;flex-wrap:wrap}.card{padding:16px 28px;border:1px solid #ccd7e4;border-radius:12px}small{color:#567}</style>',
-        '<h1>Stage1 / Stage2 三条 episode 过拟合</h1>',f'<p>状态：{esc("训练和六段视频已完成" if complete else state.get("status","preparing"))}</p>',
+        '<h1>Stage1 / Stage2 三条 episode 过拟合</h1>',f'<p>状态：{esc(status)}</p>',
         '<div class="cards">'+''.join(f'<div class="card">{esc(k)}<br><strong>{counts[k]} / {n}</strong> 步</div>' for k,n in budgets.items())+'</div>']
     if not complete:parts.append('<meta http-equiv="refresh" content="60">')
+    if publication.get('url'):parts.append(f'<p><a href="{esc(publication["url"])}">远程代码分支</a> · commit <code>{esc(publication.get("remote_commit",""))[:12]}</code> · <a href="../code_publication.json">代码树一致性记录</a></p>')
+    if result['training_complete']:
+        regressions=[]
+        for arm in ['joint','none']:
+            values={(m['step'],m['family']):(m['metrics'].get('eef_delta_translation_m_mae') or {}).get('value') for m in metrics if m['arm']==arm}
+            worse=[family for step,family in values if step==budgets[arm] and values[(step,family)] is not None and values.get((0,family)) is not None and values[(step,family)]>values[(0,family)]]
+            if worse:regressions.append(f'{arm} 的 '+ '、'.join(worse)+' 在最终固定锚点评估中比训练前误差更高')
+        if regressions:parts.append('<p><strong>结果提示：</strong>'+esc('；'.join(regressions))+'。实验完成不等于过拟合成功；请结合下方真实生成误差和完整轨迹视频判断。</p>')
     if (root/'fullspan/report/index.html').exists():parts.append('<h2><a href="../fullspan/report/index.html">播放 GT / 预测对照视频（joint 和 none）</a></h2>')
     parts+=['<p>每隔 10 个源帧重新推理，并补最后一帧。上排 GT、下排预测；前三列是同一当前时刻的头部和双腕视图，第四列为 Stage1 目标关键帧与二维 TCP。</p>',
         '<table><tr><th>数据集</th><th>Episode</th><th>展示源帧范围（含末帧）</th><th>完整指令</th></tr>']
