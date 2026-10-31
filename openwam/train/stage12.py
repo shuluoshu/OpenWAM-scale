@@ -4,6 +4,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -113,6 +114,55 @@ def validate_stage1_stage2_contract(stage1,stage2):
         raise ValueError('Stage1/Stage2 history sampling mismatch')
 
 
+def validate_precomputed_registry(dataset,audit):
+    """Bind an already loaded immutable registry to this preparation's metadata audit.
+
+    Dataset construction checks the bytes and exact selection/reader contract.
+    Reuse the same dataset and projected metadata audit here; no episode data or
+    images are read, and training nodes do not repeat this offline audit.
+    """
+    registry=dataset.registry
+    if registry is None:raise ValueError('precomputed statistics registry missing')
+    if registry.get('sources')!=audit['sources']:
+        raise ValueError('stats source/schema fingerprint_mismatch: audited source metadata changed')
+    entries=registry.get('entries',{})
+    for key,group in audit['groups'].items():
+        if key not in entries:raise ValueError(f'stats_entry_missing: {key}')
+        if entries[key].get('contract')!=group['contract']:
+            raise ValueError(f'stats source/schema fingerprint_mismatch: {key}')
+        required=[20+7*side+i for side,name in enumerate(('left','right'))
+                  for i in range(len(group['contract']['joint_indices'][name]))]
+        for stream in ('action','state'):
+            validate_stats_payload(entries[key].get(stream),required,source=f'{key}:{stream}')
+
+
+def validate_stats_payload(stats,required,*,source):
+    """Reject unusable raw52 normalization values before population preparation."""
+    if not isinstance(stats,dict):raise ValueError(f'stats payload invalid: {source}: missing statistics mapping')
+    for name in ('count','min','max','mean','std','q01','q99'):
+        values=stats.get(name)
+        if not isinstance(values,list) or len(values)!=52:
+            raise ValueError(f'stats payload invalid: {source}:{name}: expected raw52 vector')
+        try:
+            finite=all(type(value) in (int,float) and math.isfinite(value) for value in values)
+        except OverflowError:
+            finite=False
+        if not finite:
+            raise ValueError(f'stats payload invalid: {source}:{name}: expected finite numeric values')
+    if any(type(value) is not int or value<0 for value in stats['count']):
+        raise ValueError(f'stats payload invalid: {source}: count must be nonnegative integers')
+    if any(value<0 for value in stats['std']):
+        raise ValueError(f'stats payload invalid: {source}: negative std')
+    for low,high in (('min','max'),('q01','q99')):
+        if any(a>b for a,b in zip(stats[low],stats[high])):
+            raise ValueError(f'stats payload invalid: {source}: {low} exceeds {high}')
+    # Zero-count inactive dimensions retain the producer's finite fillers;
+    # declared joints must have supervision, matching prepare_native_stats.
+    missing=[i for i in required if stats['count'][i]==0]
+    if missing:
+        raise ValueError(f'stats_insufficient_valid_population: {source}: joints {missing}')
+
+
 def main(argv=None, *, _runner=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',default=str(ROOT/'configs/goal/stage12_query_history_posttrain.yaml'))
@@ -144,22 +194,33 @@ def main(argv=None, *, _runner=None):
     stage1=load_config(config['stage1_config'],source_yaml=source)
     from hydra import initialize_config_dir,compose
     from omegaconf import OmegaConf
+    extra=config.get('stage2_overrides',[])
+    validate_stage2_overrides(extra)
     with initialize_config_dir(config_dir=str(ROOT/'configs'),version_base=None):
-        stage2=OmegaConf.to_container(compose(config_name=config['stage2_config']),resolve=True)
+        stage2=OmegaConf.to_container(compose(config_name=config['stage2_config'],overrides=extra),resolve=True)
     stage2['dataloader']['source_yaml']=source
     stage2['dataloader']['metadata_only']=True
     stage2['dataloader']['normalization_registry']=None
     path_overrides=stage2_path_overrides(stage1,stage2)
     validate_stage1_stage2_contract(stage1,stage2)
     if args.prepare:
-        run([python,*common,'--prepare'])
         from openwam.dataloader.curated_stage2 import CuratedStage2Dataset
         from openwam.dataloader.native_stage2_stats import audit_selection,prepare_native_stats
+        supplied_registry=config.get('stats_registry')
+        if supplied_registry:
+            stage2['dataloader']['normalization_registry']=supplied_registry
+        else:
+            run([python,*common,'--prepare'])
         dataset=CuratedStage2Dataset.from_config(stage2['dataloader'])
         audit=audit_selection(dataset);atomic_json(output/'stage2_metadata_audit.json',audit)
         if audit['errors']:raise ValueError('Stage2 metadata audit failed; see stage2_metadata_audit.json')
-        registry=prepare_native_stats(dataset,output/'statistics',audit=audit,
-            max_episodes_per_profile=config.get('stats_episodes_per_profile',4),max_windows_per_profile=config.get('stats_windows_per_profile',128))
+        if supplied_registry:
+            validate_precomputed_registry(dataset,audit)
+            registry=dataset.registry_path
+            run([python,*common,'--prepare'])
+        else:
+            registry=prepare_native_stats(dataset,output/'statistics',audit=audit,
+                max_episodes_per_profile=config.get('stats_episodes_per_profile',4),max_windows_per_profile=config.get('stats_windows_per_profile',128))
         atomic_json(output/'prepared.json',dict(source_yaml=source,stats_registry=registry,index=str(index)))
         print(json.dumps(dict(index=str(index),stats_registry=registry),indent=2));return 0
     prepared=json.loads((output/'prepared.json').read_text())
@@ -190,8 +251,6 @@ def main(argv=None, *, _runner=None):
         f'training.max_steps={config.get("stage2_max_steps",100000)}']
     if args.stage2_resume:overrides += ['training.finetune_ckpt_path=null',f'training.resume_ckpt_path={Path(args.stage2_resume).resolve()}']
     else:overrides += [f'training.finetune_ckpt_path={config["stage2_baseline"]}']
-    extra=config.get('stage2_overrides',[])
-    validate_stage2_overrides(extra)
     overrides+=path_overrides+extra
     common2=[str(ROOT/'scripts/train.py'),'--config-name',config['stage2_config'],*overrides]
     baseline=Path(config['stage2_baseline'])
