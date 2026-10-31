@@ -205,3 +205,18 @@ def test_launcher_uses_configured_python_for_preflight_and_distributed_training(
     if mode=='--train':
         assert calls[1][:5]==['-m','torch.distributed.run','--standalone','--nproc_per_node=2','scripts/train.py']
         assert calls[1][-1]=='goal.preflight=false'
+
+
+@pytest.mark.parametrize('cadence', [2, 500, 10000])
+def test_stage2_evaluation_cadence_accepts_positive_integer(cadence):
+    cfg=config()
+    cfg.evaluation.every_updates=cadence
+    validate_stage2_config(cfg)
+
+
+@pytest.mark.parametrize('cadence', [True, False, 0, -1, 1.5, 500.1, 500.0, '500', None])
+def test_stage2_evaluation_cadence_rejects_nonpositive_or_noninteger(cadence):
+    cfg=config()
+    cfg.evaluation.every_updates=cadence
+    with pytest.raises(ValueError,match='every_updates.*positive integer'):
+        validate_stage2_config(cfg)

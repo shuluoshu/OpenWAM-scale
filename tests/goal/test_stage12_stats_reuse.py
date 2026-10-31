@@ -34,6 +34,10 @@ def pipeline(tmp_path, monkeypatch):
     monkeypatch.setattr(module, 'ROOT', tmp_path)
     monkeypatch.setattr(module, 'load_pipeline', lambda path: config)
     monkeypatch.setattr(goal, 'load_config', lambda *a, **kw: stage1)
+    # This fixture isolates registry admission with deliberately skeletal models;
+    # real scalar admission is covered by test_stage12_config_validation.py.
+    from openwam.train.utils import stage2
+    monkeypatch.setattr(stage2, 'validate_stage2_config', lambda cfg: None)
     calls = []
     return module, config, dataset, calls
 

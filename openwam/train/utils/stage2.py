@@ -158,7 +158,9 @@ def validate_stage2_config(cfg):
     if cfg.project.seed is None:raise ValueError('Stage2 requires project.seed for resumable draws')
     if cfg.training.num_epochs is not None or int(cfg.training.max_steps)<1:
         raise ValueError('Stage2 uses positive max_steps optimizer updates and num_epochs=null')
-    if int(cfg.evaluation.every_updates)!=500:raise ValueError('Stage2 evaluation every_updates must be 500')
+    cadence=OmegaConf.select(cfg,'evaluation.every_updates')
+    if type(cadence) is not int or cadence<1:
+        raise ValueError('Stage2 evaluation every_updates must be a positive integer')
 
 
 def validate_stage2_checkpoint(cfg,path):

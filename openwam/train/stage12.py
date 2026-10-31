@@ -206,12 +206,17 @@ def main(argv=None, *, _runner=None):
     extra=config.get('stage2_overrides',[])
     validate_stage2_overrides(extra)
     with initialize_config_dir(config_dir=str(ROOT/'configs'),version_base=None):
-        stage2=OmegaConf.to_container(compose(config_name=config['stage2_config'],overrides=extra),resolve=True)
+        # Match launch precedence: the pipeline budget precedes explicit overrides.
+        effective_overrides=[f'++training.max_steps={config.get("stage2_max_steps",100000)}',*extra]
+        stage2=OmegaConf.to_container(compose(config_name=config['stage2_config'],overrides=effective_overrides),resolve=True)
     stage2['dataloader']['source_yaml']=source
     stage2['dataloader']['metadata_only']=True
     stage2['dataloader']['normalization_registry']=None
     path_overrides=stage2_path_overrides(stage1,stage2)
     validate_stage1_stage2_contract(stage1,stage2)
+    # Admission must fail before expensive data preparation or model bootstrap.
+    from openwam.train.utils.stage2 import validate_stage2_config
+    validate_stage2_config(OmegaConf.create(stage2))
     # Match scripts/train.py's effective seed before binding the data contract.
     if stage2.get('project',{}).get('seed') is not None:
         stage2['dataloader']['seed']=int(stage2['project']['seed'])
