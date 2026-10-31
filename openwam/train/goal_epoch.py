@@ -1,6 +1,8 @@
 """Finite Stage1 updates, distributed tail weighting, atomic resumable handoff."""
 from __future__ import annotations
 import hashlib
+import errno
+from dataclasses import dataclass
 import json
 import math
 import os
@@ -59,7 +61,31 @@ def restore_optimizer(optimizer,payload):
     optimizer.optimizer.load_state_dict(payload['adam'])
 
 
-def save_epoch_checkpoint(expert,optimizer,output,*,identity,cursor,update,dependencies,convergence_state=None):
+def _file_stamp(path):
+    stat=Path(path).stat()
+    return dict(device=stat.st_dev,inode=stat.st_ino,mode=stat.st_mode,size=stat.st_size,
+                mtime_ns=stat.st_mtime_ns,ctime_ns=stat.st_ctime_ns,nlink=stat.st_nlink)
+
+
+@dataclass
+class _SaveReceipt:
+    """Bounded local reuse; metadata guards cannot detect metadata-preserving damage.
+
+    Public verification and resume always hash fresh, including on filesystems
+    whose ctime granularity can hide rapid writes with restored mtime.
+    """
+    directory: Path
+    manifest: dict
+    stamps: dict
+    pid: int
+
+    def matches(self,directory,manifest):
+        return (self.pid==os.getpid() and self.directory==directory and self.manifest==manifest
+                and all(_file_stamp(directory/name)==stamp for name,stamp in self.stamps.items()))
+
+
+def save_epoch_checkpoint(expert,optimizer,output,*,identity,cursor,update,dependencies,convergence_state=None,
+                          _return_receipt=False):
     from openwam.train.goal_curated import goal_bundle_spec
     name,_,save_bundle=goal_bundle_spec(getattr(expert,'representation','query_latent'))
     output=Path(output);root=output/'checkpoints';root.mkdir(parents=True,exist_ok=True)
@@ -73,8 +99,12 @@ def save_epoch_checkpoint(expert,optimizer,output,*,identity,cursor,update,depen
         torch.save(dict(identity=identity,cursor=cursor,update=update,optimizer=optimizer_payload(optimizer)),temporary/'training.pt')
         if convergence_state is not None:
             atomic_json(temporary/'convergence_state.json',convergence_state)
-        files={p.name:sha256(p) for p in temporary.iterdir() if p.is_file()}
-        atomic_json(temporary/'manifest.json',dict(identity=identity,cursor=cursor,update=update,files=files))
+        stamps={p.name:_file_stamp(p) for p in temporary.iterdir() if p.is_file()}
+        files={name:sha256(temporary/name) for name in stamps}
+        if any(_file_stamp(temporary/name)!=stamp for name,stamp in stamps.items()):
+            raise ValueError('checkpoint changed during save verification')
+        manifest=dict(identity=identity,cursor=cursor,update=update,files=files)
+        atomic_json(temporary/'manifest.json',manifest)
         for p in temporary.iterdir():
             with p.open('rb') as f:os.fsync(f.fileno())
         temporary.rename(destination)
@@ -87,13 +117,18 @@ def save_epoch_checkpoint(expert,optimizer,output,*,identity,cursor,update,depen
     # Keep two durable generations. Never remove pending/orphan directories.
     complete=sorted((p for p in root.glob('update_*') if (p/'manifest.json').is_file()),key=lambda p:p.name)
     for old in complete[:-2]:shutil.rmtree(old)
+    if _return_receipt:
+        # Round-trip small metadata to detach the receipt from caller-owned dicts.
+        return _SaveReceipt(destination.resolve(),json.loads(json.dumps(manifest)),stamps,os.getpid())
     return destination
 
 
-def _checkpoint(output,identity):
+def _checkpoint(output,identity,*,receipt=None):
     directory=Path(json.loads((Path(output)/'latest.json').read_text())['directory'])
     manifest=json.loads((directory/'manifest.json').read_text())
     if manifest['identity']!=identity:raise ValueError('checkpoint identity mismatch')
+    if isinstance(receipt,_SaveReceipt) and receipt.matches(directory,manifest):
+        return directory,manifest
     for name,digest in manifest['files'].items():
         if sha256(directory/name)!=digest:raise ValueError('checkpoint checksum mismatch: '+name)
     return directory,manifest
@@ -126,13 +161,13 @@ def load_convergence_state(directory,manifest,identity,*,evaluation_identity=Non
         manifest['update'],identity['training']['max_updates'])
 
 
-def verify_completion(output,identity):
+def verify_completion(output,identity,*,_receipt=None):
     from openwam.train.goal_curated import goal_bundle_spec
     bounded=identity.get('training',{}).get('mode')=='bounded_updates'
     proof=json.loads((Path(output)/('training_complete.json' if bounded else 'epoch_complete.json')).read_text())
     if proof['identity']!=identity:
         raise ValueError('incomplete epoch or identity mismatch')
-    directory,manifest=_checkpoint(output,identity)
+    directory,manifest=_checkpoint(output,identity,receipt=_receipt)
     if identity.get('training',{}).get('convergence') is not None:
         gate=load_convergence_state(directory,manifest,identity)
         if (not gate['converged'] or proof.get('completion_kind')!='convergence'
@@ -152,10 +187,38 @@ def verify_completion(output,identity):
         raise ValueError('partial checkpoint cannot hand off')
     name,_,_=goal_bundle_spec(identity.get('representation','query_latent'))
     checkpoint=directory/name
-    if str(checkpoint)!=proof['checkpoint'] or sha256(checkpoint)!=proof['checkpoint_sha256']:
+    if str(checkpoint)!=proof['checkpoint'] or manifest['files'][name]!=proof['checkpoint_sha256']:
         raise ValueError('handoff checkpoint mismatch')
     return proof
 
+
+
+def _publish_bundle(source,target,*,receipt=None):
+    """Atomically publish a conventional alias; the proof names the generation."""
+    source,target=Path(source),Path(target)
+    temporary=target.with_name(target.name+'.pending-'+uuid.uuid4().hex)
+    before=_file_stamp(source)
+    old=target.lstat() if target.exists() or target.is_symlink() else None
+    same_old=old is not None and (old.st_dev,old.st_ino)==(before['device'],before['inode'])
+    linked=False
+    try:
+        try:
+            os.link(source,temporary);linked=True
+        except OSError as exc:
+            if exc.errno not in (errno.EXDEV,errno.EPERM,errno.EOPNOTSUPP,errno.ENOSYS,errno.EMLINK):raise
+            shutil.copyfile(source,temporary)
+            with temporary.open('rb') as stream:os.fsync(stream.fileno())
+        os.replace(temporary,target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    if linked and isinstance(receipt,_SaveReceipt) and receipt.stamps.get(source.name)==before:
+        after=_file_stamp(source)
+        # link/replace intentionally changes only ctime and link count. Never
+        # bless changed data/inode/mtime; a mismatch forces full verification.
+        stable=('device','inode','mode','size','mtime_ns')
+        if (all(before[k]==after[k] for k in stable)
+                and after['nlink']==before['nlink']+1-int(same_old)):
+            receipt.stamps[source.name]=after
 
 def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
                 learning_rate=1e-5,history_learning_rate=1e-4,checkpoint_every=5000,
@@ -318,10 +381,13 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
               best_loss=result['best_loss'],reference_loss=result['reference_loss'],
               streak=result['streak'],converged=result['converged'],invalid_reason=invalid_reason)
         return result
+    last_saved=None
     def save():
+        nonlocal last_saved
         extra={'convergence_state':gate} if convergence is not None else {}
-        return save_epoch_checkpoint(expert,optimizer,output,identity=identity,cursor=cursor,
-                                     update=update,dependencies=dependencies,**extra)
+        last_saved=save_epoch_checkpoint(expert,optimizer,output,identity=identity,cursor=cursor,
+                                     update=update,dependencies=dependencies,_return_receipt=True,**extra)
+        return last_saved.directory
     def update_gate():
         nonlocal gate
         try:
@@ -413,7 +479,7 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
         raise RuntimeError('Stage1 max_updates exhausted without convergence; Stage2 handoff refused')
     expert.freeze()
     def finish():
-        directory,manifest=_checkpoint(output,identity)
+        directory,manifest=_checkpoint(output,identity,receipt=last_saved)
         checkpoint=directory/bundle_name
         proof=dict(identity=identity,total_samples=len(dataset),seen_samples=cursor,updates=update,
             checkpoint=str(checkpoint),checkpoint_sha256=manifest['files'][bundle_name])
@@ -425,10 +491,10 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
                          convergence_sha256=manifest['files']['convergence_state.json'])
         # Stable conventional path for inference tools; the proof always names
         # the hashed durable generation rather than this convenience copy.
-        temporary=output/(bundle_name+'.pending');shutil.copyfile(checkpoint,temporary);os.replace(temporary,output/bundle_name)
+        _publish_bundle(checkpoint,output/bundle_name,receipt=last_saved)
         summary.update(status='complete',completed_steps=update,seen_samples=cursor,
             finite_epoch_complete=not bounded,completion_kind='convergence' if convergence is not None else 'bounded_updates' if bounded else 'finite_epoch')
         atomic_json(output/'summary.json',summary)
         atomic_json(completion_file,proof)
     primary(finish)
-    return primary(lambda:verify_completion(output,identity),broadcast_result=True)
+    return primary(lambda:verify_completion(output,identity,_receipt=last_saved),broadcast_result=True)
