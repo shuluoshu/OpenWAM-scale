@@ -1,0 +1,18 @@
+# Three-hour Stage1/Stage2 overfit with full relative112 statistics
+
+Use superpowers:subagent-driven-development for independent preparation/report tasks and focused review. User authorizes approximately three hours of training using the newly computed full statistics, preserving the prior three-source experiment and joint/none comparison.
+
+## Contract
+- Active checkout: outputs/stage1_masked_sa_20261028/code. No edits to running full-stat scan dependencies (all dataloader Python, stage12.py, kinematics.py, prepare_goal_labels.py, prepare_subtask_goals.py, prepare_full_relative_stats.py), nor finalizer script.
+- New run: ROOT/outputs/stage12_fullstats_overfit_3h_20261031. Stage1 fresh initialization from the same foundation checkpoint, unified scripts/train_goal_epoch.py entry, approximately 1800 updates (~one hour measured previously); repeat population, 3 FPS anchors, same history/masks and optimizer settings. Exact actual wall time reported.
+- Samples: prior ABC episode0, RoboChallenge v2 episode0, Interndata episode472. Choose same complete display instruction [0,255), [0,186), [0,571). All valid stride10 display anchors enter Stage2 training; terminal/no-supervision anchors remain report-only. Stage1 ranges select these complete instruction spans at3FPS, with native task/subtask targets. Explicitly report actual trained-anchor counts.
+- Stage2 waits for full new-selection readiness, validates immutable registry and native contract. Keep full source YAML as normalization identity. Fixed three-episode selection is a separate preparation filter; never rewrite a full registry into sampled statistics. No old normalized tensors reused. Fixed anchor relative112/32; preserve quantile clipping policy and report its effect.
+- Freeze final unified Stage1 teacher for both arms. Same baseline/seed/optimizer settings and equal ~3600-second native worker budgets for joint and none; time-based stopping, final checkpoint/evaluation. Training total approximately3h plus preparation/rendering.
+- Report skill: whole instruction videos, every10frames +terminal, four columns/two rows GT/prediction, six videos. Strict input/weight identities, head/wrist current-anchor calibration, masks preserved, candidate calibration disclosed. Include per-loss magnitude, physical errors/adjacent-step jumps, GT clipping floor and training draw coverage. Never equate completed training with successful overfit.
+
+## Tasks
+1. Parent creates Stage1 selection/config/index and launches unified bounded training; monitors full-stat publication, records startup and freezes verified checkpoint.
+2. Preparation implementer adds standalone script to build native fixed Stage2 cases and separate fullspan report samples from final full registry and the explicit three-episode selection. Unit tests check selection/normalization identity and complete stride10 training coverage; real CPU preflight after readiness.
+3. Parent adds durable supervisor to wait for Stage1 and registry, invoke preparation, train joint/none with equal budgets, run visualization skill commands and report; no overlapping GPU jobs. Validate pure control logic before launch.
+4. Report implementer builds compact live/final HTML referencing skill videos and correct dynamic budget/coverage, loss scales, old/new clipping comparison, physical trajectory metrics. No GPU use.
+5. Independently review and run focused checks, first real sample inference gate, then full visualization and HTTP/Range verification. Publish code to existing remote branch after tests; provide Alibaba HTML URL and accurate current status. Preserve existing unrelated edits.
