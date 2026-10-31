@@ -256,6 +256,8 @@ class CuratedGoalDataset:
                 video_ordinals=m['video_ordinals'] if repo['family']=='mecka' else None)
             return video,images,alignment
         head_valid=m['head'] is not None
+        # Future supervision validity is independent of current/history camera availability.
+        goal_image_valid=head_valid and bool(m['source_valid'][goal])
         if head_valid:
             video,images,alignment=decode(m['head'],[anchor,goal])
         else:
@@ -325,11 +327,14 @@ class CuratedGoalDataset:
         observed,augmentation_trace=self.observation_augmentation(observed,view_valid,
             seed=augmentation_seed,training=not self._evaluating)
         observed.save(folder/'observed.png')
+        if not goal_image_valid:
+            projection['projection_valid'][:]=False
+            projection['in_frame'][:]=False
         np.savez_compressed(folder/'targets.npz',**{k:projection[k] for k in ('uv','projection_valid','in_frame','visibility')})
         record=dict(id=ident,metric_key=ident,family=repo['family'],granularity=level,instruction=segment['text'],
             source_repo=str(m['root']),source_episode=episode,source_episode_length=m['length'],
             instruction_start=segment['start'],instruction_end_exclusive=segment['end_exclusive'],
-            anchor_source_frame=anchor,goal_source_frame=goal,head=m['head'],goal_image_valid=head_valid,
+            anchor_source_frame=anchor,goal_source_frame=goal,head=m['head'],goal_image_valid=goal_image_valid,
             label_kind=level+'_end',success_verified=False,
             observed_image_path=str(folder/'observed.png'),goal_image_path=str(folder/'goal.png'),target_path=str(folder/'targets.npz'),
             provenance=dict(source_parquet=str(m['data']),source_parquets=[str(p) for p in m['data_files']],source_video=str(video),annotation_file=m['annotation_file'],
@@ -344,7 +349,7 @@ class CuratedGoalDataset:
             record['provenance']['observation_augmentation']=augmentation_trace
         record=clean_json(record)
         batch=prepare_overfit_images([record],device='cpu',dtype=self.dtype)[0]
-        if not head_valid:
+        if not goal_image_valid:
             batch['targets'].image_valid.zero_()
             batch['targets'].point_valid.zero_()
             batch['targets'].in_frame.zero_()

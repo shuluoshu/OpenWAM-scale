@@ -1,0 +1,18 @@
+# Four H200 nodes: Stage1 convergence -> immutable frozen teacher -> joint Stage2.
+# Selection differs from the requested YAML only by the approved missing source.
+stage1_config: configs/goal/stage1_visual_history_relative112_production.yaml
+stage2_config: goal/stage2_visual_history_joint
+source_yaml: /mnt/data/cpfs/b5/yeqingda/pretrain/launch/moravla/train_files/pretrain_v0_3_curated_3000h_posttrain_20261019_exclude_rcv1_rmv1_rmv2_20261030_exclude_missing_wipe_table_20261031.yaml
+output_dir: /mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/stage12_relative112_4x8_20261101
+world_size: 32
+nnodes: 4
+gpus_per_node: 8
+# Same official foundation as Stage1; only four projections were zero-extended.
+stage2_baseline: /mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/stage12_dlc_preflight_20261031/openwam_foundation_relative112_init/checkpoint_step_154000.safetensors
+stats_registry: /mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/curated_relative112_stats_20261031_exclude_missing_wipe_table/registry-e534aa97c759551411d46c4827a9b242532a4bb42eff1b943d52a7584bae6668.json
+stage2_max_steps: 154000
+stage2_overrides:
+  - ++training.bootstrap_workers_per_node=2
+  - training.save_steps=10000
+  - evaluation.every_updates=10000
+  - evaluation.at_start=false

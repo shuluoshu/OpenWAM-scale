@@ -59,7 +59,7 @@ def restore_optimizer(optimizer,payload):
     optimizer.optimizer.load_state_dict(payload['adam'])
 
 
-def save_epoch_checkpoint(expert,optimizer,output,*,identity,cursor,update,dependencies):
+def save_epoch_checkpoint(expert,optimizer,output,*,identity,cursor,update,dependencies,convergence_state=None):
     from openwam.train.goal_curated import goal_bundle_spec
     name,_,save_bundle=goal_bundle_spec(getattr(expert,'representation','query_latent'))
     output=Path(output);root=output/'checkpoints';root.mkdir(parents=True,exist_ok=True)
@@ -71,6 +71,8 @@ def save_epoch_checkpoint(expert,optimizer,output,*,identity,cursor,update,depen
         save_bundle(expert,temporary/name,
             training_metadata=dict(identity=identity,cursor=cursor,update=update),dependency_identities=dependencies)
         torch.save(dict(identity=identity,cursor=cursor,update=update,optimizer=optimizer_payload(optimizer)),temporary/'training.pt')
+        if convergence_state is not None:
+            atomic_json(temporary/'convergence_state.json',convergence_state)
         files={p.name:sha256(p) for p in temporary.iterdir() if p.is_file()}
         atomic_json(temporary/'manifest.json',dict(identity=identity,cursor=cursor,update=update,files=files))
         for p in temporary.iterdir():
@@ -114,6 +116,16 @@ def restore_epoch_checkpoint(expert,optimizer,output,identity):
     return saved['cursor'],saved['update']
 
 
+def load_convergence_state(directory,manifest,identity,*,evaluation_identity=None):
+    from openwam.train.convergence import validate_state
+    if 'convergence_state.json' not in manifest['files']:
+        raise ValueError('missing checkpoint convergence state')
+    state=json.loads((directory/'convergence_state.json').read_text())
+    return validate_state(state,identity['training']['convergence'],
+        evaluation_identity if evaluation_identity is not None else state['evaluation_identity'],
+        manifest['update'],identity['training']['max_updates'])
+
+
 def verify_completion(output,identity):
     from openwam.train.goal_curated import goal_bundle_spec
     bounded=identity.get('training',{}).get('mode')=='bounded_updates'
@@ -121,7 +133,16 @@ def verify_completion(output,identity):
     if proof['identity']!=identity:
         raise ValueError('incomplete epoch or identity mismatch')
     directory,manifest=_checkpoint(output,identity)
-    if bounded:
+    if identity.get('training',{}).get('convergence') is not None:
+        gate=load_convergence_state(directory,manifest,identity)
+        if (not gate['converged'] or proof.get('completion_kind')!='convergence'
+                or proof.get('finite_epoch_complete') is not False
+                or proof.get('convergence')!=gate
+                or proof.get('convergence_sha256')!=manifest['files']['convergence_state.json']
+                or proof.get('updates')!=manifest['update'] or proof.get('completed_steps')!=manifest['update']
+                or proof.get('seen_samples')!=manifest['cursor']):
+            raise ValueError('convergence completion mismatch')
+    elif bounded:
         if (proof.get('completion_kind')!='bounded_updates' or proof.get('finite_epoch_complete') is not False
                 or manifest['update']!=identity['training']['max_updates']
                 or proof['updates']!=manifest['update'] or proof.get('completed_steps')!=manifest['update']
@@ -139,7 +160,8 @@ def verify_completion(output,identity):
 def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
                 learning_rate=1e-5,history_learning_rate=1e-4,checkpoint_every=5000,
                 eval_every=500,sampling_steps=20,resume=False,bootstrap_workers_per_node=2,optimizer_device='model',
-                condition_learning_rate=None,max_updates=None,repeat_population=False,sample_cache_size=0):
+                condition_learning_rate=None,max_updates=None,repeat_population=False,sample_cache_size=0,
+                convergence=None):
     from openwam.train.goal_curated import prepare_batch,goal_parameter_groups,_export_cases
     from openwam.train.goal_overfit import FP32MasterAdamW
     from openwam.train.goal_trainer import _seed
@@ -170,6 +192,10 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
     if bounded and not repeat_population and max_updates>math.ceil(len(dataset)/world):
         raise ValueError('max_updates exceeds one population; enable repeat_population')
     training=dict(mode='bounded_updates',max_updates=max_updates,repeat_population=repeat_population) if bounded else None
+    from openwam.train.convergence import (convergence_config,new_state,observe,fixed_flow_metric,
+        evaluation_identity,flow_contract,preserve_rng)
+    convergence=convergence_config(convergence,max_updates)
+    if convergence is not None:training['convergence']=convergence
     if identity.get('training')!=training:raise ValueError('training budget identity mismatch')
     representation=getattr(expert,'representation','query_latent')
     if identity.get('representation',representation)!=representation:raise ValueError('representation identity mismatch')
@@ -194,15 +220,15 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
     if any(s!=order_states[0] for s in order_states):raise ValueError('sampling order differs between ranks')
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
     p=next(expert.parameters());device,dtype=p.device,p.dtype
-    def primary(call):
+    def primary(call,*,broadcast_result=False):
         result=None;error=None
         if rank==0:
             try:result=call()
             except Exception as exc:error=f'{type(exc).__name__}: {exc}'
-        message=[error]
+        message=[error,result if broadcast_result else None]
         if distributed:dist.broadcast_object_list(message,src=0,device=device)
         if message[0]:raise RuntimeError(message[0])
-        return result
+        return message[1] if broadcast_result else result
     def event(kind,**values):
         if rank==0:
             row=dict(event=kind,wall_time=time.time(),**values)
@@ -210,8 +236,19 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
             print(json.dumps(row,allow_nan=False),flush=True)
     primary(lambda: (_ for _ in ()).throw(ValueError('existing run requires --resume')) if (output/'latest.json').exists() and not resume else None)
     completion_file=output/('training_complete.json' if bounded else 'epoch_complete.json')
+    def fingerprint(pairs):
+        with preserve_rng():
+            prepared=((r,prepare_batch(r,b,device=device,dtype=dtype,context_cache=context_cache)) for r,b in pairs)
+            return evaluation_identity(prepared,seed=identity['seed']+200000,expert_contract=flow_contract(expert))
     if completion_file.exists():
-        proof=verify_completion(output,identity);expert.freeze();return proof
+        def completed():
+            proof=verify_completion(output,identity)
+            if convergence is not None:
+                with preserve_rng():fixed_inputs=list(dataset.evaluation_samples())
+                directory,manifest=_checkpoint(output,identity)
+                load_convergence_state(directory,manifest,identity,evaluation_identity=fingerprint(fixed_inputs))
+            return proof
+        proof=primary(completed,broadcast_result=True);expert.freeze();return proof
     expert.train_stage_a()
     optimizer=FP32MasterAdamW(goal_parameter_groups(expert,learning_rate,history_learning_rate,condition_learning_rate),
                             master_device='cpu' if optimizer_device=='cpu' else None)
@@ -252,7 +289,56 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
         if resume and old.exists():summary['evaluations']=[e for e in json.loads(old.read_text()).get('evaluations',[]) if e['step']<=update]
         (output/'index.html').write_text('<meta charset="utf-8"><h1>Finite Stage1</h1><a href="timeline.html">All evaluations</a> · <a href="inputs/index.html">Training inputs</a>')
         atomic_json(output/'summary.json',summary)
-    primary(setup)
+    if convergence is not None:
+        with preserve_rng():primary(setup)
+    else:primary(setup)
+    gate=None
+    def prepared_fixed():
+        return (prepare_batch(r,b,device=device,dtype=dtype,context_cache=context_cache) for r,b in fixed)
+    def setup_gate():
+        fixed_identity=fingerprint(fixed)
+        if resume and (output/'latest.json').exists():
+            directory,manifest=_checkpoint(output,identity)
+            return load_convergence_state(directory,manifest,identity,evaluation_identity=fixed_identity)
+        return new_state(convergence,fixed_identity)
+    def gate_evaluate():
+        metric=fixed_flow_metric(expert,prepared_fixed(),seed=identity['seed']+200000)
+        result=observe(gate,update,metric,max_updates=max_updates)
+        invalid_reason=None
+        if result['history'][-1]['metric'] is None:
+            missing=[name for name,count,weight in (('image','valid_images','lambda_image'),('TCP','valid_points','lambda_tcp'))
+                     if isinstance(metric,dict) and metric.get(weight,0)>0 and metric.get(count)==0]
+            invalid_reason=('no valid '+' or '.join(missing)+' supervision in fixed diagnostic pool' if missing
+                            else 'empty, nonfinite, invalid, or changed fixed diagnostic supervision')
+        summary['convergence']=result
+        summary.update(evaluation_split='fixed_train_population_diagnostic',formal_generalization=False,
+                       convergence_last_invalid_reason=invalid_reason)
+        atomic_json(output/'summary.json',summary)
+        event('convergence_evaluation',step=update,metric=result['history'][-1]['metric'],
+              best_loss=result['best_loss'],reference_loss=result['reference_loss'],
+              streak=result['streak'],converged=result['converged'],invalid_reason=invalid_reason)
+        return result
+    def save():
+        extra={'convergence_state':gate} if convergence is not None else {}
+        return save_epoch_checkpoint(expert,optimizer,output,identity=identity,cursor=cursor,
+                                     update=update,dependencies=dependencies,**extra)
+    def update_gate():
+        nonlocal gate
+        try:
+            gate=primary(gate_evaluate,broadcast_result=True)
+        except RuntimeError:
+            # Commit the actual current optimizer and an invalid evidence row;
+            # every rank received the same error before entering this checkpoint.
+            gate=primary(lambda:observe(gate,update,None,max_updates=max_updates),broadcast_result=True)
+            primary(save)
+            raise
+    if convergence is not None:
+        gate=primary(setup_gate,broadcast_result=True)
+        if not gate['history']:
+            update_gate()
+            primary(save)
+        summary['convergence']=gate
+        summary.update(evaluation_split='fixed_train_population_diagnostic',formal_generalization=False)
     def evaluate():
         directory=f'eval_step_{update:09d}'
         dest=output/directory
@@ -268,7 +354,7 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
         timeline.write_text(timeline.read_text().replace('href="../index.html"','href="index.html"').replace('href="../g1_concept_and_plan.html"','href="summary.json"'))
         event('report_ready',step=update,cursor=cursor,directory=directory)
     started=time.monotonic()
-    while update<max_updates if bounded else cursor<len(dataset):
+    while (update<max_updates if bounded else cursor<len(dataset)) and not (gate and gate['converged']):
         population_cursor=cursor%len(dataset) if repeat_population else cursor
         position,weight=rank_sample(population_cursor,len(dataset),rank,world)
         index=order[position]
@@ -308,10 +394,23 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
         summary.update(completed_steps=update,seen_samples=cursor)
         if rank==0:atomic_json(output/'summary.json',summary)
         final=update==max_updates if bounded else cursor==len(dataset)
-        if update%eval_every==0 or final:primary(evaluate)
-        if update%checkpoint_every==0 or final:
-            primary(lambda:save_epoch_checkpoint(expert,optimizer,output,identity=identity,cursor=cursor,update=update,dependencies=dependencies))
+        visual_due=update%eval_every==0 or final
+        if convergence is None and visual_due:primary(evaluate)
+        gate_due=convergence is not None and (update%convergence['eval_every']==0 or final)
+        if gate_due:
+            update_gate()
+        if update%checkpoint_every==0 or final or gate_due:
+            primary(save)
             event('checkpoint_saved',step=update,cursor=cursor)
+        if convergence is not None and visual_due:primary(evaluate)
+    if convergence is not None and not gate['converged']:
+        def exhausted():
+            summary.update(status='budget_exhausted_without_convergence',convergence=gate,
+                           completed_steps=update,seen_samples=cursor)
+            atomic_json(output/'summary.json',summary)
+            event('budget_exhausted_without_convergence',step=update,cursor=cursor)
+        primary(exhausted)
+        raise RuntimeError('Stage1 max_updates exhausted without convergence; Stage2 handoff refused')
     expert.freeze()
     def finish():
         directory,manifest=_checkpoint(output,identity)
@@ -321,12 +420,15 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
         if bounded:
             proof.update(completion_kind='bounded_updates',finite_epoch_complete=False,completed_steps=update,
                          unique_samples_seen=min(cursor,len(dataset)),representation=representation)
+        if convergence is not None:
+            proof.update(completion_kind='convergence',convergence=gate,
+                         convergence_sha256=manifest['files']['convergence_state.json'])
         # Stable conventional path for inference tools; the proof always names
         # the hashed durable generation rather than this convenience copy.
         temporary=output/(bundle_name+'.pending');shutil.copyfile(checkpoint,temporary);os.replace(temporary,output/bundle_name)
         summary.update(status='complete',completed_steps=update,seen_samples=cursor,
-            finite_epoch_complete=not bounded,completion_kind='bounded_updates' if bounded else 'finite_epoch')
+            finite_epoch_complete=not bounded,completion_kind='convergence' if convergence is not None else 'bounded_updates' if bounded else 'finite_epoch')
         atomic_json(output/'summary.json',summary)
         atomic_json(completion_file,proof)
     primary(finish)
-    return verify_completion(output,identity)
+    return primary(lambda:verify_completion(output,identity),broadcast_result=True)

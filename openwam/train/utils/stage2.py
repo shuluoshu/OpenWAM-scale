@@ -174,11 +174,12 @@ def validate_stage2_checkpoint(cfg,path):
                 raise ValueError(f'Stage2 baseline projection must retain width112: {key}={shape}')
 
 
-def validate_stage2_launch(cfg,*,metadata_only=False):
+def validate_stage2_launch(cfg,*,metadata_only=False,prepared_runtime=None):
     """Validate real assets before model/Accelerator construction; CPU only."""
     from safetensors import safe_open
     from openwam.train.utils.ckpt_model_loader import _resolve_ckpt_source,find_latest_weights
     validate_stage2_config(cfg)
+    original_dataloader=OmegaConf.to_container(cfg.dataloader,resolve=True)
     resume = OmegaConf.select(cfg, 'training.resume_ckpt_path')
     finetune = OmegaConf.select(cfg, 'training.finetune_ckpt_path')
     if resume and finetune:
@@ -262,15 +263,39 @@ def validate_stage2_launch(cfg,*,metadata_only=False):
     source=Path(cfg.dataloader.source_yaml)
     if not source.is_file():raise FileNotFoundError(f'STAGE2_SOURCE_YAML missing: {source}')
     if not cfg.project.output_dir:raise ValueError('STAGE2_OUTPUT_DIR is required')
+    dataset=validate_stage2_data(cfg,metadata_only=metadata_only,prepared_runtime=prepared_runtime,
+        original_dataloader=original_dataloader if resume else None)
+    return dict(dataset.scope_summary(),global_batch=int(cfg.training.batch_size)*int(os.environ.get('WORLD_SIZE','1'))*int(cfg.training.gradient_accumulation_steps),
+                state=('resume requested' if cfg.training.resume_ckpt_path else 'warm-start')+'; full resume/relocation validation required',metadata_only=metadata_only)
+
+
+def validate_stage2_data(cfg,*,metadata_only=False,prepared_runtime=None,original_dataloader=None):
+    """Reuse only an exact offline data proof; preserve native reader checks."""
     from openwam.dataloader.curated_stage2 import CuratedStage2Dataset
     from openwam.dataloader.native_stage2_stats import audit_selection
     dl=OmegaConf.to_container(cfg.dataloader,resolve=True)
     if metadata_only and not dl.get('normalization_registry'):dl['metadata_only']=True
     dataset=CuratedStage2Dataset.from_config(dl)
-    audit=audit_selection(dataset)
-    if audit['errors']:raise ValueError(f'Stage2 source metadata errors: {audit["errors"]}')
-    return dict(dataset.scope_summary(),global_batch=int(cfg.training.batch_size)*int(os.environ.get('WORLD_SIZE','1'))*int(cfg.training.gradient_accumulation_steps),
-                state=('resume requested' if cfg.training.resume_ckpt_path else 'warm-start')+'; full resume/relocation validation required',metadata_only=metadata_only)
+    if prepared_runtime is not None:
+        from openwam.train.prepared_runtime import load_prepared_runtime
+        original=original_dataloader if original_dataloader is not None else dl
+        proof=load_prepared_runtime(prepared_runtime,stage2_dataloader=original,source_yaml=original['source_yaml'])
+        if original_dataloader is not None:
+            # Full-state resume packages normalization assets. The resolver above
+            # has validated its manifest; permit only those path substitutions,
+            # identical bytes, and the same resolved native reader contract.
+            from openwam.dataloader.goal_epoch import sha256_file
+            relocated={'source_yaml','normalization_registry','data_root','metadata_only'}
+            if ({k:v for k,v in original.items() if k not in relocated} !=
+                {k:v for k,v in dl.items() if k not in relocated}
+                or dataset.stats_contract()!=proof['dataset_contract']
+                or sha256_file(dl['source_yaml'])!=proof['source']['sha256']
+                or sha256_file(dl['normalization_registry'])!=proof['registry']['sha256']):
+                raise ValueError('prepared Stage2 relocated data/config mismatch')
+    else:
+        audit=audit_selection(dataset)
+        if audit['errors']:raise ValueError(f'Stage2 source metadata errors: {audit["errors"]}')
+    return dataset
 
 
 def stage2_resume_contract(cfg):

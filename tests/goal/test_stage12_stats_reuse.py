@@ -20,14 +20,17 @@ def pipeline(tmp_path, monkeypatch):
     dataset = CuratedStage2Dataset(source)
     registry = prepare_native_stats(dataset, tmp_path/'statistics',
         max_episodes_per_profile=1, max_windows_per_profile=4)
-    stage1 = dict(model=dict(goal_representation='query_latent'), dataset={})
+    stage1 = dict(model=dict(goal_representation='query_latent'), dataset=dict(source_yaml=str(source)), sample_fps=3.)
     configs = tmp_path/'configs'
     configs.mkdir()
     (configs/'stage2.yaml').write_text(yaml.safe_dump(dict(
         model=dict(goal_representation='query_latent'), dataloader={})))
     config = dict(source_yaml=str(source), output_dir=str(tmp_path/'output'),
         stage1_config='unused', stage2_config='stage2', stats_registry=registry,
-        world_size=1)
+        world_size=1, stage2_baseline=str(tmp_path/'baseline'))
+    (tmp_path/'baseline').mkdir()
+    (tmp_path/'baseline/config.yaml').write_text('model: {}')
+    stage1['baseline_checkpoint']=config['stage2_baseline']
     monkeypatch.setattr(module, 'ROOT', tmp_path)
     monkeypatch.setattr(module, 'load_pipeline', lambda path: config)
     monkeypatch.setattr(goal, 'load_config', lambda *a, **kw: stage1)
@@ -37,8 +40,16 @@ def pipeline(tmp_path, monkeypatch):
 
 def prepare(pipeline):
     module, config, dataset, calls = pipeline
-    return module.main(['--config', 'unused', '--prepare'],
-        _runner=lambda command, **kw: calls.append(command))
+    def run(command, **kwargs):
+        from openwam.dataloader.curated_goal import CuratedGoalDataset
+        from openwam.dataloader.goal_epoch import build_epoch_index
+        calls.append(command)
+        output=Path(config['output_dir']);stage1_output=output/'stage1'
+        stage1_output.mkdir(parents=True,exist_ok=True)
+        source=CuratedGoalDataset(config['source_yaml'],str(output/'cache'))
+        summary=build_epoch_index(source,output/'population.sqlite',sample_fps=3.)
+        (stage1_output/'population.json').write_text(json.dumps(summary))
+    return module.main(['--config', 'unused', '--prepare'], _runner=run)
 
 
 def rewrite_registry(config, mutate):
@@ -159,3 +170,27 @@ def test_no_registry_keeps_existing_sampled_preparation(pipeline, monkeypatch):
     assert len(sampled) == 1
     assert sampled[0]['max_windows_per_profile'] == 3
     assert (Path(config['output_dir'])/'prepared.json').is_file()
+
+
+def test_prepared_check_and_train_never_reaudit_and_forward_proof(pipeline, monkeypatch):
+    import torch
+    import openwam.dataloader.curated_goal as goal_data
+    import openwam.dataloader.curated_stage2 as stage2_data
+    import openwam.dataloader.goal_epoch as epoch
+    module, config, dataset, calls = pipeline
+    assert prepare(pipeline) == 0
+    marker=json.loads((Path(config['output_dir'])/'prepared.json').read_text())
+    pointer=marker['runtime_preparation']
+    monkeypatch.setattr(goal_data,'CuratedGoalDataset',lambda *a,**k:pytest.fail('global Stage1 dataset construction'))
+    monkeypatch.setattr(stage2_data,'CuratedStage2Dataset',lambda *a,**k:pytest.fail('global Stage2 dataset construction'))
+    monkeypatch.setattr(epoch,'validate_index',lambda *a,**k:pytest.fail('global index validation'))
+    assert module.main(['--config','unused','--check']) == 0
+    monkeypatch.setattr(torch.cuda,'device_count',lambda:1)
+    commands=[]
+    def execute(output,identity,stage1,stage2,**kwargs):
+        commands.extend([stage1,stage2,kwargs['stage2_preflight']])
+    monkeypatch.setattr(module,'execute_stages',execute)
+    assert module.main(['--config','unused','--train'],_runner=lambda *a,**k:None) == 0
+    assert commands[0][-2:] == ['--prepared-runtime',pointer]
+    for command in commands[1:]:
+        assert '++runtime_preparation='+json.dumps(pointer) in command

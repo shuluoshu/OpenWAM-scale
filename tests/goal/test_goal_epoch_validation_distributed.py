@@ -42,10 +42,14 @@ def _worker(rank, root, mode):
     goal_epoch.validate_index=counted
     result={}
     try:
-        index=root/('other.db' if mode=='follower_identity' and rank==1 else 'index.db')
-        finite=train_goal_epoch.validated_population(_Source(root),index,sample_fps=3.,device=torch.device('cpu'))
+        index=root/('other.db' if mode in ('follower_identity','prepared_follower_identity') and rank==1 else 'index.db')
+        extra={}
+        if mode.startswith('prepared_'):
+            extra=dict(prepared_runtime=(root/'proof.txt').read_text(),config=dict(
+                dataset=dict(source_yaml=str(root/'source.yaml')),sample_fps=3.))
+        finite=train_goal_epoch.validated_population(_Source(root),index,sample_fps=3.,device=torch.device('cpu'),**extra)
         result=dict(status='ok',length=len(finite),summary=finite.summary)
-        if mode=='source_changed':
+        if mode in ('source_changed','prepared_source_changed'):
             if rank==0:(root/'dependency').write_text('changed after global validation')
             dist.barrier()
         result['sample']=finite.sample(0)[0]
@@ -60,16 +64,26 @@ def _worker(rank, root, mode):
 @pytest.mark.parametrize('mode,expected',[
     ('ok',None),('incomplete','incomplete'),('empty','empty population'),
     ('follower_identity','index'),('source_changed','source dependency changed'),
+    ('prepared_ok',None),('prepared_follower_identity','index'),('prepared_source_changed','source dependency changed'),
 ])
 def test_two_ranks_validate_once_and_share_errors(tmp_path,mode,expected):
     from openwam.dataloader.goal_epoch import build_epoch_index
     (tmp_path/'source.yaml').write_text('fixture')
     (tmp_path/'dependency').write_text('initial')
-    build_epoch_index(_Source(tmp_path,empty=mode=='empty'),tmp_path/'index.db',sample_fps=3.)
+    population=build_epoch_index(_Source(tmp_path,empty=mode=='empty'),tmp_path/'index.db',sample_fps=3.)
+    if mode.startswith('prepared_'):
+        from openwam.train.prepared_runtime import write_prepared_runtime
+        registry=tmp_path/'registry.json';registry.write_text('{}')
+        audit=tmp_path/'audit.json';audit.write_text('{"errors": []}')
+        baseline=tmp_path/'baseline';baseline.mkdir();(baseline/'config.yaml').write_text('model: {}')
+        proof=write_prepared_runtime(tmp_path,stage1=dict(dataset=dict(source_yaml=str(tmp_path/'source.yaml')),sample_fps=3.),
+            stage2_dataloader=dict(source_yaml=str(tmp_path/'source.yaml'),normalization_registry=str(registry)),
+            pipeline=dict(stage2_baseline=str(baseline)),population=population,audit_path=audit,dataset_contract={})
+        (tmp_path/'proof.txt').write_text(proof)
     if mode=='incomplete':
         with sqlite3.connect(tmp_path/'index.db') as connection:
             connection.execute("UPDATE metadata SET value='false' WHERE key='complete'")
-    if mode=='follower_identity':
+    if mode in ('follower_identity','prepared_follower_identity'):
         (tmp_path/'other.db').write_bytes((tmp_path/'index.db').read_bytes())
     context=mp.spawn(_worker,args=(str(tmp_path),mode),nprocs=2,join=False)
     deadline=time.monotonic()+60
@@ -80,14 +94,14 @@ def test_two_ranks_validate_once_and_share_errors(tmp_path,mode,expected):
         for process in context.processes:
             if process.is_alive():process.terminate();process.join(timeout=5)
     results=[json.loads((tmp_path/f'rank_{rank}.json').read_text()) for rank in range(2)]
-    assert [r['global_validation_calls'] for r in results]==[1,0]
+    assert [r['global_validation_calls'] for r in results]==([0,0] if mode.startswith('prepared_') else [1,0])
     if expected is None:
         assert all(r['status']=='ok' and r['length']==2 for r in results)
         assert results[0]['summary']==results[1]['summary']
         assert results[0]['sample']==results[1]['sample']==dict(anchor=0,goal=11)
     else:
         assert all(r['status']=='error' and expected in r['error'] for r in results)
-        if mode!='source_changed':assert results[0]['error']==results[1]['error']
+        if mode not in ('source_changed','prepared_source_changed'):assert results[0]['error']==results[1]['error']
 
 
 def test_single_process_validation_keeps_original_errors(tmp_path):

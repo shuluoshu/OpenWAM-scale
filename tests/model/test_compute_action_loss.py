@@ -8,6 +8,7 @@ vs 2-D action_is_pad. Uses a thin stub that supplies just the scheduler
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -168,3 +169,43 @@ class TestComputeActionLoss:
             device="cpu",
         )
         assert torch.allclose(l, torch.tensor(0.0), atol=1e-7)
+
+
+@pytest.mark.parametrize('mask_kind', ['element', 'time', 'legacy_hand'])
+@pytest.mark.parametrize('all_masked', [False, True])
+@pytest.mark.parametrize('bad', [float('nan'), float('inf'), -float('inf')])
+def test_masked_nonfinite_actions_have_zero_loss_and_gradient(mask_kind, all_masked, bad):
+    pred = torch.full((1, 2, 112), 2., requires_grad=True)
+    target = torch.zeros_like(pred)
+    pad = torch.ones_like(pred, dtype=torch.bool)
+    if not all_masked:
+        pad[:, 0, :9 if mask_kind == 'element' else 112] = False
+    if mask_kind == 'time':
+        pad = pad.all(dim=-1)
+    elif mask_kind == 'legacy_hand':
+        pad = pad.all(dim=-1, keepdim=True).expand(-1, -1, 2)
+    active = ~pad if mask_kind == 'element' else ~pad.all(-1) if mask_kind == 'legacy_hand' else ~pad
+    if active.ndim == 2:
+        active = active.unsqueeze(-1).expand_as(pred)
+    target[~active] = bad
+    loss = _ModelStub()._compute_action_loss(pred, target, torch.tensor([0]), _SchedulerStub(),
+                                            {'action_is_pad': pad}, 'cpu')
+    assert loss.item() == (0. if all_masked else 4.)
+    loss.backward()
+    assert torch.isfinite(pred.grad).all()
+    assert (pred.grad[~active] == 0).all()
+    if not all_masked:
+        torch.testing.assert_close(pred.grad[active], torch.full_like(pred.grad[active], 4./active.sum()))
+
+
+@pytest.mark.parametrize('bad', [float('nan'), float('inf'), -float('inf')])
+@pytest.mark.parametrize('poison_prediction', [False, True])
+def test_nonfinite_valid_action_entries_remain_detectable(bad, poison_prediction):
+    pred = torch.zeros(1, 2, 112)
+    target = torch.zeros_like(pred)
+    (pred if poison_prediction else target)[0, 0, 0] = bad
+    pad = torch.ones_like(pred, dtype=torch.bool)
+    pad[0, 0, 0] = False
+    loss = _ModelStub()._compute_action_loss(pred, target, torch.tensor([0]), _SchedulerStub(),
+                                            {'action_is_pad': pad}, 'cpu')
+    assert not torch.isfinite(loss)

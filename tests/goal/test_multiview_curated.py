@@ -13,20 +13,20 @@ from openwam.train.goal_curated import load_config, prepare_batch, train_curated
 from openwam.train.goal_patch import make_smoke_data
 
 
-def native_fixture(tmp_path, wrists=('left', 'right')):
+def native_fixture(tmp_path, wrists=('left', 'right'), fps=10):
     import pyarrow as pa
     import pyarrow.parquet as pq
     root = tmp_path/'LightWheel/fixture'
     (root/'meta/episodes/chunk-000').mkdir(parents=True)
     cameras = ['observation.images.head_left'] + ['observation.images.cam_'+side+'_wrist' for side in wrists]
-    info = dict(fps=10, features={camera: dict(dtype='video', shape=[24,32,3]) for camera in cameras},
+    info = dict(fps=fps, features={camera: dict(dtype='video', shape=[24,32,3]) for camera in cameras},
                 data_path='data.parquet', video_path='shared.mp4')
     # Joint semantics are deliberately unavailable: camera reading must not
     # trigger Stage2 robot joint validation.
     info['features']['observation.states.joint'] = dict(dtype='float32', shape=[3], unit='unknown')
     (root/'meta/info.json').write_text(json.dumps(info))
     ep = dict(episode_index=0, length=10, **{'data/chunk_index':0, 'data/file_index':0})
-    for camera, offset in zip(cameras, (.2,.4,.6)):
+    for camera, offset in zip(cameras, (2/fps,4/fps,6/fps)):
         ep.update({f'videos/{camera}/chunk_index':0, f'videos/{camera}/file_index':0,
                    f'videos/{camera}/from_timestamp':offset})
     pq.write_table(pa.Table.from_pylist([ep]),root/'meta/episodes/chunk-000/file-000.parquet')
@@ -37,7 +37,7 @@ def native_fixture(tmp_path, wrists=('left', 'right')):
         segments_by_repo={'LightWheel/fixture':[[0,1,2]]}, repo_weights={'LightWheel/fixture':1}))))
     av=pytest.importorskip('av')
     with av.open(str(root/'shared.mp4'),'w') as container:
-        stream=container.add_stream('mpeg4',rate=10)
+        stream=container.add_stream('mpeg4',rate=fps)
         stream.width=32; stream.height=24; stream.pix_fmt='yuv420p'
         for i in range(20):
             frame=av.VideoFrame.from_ndarray(np.full((24,32,3),i*10,np.uint8),format='rgb24')
@@ -344,3 +344,43 @@ def test_preflight_visible_input_dimensions_and_view_validity(tmp_path):
         assert 'Head-only endpoint GT (H256 × W320)' in content
         assert 'head: valid · left_wrist: valid · right_wrist: missing' in content
         assert 'Same anchor source frame: 1' in content
+
+
+@pytest.mark.parametrize('goal_valid', [False, True])
+def test_finite_goal_source_validity_preserves_current_views_and_history(tmp_path, goal_valid):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from openwam.dataloader.goal_epoch import build_epoch_index, FiniteGoalDataset
+    from openwam.train.goal_overfit import prepare_overfit_images
+
+    selection, root = native_fixture(tmp_path, fps=1)
+    config = yaml.safe_load(selection.read_text())
+    config['selection']['segments_by_repo']['LightWheel/fixture'] = [[0, 1, 7]]
+    selection.write_text(yaml.safe_dump(config))
+    hands = np.zeros((2, 21, 3))
+    hands[:, 4] = [-.1, 0, 2]
+    hands[:, 8] = [.1, 0, 2]
+    rows = pq.read_table(root/'data.parquet').to_pylist()
+    for row in rows:
+        row['training.valid'] = int(goal_valid or row['frame_index'] != 7)
+        row['observation.states.hand.position'] = hands.ravel().tolist()
+        row['observation.states.camera.intrinsic'] = [10., 0, 16, 0, 10, 12, 0, 0, 1]
+        row['observation.states.camera.world_to_camera'] = np.eye(4).ravel().tolist()
+    pq.write_table(pa.Table.from_pylist(rows), root/'data.parquet')
+    dataset = CuratedGoalDataset(selection, tmp_path/'cache', observation_mode='multiview',
+                                 history={'enabled': True})
+    index = tmp_path/'index.sqlite'
+    build_epoch_index(dataset, index, sample_fps=1.)
+    finite = FiniteGoalDataset(dataset, index, sample_fps=1.)
+    record, batch = finite.sample(4)
+    assert record['anchor_source_frame'] == 5
+    assert record['goal_source_frame'] == 7
+    assert batch['observed_view_valid'].tolist() == [[True, True, True]]
+    assert batch['history_valid'].sum().item() == 4
+    assert batch['history_images'][batch['history_valid']].isfinite().all()
+    assert record['provenance']['head_history']['head'] == 'observation.images.head_left'
+    assert record['goal_image_valid'] is goal_valid
+    for targets in (batch['targets'], prepare_overfit_images([record], device='cpu', dtype=torch.float32)[0]['targets']):
+        assert targets.image_valid.tolist() == [goal_valid]
+        assert targets.point_valid.tolist() == [[goal_valid, goal_valid]]
+        assert targets.in_frame.tolist() == [[goal_valid, goal_valid]]

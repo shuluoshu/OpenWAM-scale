@@ -37,6 +37,9 @@ def epoch_identity(config,population,world):
         if type(budget) is not int or budget<1 or type(repeat) is not bool:raise ValueError('invalid bounded update budget')
         result['training']=dict(mode='bounded_updates',max_updates=budget,repeat_population=repeat)
     elif config.get('repeat_population'):raise ValueError('repeat_population requires max_updates')
+    from openwam.train.convergence import convergence_config
+    convergence=convergence_config(config.get('convergence'),config.get('max_updates'))
+    if convergence is not None:result['training']['convergence']=convergence
     return result
 
 
@@ -52,12 +55,17 @@ def execute_stages(output,identity,stage1_command,stage2_command,*,runner=None,r
         if previous.get('identity',identity)!=identity:raise ValueError('pipeline identity mismatch')
         if previous.get('pipeline_identity',pipeline_identity)!=pipeline_identity:raise ValueError('Stage2 pipeline identity mismatch')
         phase='stage1'
+        completed_pipeline=previous.get('phase')=='complete' or previous.get('stage2_complete') is True
+        completed_flag={'stage2_complete':True} if completed_pipeline else {}
         try:
             completion='training_complete.json' if identity.get('training',{}).get('mode')=='bounded_updates' else 'epoch_complete.json'
-            if not (resume and (output/'stage1'/completion).exists()):
-                atomic_json(state,dict(phase=phase,identity=identity,pipeline_identity=pipeline_identity));runner(stage1_command)
+            if not (resume and (output/'stage1'/completion).exists()
+                    and identity.get('training',{}).get('convergence') is None):
+                atomic_json(state,dict(phase=phase,identity=identity,pipeline_identity=pipeline_identity,**completed_flag));runner(stage1_command)
             proof=verify_completion(output/'stage1',identity)
-            if previous.get('phase')=='complete':return proof
+            if completed_pipeline:
+                atomic_json(state,dict(phase='complete',identity=identity,pipeline_identity=pipeline_identity,stage1=proof))
+                return proof
             phase='stage2'
             atomic_json(state,dict(phase=phase,identity=identity,pipeline_identity=pipeline_identity,stage1=proof))
             substitute=lambda command:[arg.replace('{goal_checkpoint}',proof['checkpoint']) for arg in command]
@@ -66,7 +74,7 @@ def execute_stages(output,identity,stage1_command,stage2_command,*,runner=None,r
             atomic_json(state,dict(phase='complete',identity=identity,pipeline_identity=pipeline_identity,stage1=proof))
             return proof
         except BaseException as exc:
-            atomic_json(state,dict(phase=phase+'_failed',identity=identity,pipeline_identity=pipeline_identity,error=f'{type(exc).__name__}: {exc}'))
+            atomic_json(state,dict(phase=phase+'_failed',identity=identity,pipeline_identity=pipeline_identity,error=f'{type(exc).__name__}: {exc}',**completed_flag))
             raise
 
 
@@ -171,6 +179,7 @@ def main(argv=None, *, _runner=None):
     modes.add_argument('--train',action='store_true',help='launch Stage1 then automatically frozen Stage2')
     modes.add_argument('--check',action='store_true',help='validate prepared inputs; no model or GPU training')
     parser.add_argument('--resume',action='store_true')
+    parser.add_argument('--prepared-runtime',help='explicit offline runtime proof (default: prepared.json pointer)')
     parser.add_argument('--stage2-resume',help='explicit Stage2 full-state checkpoint if Stage2 was interrupted')
     args=parser.parse_args(argv)
     config=load_pipeline(args.config);output=Path(config['output_dir']);output.mkdir(parents=True,exist_ok=True)
@@ -203,6 +212,9 @@ def main(argv=None, *, _runner=None):
     stage2['dataloader']['normalization_registry']=None
     path_overrides=stage2_path_overrides(stage1,stage2)
     validate_stage1_stage2_contract(stage1,stage2)
+    # Match scripts/train.py's effective seed before binding the data contract.
+    if stage2.get('project',{}).get('seed') is not None:
+        stage2['dataloader']['seed']=int(stage2['project']['seed'])
     if args.prepare:
         from openwam.dataloader.curated_stage2 import CuratedStage2Dataset
         from openwam.dataloader.native_stage2_stats import audit_selection,prepare_native_stats
@@ -221,19 +233,35 @@ def main(argv=None, *, _runner=None):
         else:
             registry=prepare_native_stats(dataset,output/'statistics',audit=audit,
                 max_episodes_per_profile=config.get('stats_episodes_per_profile',4),max_windows_per_profile=config.get('stats_windows_per_profile',128))
-        atomic_json(output/'prepared.json',dict(source_yaml=source,stats_registry=registry,index=str(index)))
+        from openwam.train.prepared_runtime import write_prepared_runtime
+        stage2['dataloader']['normalization_registry']=registry
+        population=json.loads((stage1_output/'population.json').read_text())
+        runtime_proof=write_prepared_runtime(output,stage1=stage1,stage2_dataloader=stage2['dataloader'],
+            pipeline=config,stage2_composed=stage2,population=population,audit_path=output/'stage2_metadata_audit.json',
+            dataset_contract=dataset.stats_contract())
+        atomic_json(output/'prepared.json',dict(source_yaml=source,stats_registry=registry,index=str(index),
+            runtime_preparation=runtime_proof))
         print(json.dumps(dict(index=str(index),stats_registry=registry),indent=2));return 0
     prepared=json.loads((output/'prepared.json').read_text())
     registry=config.get('stats_registry') or prepared['stats_registry']
-    from openwam.dataloader.curated_goal import CuratedGoalDataset
-    from openwam.dataloader.goal_epoch import validate_index,epoch_sample_fps
-    ds=dict(stage1['dataset']);ds['cache_dir']=str(output/'check_cache')
-    dataset=CuratedGoalDataset(**ds,seed=stage1.get('seed',42))
-    population=validate_index(dataset,index,sample_fps=epoch_sample_fps(stage1));identity=epoch_identity(stage1,population,world)
-    from openwam.dataloader.curated_stage2 import CuratedStage2Dataset
     stage2['dataloader']['normalization_registry']=registry
-    # Construction validates immutable registry bytes and exact selection/config contract.
-    CuratedStage2Dataset.from_config(stage2['dataloader'])
+    runtime_proof=args.prepared_runtime or prepared.get('runtime_preparation')
+    runtime=None
+    if runtime_proof is not None:
+        from openwam.train.prepared_runtime import load_prepared_runtime
+        runtime=load_prepared_runtime(runtime_proof,stage1=stage1,stage2_dataloader=stage2['dataloader'],
+            pipeline=config,stage2_composed=stage2,index_path=index,source_yaml=source)
+        population=runtime['population']
+        env['OPENWAM_PREPARED_RUNTIME']=str(Path(runtime_proof).resolve())
+    else:
+        from openwam.dataloader.curated_goal import CuratedGoalDataset
+        from openwam.dataloader.goal_epoch import validate_index,epoch_sample_fps
+        ds=dict(stage1['dataset']);ds['cache_dir']=str(output/'check_cache')
+        dataset=CuratedGoalDataset(**ds,seed=stage1.get('seed',42))
+        population=validate_index(dataset,index,sample_fps=epoch_sample_fps(stage1))
+        from openwam.dataloader.curated_stage2 import CuratedStage2Dataset
+        CuratedStage2Dataset.from_config(stage2['dataloader'])
+    identity=epoch_identity(stage1,population,world)
     for p in (stage1['baseline_checkpoint'],config.get('stage2_baseline')):
         if not p or not Path(p).exists():raise FileNotFoundError('baseline checkpoint missing: '+str(p))
     if args.check:
@@ -246,20 +274,22 @@ def main(argv=None, *, _runner=None):
         raise ValueError('interrupted Stage2 requires --stage2-resume full-state checkpoint; refusing implicit restart')
     torchrun=torchrun_command(python,config)
     command1=[*torchrun,*common,'--train']+(['--resume'] if args.resume else [])
+    if runtime_proof is not None:command1+=['--prepared-runtime',str(runtime_proof)]
     overrides=[f'dataloader.source_yaml={source}',f'dataloader.normalization_registry={registry}',
         'goal.checkpoint={goal_checkpoint}',f'project.output_dir={output / "stage2"}',
         f'training.max_steps={config.get("stage2_max_steps",100000)}']
     if args.stage2_resume:overrides += ['training.finetune_ckpt_path=null',f'training.resume_ckpt_path={Path(args.stage2_resume).resolve()}']
     else:overrides += [f'training.finetune_ckpt_path={config["stage2_baseline"]}']
     overrides+=path_overrides+extra
+    if runtime_proof is not None:overrides+=['++runtime_preparation='+json.dumps(str(Path(runtime_proof).resolve()))]
     common2=[str(ROOT/'scripts/train.py'),'--config-name',config['stage2_config'],*overrides]
-    baseline=Path(config['stage2_baseline'])
-    if baseline.is_file():
-        assets=[baseline,baseline.parent/'config.yaml']
-        assets+=sorted(p for p in (baseline.parent/'tokenizer').rglob('*') if p.is_file())
-    else:assets=sorted(p for p in baseline.rglob('*') if p.is_file())
+    if runtime is not None:
+        baseline_hashes={asset['path']:asset['sha256'] for asset in runtime['baseline']}
+    else:
+        from openwam.train.prepared_runtime import baseline_assets
+        baseline_hashes={str(p):sha256(p) for p in baseline_assets(config['stage2_baseline'])}
     contract=dict(stage2_composed=stage2,stage2_max_steps=config.get('stage2_max_steps',100000),
-        stage2_overrides=extra,baseline={str(p):sha256(p) for p in assets},
+        stage2_overrides=extra,baseline=baseline_hashes,
         registry_sha256=sha256(registry),output=str(output/'stage2'))
     if path_overrides:contract['path_aliases_sha256']=sha256(stage1['dataset']['path_aliases'])
     pipeline_identity=hashlib.sha256(json.dumps(contract,sort_keys=True).encode()).hexdigest()

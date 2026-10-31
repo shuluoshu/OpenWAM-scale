@@ -133,3 +133,41 @@ def test_launcher_uses_parallel_coordinator_and_passes_resume_limit(tmp_path,mon
     monkeypatch.setattr(goal_epoch,'train_epoch',train)
     assert launcher.main(['--train','--config','unused','--index','unused','--output-dir',str(tmp_path)])==0
     assert events==['device','coordinator','build','train']
+
+
+def test_stage2_constructor_waves_only_model_load_and_goal_setup(monkeypatch):
+    from types import SimpleNamespace
+    from omegaconf import OmegaConf
+    from openwam.train.openwam_trainer import OpenWAMTrainer
+    import openwam.train.openwam_trainer as trainer_module
+    import openwam.train.utils.stage2 as stage2
+    import openwam.train.bootstrap as bootstrap
+    import openwam.model as model
+    import openwam.model.goal.runtime as runtime
+    events=[];inside=False
+    monkeypatch.setenv('LOCAL_RANK','0');monkeypatch.setenv('LOCAL_WORLD_SIZE','1')
+    monkeypatch.setattr(stage2,'is_stage2',lambda cfg:True)
+    monkeypatch.setattr(stage2,'validate_stage2_config',lambda cfg:None)
+    arch=SimpleNamespace(goal_expert=None,dtype=torch.float32,device='cpu',
+        set_dtype_device=lambda *a:events.append(('placement',inside)),
+        freeze_modules=lambda *a:[],init_training_schedulers=lambda *a:None,
+        set_training_runtime=lambda **kw:None)
+    resolved=SimpleNamespace(registry_name='fake',params={},canonical=SimpleNamespace(framework='fake',variant='fake'))
+    monkeypatch.setattr(model,'resolve_architecture_config',lambda *a:resolved)
+    def build(*a):events.append(('build',inside));return arch
+    monkeypatch.setattr(model,'build_architecture',build)
+    monkeypatch.setattr(runtime,'configure_goal',lambda *a,**kw:events.append(('goal',inside)))
+    monkeypatch.setattr(trainer_module,'log_parameter_counts',lambda *a,**kw:None)
+    def waves(callback,**kw):
+        nonlocal inside
+        assert kw==dict(local_rank=0,local_world_size=1,workers_per_node=1)
+        inside=True
+        result=callback()
+        inside=False
+        return result
+    monkeypatch.setattr(bootstrap,'run_bootstrap_in_waves',waves)
+    cfg=OmegaConf.create(dict(model={'freeze':[]},project={'seed':None},training=dict(
+        bootstrap_workers_per_node=2,lambda_video=1.,lambda_action=1.,use_gradient_checkpointing=True,
+        use_gradient_checkpointing_offload=False,max_timestep_boundary=1.,min_timestep_boundary=0.)))
+    OpenWAMTrainer(cfg)
+    assert events==[('build',True),('goal',True),('placement',False)]

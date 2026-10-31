@@ -113,7 +113,8 @@ def _train(cfg: DictConfig) -> None:
     from openwam.train.utils.stage2 import is_stage2, validate_stage2_launch
     if is_stage2(cfg):
         preflight = bool(cfg.goal.preflight)
-        summary = validate_stage2_launch(cfg, metadata_only=preflight)
+        summary = validate_stage2_launch(cfg, metadata_only=preflight,
+            prepared_runtime=cfg.get("runtime_preparation") or os.environ.get("OPENWAM_PREPARED_RUNTIME"))
         if preflight:
             import json
             print(json.dumps(summary, indent=2), flush=True)

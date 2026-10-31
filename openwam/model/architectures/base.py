@@ -1437,42 +1437,40 @@ class BaseWAMArchitecture(ABC, nn.Module):
         A (T, 2) per-hand mask is handled by the legacy 2D path
         (rank-3 mask, per-element broadcasting), unchanged by this migration.
         """
-        import torch.nn.functional as F
-
         tw = scheduler.training_weight(timestep_ids).to(dtype=torch.float32, device=device)
         if tw.ndim != 1:
             raise ValueError(f"action loss weights must be per-sample [B], got shape {tuple(tw.shape)}")
-        per_element = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
+        residual = noise_pred.float() - target.float()
 
         action_is_pad = inputs.get("action_is_pad")
 
         if action_is_pad is None:
-            per_sample = per_element.mean(dim=(1, 2))
+            per_sample = residual.square().mean(dim=(1, 2))
             return (per_sample * tw).mean()
 
-        action_is_pad = action_is_pad.to(device=per_element.device, dtype=torch.bool)
+        action_is_pad = action_is_pad.to(device=residual.device, dtype=torch.bool)
         valid_mask_f = (~action_is_pad).float()
 
         # New default path: (B, T, D) per-element mask that exactly matches
-        # per_element's shape. Used by RoboCOIN/EgoDex/RoboTwin/OXE after the
+        # residual's shape. Used by RoboCOIN/EgoDex/RoboTwin/OXE after the
         # 2D mask migration.
-        if valid_mask_f.shape == per_element.shape:
-            weighted = per_element * valid_mask_f
+        if valid_mask_f.shape == residual.shape:
+            # Mask before squaring: zero times NaN after MSE also poisons backward.
+            weighted = torch.where(valid_mask_f.bool(), residual, 0.).square()
             per_sample = weighted.sum(dim=(1, 2)) / valid_mask_f.sum(dim=(1, 2)).clamp(min=1)
             return (per_sample * tw).mean()
 
         # Legacy fallback path. Handles:
         #   (a) 1D ``(B, T)`` per-timestep mask (pre-migration contract; still
         #       valid for any reader that didn't migrate).
-        #   (b) ``(B, T, K)`` mask whose K dim does NOT match per_element's D
+        #   (b) ``(B, T, K)`` mask whose K dim does NOT match residual's D
         #       (e.g. predictor stub used in tests where pred ∈ R^{T×2} but
         #       reader emits 14-dim mask; OR a per-hand mask). Collapse
         #       to per-step via ``any(dim=-1)`` so "any dim valid → timestep
         #       contributes" — preserves legacy semantics.
         if valid_mask_f.ndim == 3:
             valid_mask_f = (valid_mask_f > 0).any(dim=-1).float()
-        per_step = per_element.mean(dim=2)
-        per_step = per_step * valid_mask_f
+        per_step = torch.where(valid_mask_f.bool().unsqueeze(-1), residual, 0.).square().mean(dim=2)
         valid_count = valid_mask_f.sum(dim=1).clamp(min=1)
         per_sample = per_step.sum(dim=1) / valid_count
         return (per_sample * tw).mean()

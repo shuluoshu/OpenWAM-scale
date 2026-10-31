@@ -236,7 +236,7 @@ def goal_source_tcp(family, row, *, tcp_from_eef=None):
                     if masks is not None:
                         mask=np.asarray(masks[i],float)
                         if mask.shape!=(10,):raise ValueError('invalid EEF mask')
-                        valid[i] &= (mask[:9]>.5).all()
+                        valid[i] &= (np.isfinite(mask[:9]) & (mask[:9]>.5)).all()
                     if family=='Genrobot':
                         key=f'raw.robot{i+1}.finger.eef_pose.alignment_valid'
                         if key in row:
@@ -269,13 +269,13 @@ def goal_source_tcp(family, row, *, tcp_from_eef=None):
         for key,threshold in [('observation.states.hand.valid',.5),('observation.states.hand.confidence',.8)]:
             if family in humans and key in row:
                 good=np.asarray(row[key],float).reshape(2)
-                valid &= good>=threshold if 'confidence' in key else good>threshold
+                valid &= np.isfinite(good) & (good>=threshold if 'confidence' in key else good>threshold)
                 provenance['used_fields'].append(key)
         for key in ('canonical.frame_valid','source.frame_validity'):
             if key in row:
-                frame_valid=np.asarray(row[key]).reshape(-1)
+                frame_valid=np.asarray(row[key],float).reshape(-1)
                 if not frame_valid.size:raise ValueError(f'{key}: empty shared frame validity')
-                valid &= bool(frame_valid[0]>.5)
+                valid &= bool(np.isfinite(frame_valid[0]) and frame_valid[0]>.5)
         valid &= np.isfinite(tcp).all(-1)
     except (KeyError, ValueError, TypeError) as exc:
         valid[:]=False;provenance['missing_reasons'].append(f'missing_or_invalid_tcp: {exc}')

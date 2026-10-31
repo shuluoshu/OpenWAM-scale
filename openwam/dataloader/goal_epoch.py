@@ -176,6 +176,7 @@ def _check_identity(dataset,metadata):
 def validate_index(dataset,index_path,*,sample_fps=None):
     """Validate identity/completion and interval coverage; never decode images."""
     path=Path(index_path).resolve()
+    before=path.stat()
     _warm_index(path)
     with closing(sqlite3.connect(f'{path.as_uri()}?mode=ro',uri=True)) as c:
         m=_metadata(c);_check_identity(dataset,m)
@@ -193,7 +194,12 @@ def validate_index(dataset,index_path,*,sample_fps=None):
         m['samples_by_level']={level:count for level,count in c.execute('SELECT level,SUM(count) FROM runs GROUP BY level')}
         m['completed_episodes']=expected
         m['run_count']=c.execute('SELECT COUNT(*) FROM runs').fetchone()[0]
-    return dict(m,index_sha256=sha256_file(path),index_path=str(path),selected_repos_sha256=_selected_repos_digest(dataset))
+    checksum=sha256_file(path)
+    after=path.stat()
+    if (before.st_size,before.st_mtime_ns)!=(after.st_size,after.st_mtime_ns):
+        raise ValueError('epoch index changed during validation')
+    return dict(m,index_sha256=checksum,index_path=str(path),selected_repos_sha256=_selected_repos_digest(dataset),
+        index_file_stamp=dict(size=after.st_size,mtime_ns=after.st_mtime_ns))
 
 
 def _prepare_episode(dataset,item,sample_fps):
@@ -384,9 +390,21 @@ def build_epoch_index(dataset,index_path,*,sample_fps=15.0,workers=1,max_pending
 
 
 class FiniteGoalDataset:
-    def __init__(self,dataset,index_path,*,sample_fps=None,_validated_summary=None):
+    def __init__(self,dataset,index_path,*,sample_fps=None,_validated_summary=None,prepared_runtime=None,config=None):
         self.dataset=dataset;self.index_path=Path(index_path).resolve()
-        if _validated_summary is None:self.summary=validate_index(dataset,self.index_path,sample_fps=sample_fps)
+        if prepared_runtime is not None:
+            from openwam.train.prepared_runtime import load_prepared_runtime
+            if config is None:raise ValueError('prepared population requires exact Stage1 config')
+            proof=load_prepared_runtime(prepared_runtime,stage1=config,index_path=self.index_path,
+                source_yaml=dataset.selection['source_yaml'])
+            summary=proof['population']
+            if (summary.get('version')!=VERSION or summary.get('complete') is not True
+                or summary.get('total_samples',0)<=0
+                or summary.get('selected_repos_sha256')!=_selected_repos_digest(dataset)
+                or (sample_fps is not None and summary.get('sample_fps')!=epoch_sample_fps({'sample_fps':sample_fps}))):
+                raise ValueError('prepared population dataset contract mismatch')
+            self.summary=summary
+        elif _validated_summary is None:self.summary=validate_index(dataset,self.index_path,sample_fps=sample_fps)
         else:
             # Only for a summary freshly validated and broadcast by the launcher's
             # rank zero. Every rank still verifies its bytes/configuration locally.

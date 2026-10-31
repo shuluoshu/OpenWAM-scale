@@ -1,0 +1,21 @@
+# Optimized Stage1, official OpenWAM initialization, native mixed task/subtask data.
+base_config: stage1_visual_history_overfit.yaml
+baseline_checkpoint: /mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Pretrain-Foundation-Model/checkpoint_step_154000.safetensors
+sample_fps: 3.0
+max_updates: 154000
+max_steps: 154000
+repeat_population: true
+checkpoint_every: 10000
+eval_every: 10000
+bootstrap_workers_per_node: 2
+sample_cache_size: 0
+# Fixed training-population diagnostics; not held-out success measurements.
+# Exhausting the budget without accepted joint image/TCP evidence blocks Stage2.
+convergence:
+  min_updates: 50000
+  eval_every: 10000
+  patience: 5
+  relative_tolerance: 0.01
+dataset:
+  source_yaml: /mnt/data/cpfs/b5/yeqingda/pretrain/launch/moravla/train_files/pretrain_v0_3_curated_3000h_posttrain_20261019_exclude_rcv1_rmv1_rmv2_20261030_exclude_missing_wipe_table_20261031.yaml
+  cache_dir: outputs/stage1_visual_history_relative112/cache

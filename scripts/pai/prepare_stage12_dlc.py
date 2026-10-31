@@ -7,6 +7,7 @@ and optionally executes the CLI's serialization-only dry run.
 import argparse
 import importlib.util
 import json
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -14,6 +15,26 @@ import sys
 
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT))
+
+
+def runtime_command(site, command):
+    """Unpack a trusted, SHA-pinned conda archive into its rewritten prefix."""
+    archive=site.get('runtime_archive')
+    if archive is None:return shlex.join(command)
+    if (not isinstance(archive,dict) or set(archive)!={'path','sha256','prefix'}
+        or any(not isinstance(archive.get(k),str) or not archive[k] for k in ('path','sha256','prefix'))):
+        raise ValueError('runtime_archive requires path, sha256, prefix strings')
+    path,prefix,checksum=archive['path'],archive['prefix'],archive['sha256']
+    if (not Path(path).is_absolute() or not Path(prefix).is_absolute()
+        or Path(prefix)==Path('/') or not re.fullmatch('[0-9a-fA-F]{64}',checksum)):
+        raise ValueError('runtime_archive requires absolute paths and a pinned SHA256')
+    if site['python']!=str(Path(prefix)/'bin/python'):
+        raise ValueError('runtime_archive prefix must match site.python exactly')
+    # Hash stdin so even filenames with spaces/newlines cannot alter checksum
+    # parsing. Every substituted path is shell-quoted independently.
+    check=f'[ "$(sha256sum < {shlex.quote(path)} | cut -d " " -f 1)" = {shlex.quote(checksum.lower())} ]'
+    return '\n'.join(['set -eu',check,shlex.join(['mkdir','-p','--',prefix]),
+        shlex.join(['tar','-xf',path,'-C',prefix]),shlex.join(command)])
 
 
 def build_request(site):
@@ -45,7 +66,7 @@ def build_request(site):
         Accessibility='PRIVATE',Priority=priority,
         JobSpecs=[dict(Type='Worker',PodCount=4,Image=site['image'],ResourceConfig=dict(
             CPU=str(site['cpu']),GPU='8',Memory=site['memory'],SharedMemory=site['shared_memory']))],
-        Envs=env,UserCommand=shlex.join(command),DataSources=site['data_sources'],
+        Envs=env,UserCommand=runtime_command(site,command),DataSources=site['data_sources'],
         UserVpc=site['user_vpc'],Settings={'EnableRDMA':True})
 
 
@@ -68,18 +89,19 @@ def main():
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     errors=module.validate_request(request)
     if errors: raise ValueError('\n'.join(errors))
-    # User explicitly requested queued submission without capacity polling.
-    # Capacity is not a precondition: scheduler decides when 4 nodes are free.
     out=Path(args.out);out.mkdir(parents=True,exist_ok=True)
     (out/'request.json').write_text(json.dumps(request,indent=2)+'\n')
     dry=module.build_command(request,cli_dry_run=True)
     submit=module.build_command(request)
     (out/'dry_run.sh').write_text('#!/usr/bin/env bash\nset -euo pipefail\n'+shlex.join(dry)+'\n')
-    check=[site['python'],str(Path(site['code_dir'])/'scripts/pai/preparation_gate.py'),
+    # The DLC interpreter is unpacked only after scheduling; this check runs on
+    # the submitting host, using the same interpreter that rendered the request.
+    host_python=sys.executable if site.get('runtime_archive') is not None else site['python']
+    check=[host_python,str(Path(site['code_dir'])/'scripts/pai/preparation_gate.py'),
            '--check','--marker',site['prepared_marker'],'--config',str(pipeline)]
     (out/'submit.sh').write_text('#!/usr/bin/env bash\nset -euo pipefail\n'+shlex.join(check)+'\n'+shlex.join(submit)+'\n')
     print(f'Prepared {out}/request.json; 4 Pods x 8 GPU. No job submitted.')
-    print('Queued submission; quota availability was not queried as requested. Verify image compatibility and CPU preparation before submit.sh.')
+    print('Request rendering does not establish quota availability; the scheduler determines placement. Verify runtime compatibility and CPU preparation before submit.sh.')
     if args.dry_run:subprocess.run(dry,check=True)
 
 

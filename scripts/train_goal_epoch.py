@@ -39,10 +39,24 @@ def export_run_artifacts(output,config,dependencies,*,identity,context_cache=Non
         rank=int(os.environ.get('RANK',0)),world_size=int(os.environ.get('WORLD_SIZE',1))))
 
 
-def validated_population(dataset,index_path,*,sample_fps,device=None):
+def validated_population(dataset,index_path,*,sample_fps,device=None,prepared_runtime=None,config=None):
     """Scan global source dependencies once, then verify index identity per rank."""
     import torch.distributed as dist
     from openwam.dataloader.goal_epoch import FiniteGoalDataset
+    if prepared_runtime is not None:
+        finite=None;error=None
+        try:
+            finite=FiniteGoalDataset(dataset,index_path,sample_fps=sample_fps,
+                prepared_runtime=prepared_runtime,config=config)
+        except Exception as exc:error=f'{type(exc).__name__}: {exc}'
+        if not dist.is_initialized() or dist.get_world_size()==1:
+            if error:raise ValueError('prepared population validation failed: '+error)
+        else:
+            errors=[None]*dist.get_world_size()
+            dist.all_gather_object(errors,error)
+            for rank,err in enumerate(errors):
+                if err:raise RuntimeError(f'prepared population validation failed on rank {rank}: {err}')
+        return finite
     if not dist.is_initialized() or dist.get_world_size()==1:
         finite=FiniteGoalDataset(dataset,index_path,sample_fps=sample_fps)
         if not len(finite):raise ValueError('empty population')
@@ -81,6 +95,7 @@ def main(argv=None):
     parser.add_argument('--index',required=True)
     parser.add_argument('--output-dir',required=True)
     parser.add_argument('--source-yaml')
+    parser.add_argument('--prepared-runtime',help='explicit immutable offline preparation proof; mismatch fails closed')
     parser.add_argument('--resume',action='store_true')
     parser.add_argument('--max-updates',type=int,help='bounded optimizer updates; saved identity includes this budget')
     parser.add_argument('--repeat-population',action='store_true',help='repeat the finite population for bounded overfit')
@@ -115,12 +130,12 @@ def main(argv=None):
         atomic_json(output/'population.json',result);print(json.dumps(result,indent=2));return 0
     # Keep the single-process error path before CUDA allocation; distributed
     # validation needs an initialized group so failures can reach every rank.
-    finite=validated_population(dataset,args.index,sample_fps=sample_fps) if world==1 else None
+    finite=validated_population(dataset,args.index,sample_fps=sample_fps,prepared_runtime=args.prepared_runtime,config=config) if world==1 else None
     device=torch.device('cuda',local)
     torch.cuda.set_device(device)
     if world>1:dist.init_process_group('nccl',timeout=timedelta(hours=4))
     try:
-        if world>1:finite=validated_population(dataset,args.index,sample_fps=sample_fps,device=device)
+        if world>1:finite=validated_population(dataset,args.index,sample_fps=sample_fps,device=device,prepared_runtime=args.prepared_runtime,config=config)
         from openwam.train.stage12 import epoch_identity
         identity=epoch_identity(config,finite.summary,world)
         if rank==0:atomic_json(output/'identity.json',identity)
@@ -145,7 +160,7 @@ def main(argv=None):
             bootstrap_workers_per_node=config.get('bootstrap_workers_per_node',2),
             optimizer_device=config.get('optimizer_device','model'),
             max_updates=config.get('max_updates'),repeat_population=config.get('repeat_population',False),
-            sample_cache_size=config.get('sample_cache_size',0))
+            sample_cache_size=config.get('sample_cache_size',0),convergence=config.get('convergence'))
         if rank==0:
             export_run_artifacts(output,config,dependencies,identity=identity,context_cache=cache)
             print(json.dumps(result,indent=2))

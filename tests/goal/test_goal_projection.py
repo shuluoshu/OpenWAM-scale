@@ -97,3 +97,42 @@ def test_decode_nonzero_offset_rejects_vfr_with_coarse_clock(monkeypatch):
     monkeypatch.setattr(av,'open',lambda _:Container())
     with pytest.raises(ValueError,match='VFR time offset'):
         decode_goal('coarse-clock.mp4',1/30,2)
+
+
+@pytest.mark.parametrize('bad', [0., float('nan'), float('inf'), -float('inf')])
+@pytest.mark.parametrize('key', ['observation.states.eef.mask', 'observation.states.hand.valid',
+                                'observation.states.hand.confidence', 'canonical.frame_valid',
+                                'source.frame_validity', 'raw.robot1.finger.eef_pose.alignment_valid'])
+def test_stored_tcp_flags_require_finite_valid_values(key, bad):
+    from scripts.data.trajectory_projection import goal_source_tcp
+    human = key.startswith('observation.states.hand.')
+    if human:
+        hands = np.zeros((2, 21, 3))
+        hands[:, 4] = [1, 0, 2]
+        hands[:, 8] = [1, 2, 2]
+        row = {'observation.states.hand.position': hands.ravel(), key: [bad, 1.]}
+        family = 'LightWheel'
+    else:
+        row = {'observation.states.eef': [0, 0, 0, 1, 0, 0, 0, 1, 0, 0]*2}
+        row[key] = [bad] + [1.]*19 if key.endswith('.mask') else [bad]
+        family = 'Genrobot' if key.startswith('raw.') else 'morphirobot0930'
+    result = goal_source_tcp(family, row)
+    shared = key in ('canonical.frame_valid', 'source.frame_validity')
+    assert result['tcp_valid'].tolist() == [False, not shared]
+    assert np.isnan(result['tcp_world'][0]).all()
+    if not shared:
+        assert np.isfinite(result['tcp_world'][1]).all()
+
+
+@pytest.mark.parametrize('bad', [float('nan'), float('inf'), -float('inf')])
+@pytest.mark.parametrize('coordinate', [0, 3, 8, 9])
+def test_nonfinite_eef_pose_masks_only_its_arm_and_ignores_gripper(coordinate, bad):
+    from scripts.data.trajectory_projection import goal_source_tcp
+    pose = np.array([0., 0, 0, 1, 0, 0, 0, 1, 0, 0]*2)
+    pose[coordinate] = bad
+    flags = np.ones(20)
+    flags[9] = bad  # Gripper validity is independent of the nine pose coordinates.
+    result = goal_source_tcp('morphirobot0930', {'observation.states.eef': pose,
+                             'observation.states.eef.mask': flags})
+    assert result['tcp_valid'].tolist() == [coordinate == 9, True]
+    np.testing.assert_allclose(result['tcp_world'][1], [.23116, 0, 0])

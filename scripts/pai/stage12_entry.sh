@@ -10,7 +10,12 @@ case "$mode" in prepare|check|train) ;; *) echo 'Usage: stage12_entry.sh {prepar
 export STAGE12_CONFIG="${STAGE12_CONFIG:-configs/goal/stage12_query_history_posttrain_3fps_4x8gpu.yaml}"
 cd "$OPENWAM_CODE_DIR"
 [[ "$(git rev-parse HEAD)" == "$OPENWAM_EXPECTED_COMMIT" ]] || { echo 'Code commit mismatch' >&2; exit 1; }
-git diff --quiet HEAD -- openwam configs/goal configs/model configs/dataloader configs/train.yaml scripts/train_stage12.py scripts/train_goal_epoch.py scripts/train.py scripts/data || { echo 'Training code/config has uncommitted changes' >&2; exit 1; }
+runtime_paths=(openwam configs scripts third_party pyproject.toml setup.py setup.cfg requirements.txt "*.py" "*.so" "*.pth")
+git diff --quiet HEAD -- || { echo 'Training code/config has uncommitted changes' >&2; exit 1; }
+# Include ignored executable/config sources too; only runtime caches and outputs
+# are excluded. An untracked module can shadow pinned imports.
+untracked="$(git ls-files --others --exclude='__pycache__/' --exclude='*.pyc' --exclude='.pytest_cache/' --exclude='outputs/' -- "${runtime_paths[@]}")"
+[[ -z "$untracked" ]] || { echo 'Untracked runtime code/config files present' >&2; printf '%s\n' "$untracked" >&2; exit 1; }
 export PATH="$(dirname "$OPENWAM_PYTHON"):$PATH"
 export PYTHONPATH="$OPENWAM_CODE_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
@@ -33,7 +38,7 @@ assert float(stage1['sample_fps'])==3., 'This entry requires 3 FPS Stage1'
 for name in ('torch','torchvision','transformers','diffusers','deepspeed','av','pyarrow','hydra','omegaconf','psutil'):
     mod=importlib.import_module(name)
     print(name, getattr(mod,'__version__','available'), flush=True)
-for path in (cfg['stage2_baseline'], stage1['baseline_checkpoint'], '/mnt/data/cpfs/b5big', '/mnt/data/nas/B_zone_nas/jeffry/calibration_results'):
+for path in (cfg['source_yaml'], cfg['stage2_baseline'], stage1['baseline_checkpoint'], '/mnt/data/cpfs/b5big', '/mnt/data/nas/B_zone_nas/jeffry/calibration_results'):
     if not Path(path).exists(): raise FileNotFoundError(path)
 if sys.argv[1]=='train':
     import torch
@@ -46,13 +51,4 @@ if sys.argv[1]=='train':
     if not (Path(cfg['output_dir'])/'prepared.json').is_file():
         raise RuntimeError('CPU preparation missing; run prepare before allocating the GPU job')
 PY
-if [[ "$mode" == prepare ]]; then
-    # Derive selection only if absent; never silently regenerate a running job's data.
-    source_yaml="$("$OPENWAM_PYTHON" -c 'import os; from openwam.train.stage12 import load_pipeline; print(load_pipeline(os.environ["STAGE12_CONFIG"])["source_yaml"])')"
-    if [[ ! -f "$source_yaml" ]]; then
-        "$OPENWAM_PYTHON" scripts/data/prepare_stage12_selection.py \
-          --original-yaml /mnt/data/cpfs/b5/yeqingda/pretrain/launch/moravla/train_files/pretrain_v0_3_curated_3000h_posttrain_20261019.yaml \
-          --output-yaml "$source_yaml"
-    fi
-fi
 exec "$OPENWAM_PYTHON" scripts/train_stage12.py --config "$STAGE12_CONFIG" "--$mode" "$@"
