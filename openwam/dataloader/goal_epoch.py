@@ -423,6 +423,9 @@ class FiniteGoalDataset:
             self.summary=summary
         self._connection=None;self._evaluations=None
         self._validated=OrderedDict()
+    def __getstate__(self):
+        # Spawn workers must open their own SQLite handle and episode readers.
+        return dict(self.__dict__,_connection=None,_evaluations=None,_validated=OrderedDict())
     def __len__(self):return self.summary['total_samples']
     def _db(self):
         if self._connection is None:self._connection=sqlite3.connect(f'{self.index_path.as_uri()}?mode=ro',uri=True)

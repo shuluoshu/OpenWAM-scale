@@ -31,6 +31,11 @@ def epoch_identity(config,population,world):
     result=dict(code_sha256=code.hexdigest(),**{k:population[k] for k in ('source_yaml_sha256','index_sha256','total_samples')},
         world_size=world,seed=config.get('seed',42),sampling=sampling_contract(config,population['total_samples']),
         config_sha256=hashlib.sha256(json.dumps(config,sort_keys=True).encode()).hexdigest())
+    loading={name:config.get(name,default) for name,default in
+             (('batch_size',1),('dataset_num_workers',0),('prefetch_factor',2))}
+    for name,minimum in (('batch_size',1),('dataset_num_workers',0),('prefetch_factor',1)):
+        if type(loading[name]) is not int or loading[name]<minimum:raise ValueError('invalid '+name)
+    result['data_loading']=loading
     result['representation']=config.get('model',{}).get('goal_representation','query_latent')
     if config.get('max_updates') is not None:
         budget=config['max_updates'];repeat=config.get('repeat_population',False)

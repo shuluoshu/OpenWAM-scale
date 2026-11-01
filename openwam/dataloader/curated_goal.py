@@ -116,6 +116,10 @@ class CuratedGoalDataset:
         self._episodes=OrderedDict();self._evaluations=None;self._asset_slot=0;self._evaluating=False
         self._weights=np.array([r['weight'] for r in self.repos]);self._weights/=self._weights.sum()
 
+    def __getstate__(self):
+        # Cached Arrow/episode payloads and exported diagnostics stay in parent.
+        return dict(self.__dict__,_episodes=OrderedDict(),_evaluations=None,_asset_slot=0,_evaluating=False)
+
     def scope_summary(self):
         return dict(source_yaml=self.selection['source_yaml'],repositories=len(self.repos),
                     segments=sum(len(r['ranges']) for r in self.repos),

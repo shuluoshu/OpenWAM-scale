@@ -101,6 +101,34 @@ def test_byte_lru_enforces_bytes_and_entries():
     with pytest.raises(ValueError,match='cache_byte_budget'):c.put('c',{},101)
 
 
+def test_byte_lru_pickle_preserves_limits_order_and_eviction():
+    import pickle
+    from openwam.dataloader.native_stage2_io import ByteLRU
+    cache=ByteLRU(2,100)
+    cache.put('a',{'value':1},30);cache.put('b',{'value':2},40)
+    cache.get_value('a')
+    restored=pickle.loads(pickle.dumps(cache))
+    assert (restored.max_entries,restored.max_bytes,restored.bytes)==(2,100,70)
+    assert list(restored)==['b','a']
+    restored.put('c',{'value':3},50)
+    assert list(restored)==['a','c'] and restored.bytes==80
+    assert restored.get_value('a')=={'value':1}
+
+
+def test_stage2_dataset_pickle_discards_reader_cache_and_preserves_limits():
+    import pickle
+    from openwam.dataloader.curated_stage2 import CuratedStage2Dataset
+    from openwam.dataloader.native_stage2_io import ByteLRU
+    dataset=object.__new__(CuratedStage2Dataset)
+    dataset._cache=ByteLRU(2,100)
+    # Real reader state can contain objects that must never enter worker pickle.
+    dataset._cache.put('parent-reader',lambda:None,40)
+    restored=pickle.loads(pickle.dumps(dataset))
+    assert (restored._cache.max_entries,restored._cache.max_bytes)==(2,100)
+    assert len(restored._cache)==0 and restored._cache.bytes==0
+    assert list(dataset._cache)==['parent-reader'] and dataset._cache.bytes==40
+
+
 def make_native_source(tmp_path, *, subtasks=True):
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -214,6 +242,54 @@ def test_video_offset_must_match_previous_episode_lengths():
     assert video_frame_base(ep,rows,cam,30)==10
     ep['videos/head/from_timestamp']=11/30
     with pytest.raises(ValueError,match='video_offset'):video_frame_base(ep,rows,cam,30)
+
+
+def test_undeclared_video_metadata_accepts_optional_missing_end_timestamp(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from openwam.dataloader.native_stage2_io import validate_video_metadata
+    directory=tmp_path/'meta/episodes/chunk-000';directory.mkdir(parents=True)
+    episode={'episode_index':0,'length':10,'dataset_from_index':0,
+             'videos/head/chunk_index':0,'videos/head/file_index':0,
+             'videos/head/from_timestamp':0.}
+    pq.write_table(pa.Table.from_pylist([episode]),directory/'file-000.parquet')
+    metadata={'root':tmp_path,'ep':episode,'info':{'fps':30}}
+    assert validate_video_metadata(metadata,'head')==0
+
+
+def packed_curated_video_rows():
+    return [dict(episode_index=0,length=10,dataset_from_index=0,
+                 **{'videos/head/from_timestamp':0.,'videos/head/to_timestamp':10/30}),
+            dict(episode_index=1,length=20,dataset_from_index=10,
+                 **{'videos/head/from_timestamp':40/30,'videos/head/to_timestamp':60/30})]
+
+
+def test_declared_stationary_curation_preserves_physical_video_gaps():
+    from openwam.dataloader.native_stage2_io import video_frame_base
+    rows=packed_curated_video_rows()
+    info={'data_curation':{'stationary_filter':{
+        'video_materialization':'hardlink_full_source_payload',
+        'parquet_timeline':'dense_reindexed_from_zero'}}}
+    assert video_frame_base(rows[1],rows,'head',30,info=info)==40
+    # Without the exact source declaration, the original cumulative check stays.
+    with pytest.raises(ValueError,match='video_offset'):
+        video_frame_base(rows[1],rows,'head',30,info={})
+
+
+@pytest.mark.parametrize('start,end',[
+    (-1/30,19/30), (40.5/30,60.5/30),
+    (float('nan'),60/30), (40/30,float('inf')),
+    (40/30,59/30), (9/30,29/30),
+])
+def test_declared_stationary_curation_rejects_invalid_video_segments(start,end):
+    from openwam.dataloader.native_stage2_io import video_frame_base
+    rows=packed_curated_video_rows()
+    rows[1].update({'videos/head/from_timestamp':start,'videos/head/to_timestamp':end})
+    info={'data_curation':{'stationary_filter':{
+        'video_materialization':'hardlink_full_source_payload',
+        'parquet_timeline':'dense_reindexed_from_zero'}}}
+    with pytest.raises(ValueError,match='video_offset'):
+        video_frame_base(rows[1],rows,'head',30,info=info)
 
 
 def test_sampling_balances_language_and_excludes_spike_windows(tmp_path):

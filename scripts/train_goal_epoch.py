@@ -98,6 +98,9 @@ def main(argv=None):
     parser.add_argument('--prepared-runtime',help='explicit immutable offline preparation proof; mismatch fails closed')
     parser.add_argument('--resume',action='store_true')
     parser.add_argument('--max-updates',type=int,help='bounded optimizer updates; saved identity includes this budget')
+    parser.add_argument('--batch-size',type=int,help='real samples per rank optimizer update')
+    parser.add_argument('--dataset-num-workers',type=int,help='spawned CPU data readers per rank (zero reads synchronously)')
+    parser.add_argument('--prefetch-factor',type=int,help='bounded pending CPU samples per reader')
     parser.add_argument('--repeat-population',action='store_true',help='repeat the finite population for bounded overfit')
     parser.add_argument('--index-workers',type=int,default=32,help='bounded CPU metadata reader threads during --prepare (default: 32)')
     parser.add_argument('--index-max-pending',type=int,default=64,help='maximum ordered pending episode results (default: 64)')
@@ -113,6 +116,8 @@ def main(argv=None):
     torch.set_num_threads(2)
     config=load_config(args.config,source_yaml=args.source_yaml)
     if args.max_updates is not None:config['max_updates']=args.max_updates
+    for key in ('batch_size','dataset_num_workers','prefetch_factor'):
+        if getattr(args,key) is not None:config[key]=getattr(args,key)
     if args.repeat_population:config['repeat_population']=True
     sample_fps=epoch_sample_fps(config)
     if config['model']['goal_representation'] not in ('query_latent','visual_history_masked_sa'):
@@ -160,7 +165,9 @@ def main(argv=None):
             bootstrap_workers_per_node=config.get('bootstrap_workers_per_node',2),
             optimizer_device=config.get('optimizer_device','model'),
             max_updates=config.get('max_updates'),repeat_population=config.get('repeat_population',False),
-            sample_cache_size=config.get('sample_cache_size',0),convergence=config.get('convergence'))
+            sample_cache_size=config.get('sample_cache_size',0),convergence=config.get('convergence'),
+            batch_size=config.get('batch_size',1),dataset_num_workers=config.get('dataset_num_workers',0),
+            prefetch_factor=config.get('prefetch_factor',2))
         if rank==0:
             export_run_artifacts(output,config,dependencies,identity=identity,context_cache=cache)
             print(json.dumps(result,indent=2))

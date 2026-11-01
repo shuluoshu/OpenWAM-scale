@@ -1,0 +1,11 @@
+# 80 GiB-class devices: FP32 master AdamW remains on the CPU.
+# Capacity measured with initialized optimizer; cluster throughput must be checked.
+base_config: stage1_visual_history_relative112_production.yaml
+batch_size: 128
+dataset_num_workers: 8
+# Singleton worker tasks: at most one future local batch outstanding per rank.
+prefetch_factor: 16
+optimizer_device: cpu
+text_device: cuda
+text_cache_size: 128
+bootstrap_workers_per_node: 8

@@ -2,7 +2,7 @@
 from __future__ import annotations
 import hashlib
 import errno
-from dataclasses import dataclass
+from dataclasses import dataclass,replace
 import json
 import math
 import os
@@ -10,7 +10,7 @@ from pathlib import Path
 import shutil
 import time
 import uuid
-from collections import Counter,OrderedDict
+from collections import Counter
 import torch
 import torch.distributed as dist
 
@@ -224,7 +224,7 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
                 learning_rate=1e-5,history_learning_rate=1e-4,checkpoint_every=5000,
                 eval_every=500,sampling_steps=20,resume=False,bootstrap_workers_per_node=2,optimizer_device='model',
                 condition_learning_rate=None,max_updates=None,repeat_population=False,sample_cache_size=0,
-                convergence=None):
+                convergence=None,batch_size=1,dataset_num_workers=0,prefetch_factor=2):
     from openwam.train.goal_curated import prepare_batch,goal_parameter_groups,_export_cases
     from openwam.train.goal_overfit import FP32MasterAdamW
     from openwam.train.goal_trainer import _seed
@@ -238,22 +238,13 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
     if not math.isfinite(learning_rate) or learning_rate<=0:raise ValueError('invalid learning rate')
     if optimizer_device not in ('model','cpu'):raise ValueError('optimizer_device must be model or cpu')
     if type(sample_cache_size) is not int or sample_cache_size<0:raise ValueError('sample_cache_size must be nonnegative')
-    samples=OrderedDict()
-    def sample(index):
-        if index in samples:
-            pair=samples.pop(index);samples[index]=pair
-            return pair
-        pair=dataset.sample(index)
-        if sample_cache_size:
-            samples[index]=pair
-            while len(samples)>sample_cache_size:samples.popitem(last=False)
-        return pair
+    from openwam.train.goal_batch import GoalBatchLoader,prepare_goal_batch,rank_batch
+    loading=dict(batch_size=batch_size,dataset_num_workers=dataset_num_workers,prefetch_factor=prefetch_factor)
+    defaults=dict(batch_size=1,dataset_num_workers=0,prefetch_factor=2)
     bounded=max_updates is not None
     if bounded and (type(max_updates) is not int or max_updates<1):raise ValueError('max_updates must be a positive integer')
     if type(repeat_population) is not bool or (repeat_population and not bounded):
         raise ValueError('repeat_population requires max_updates')
-    if bounded and not repeat_population and max_updates>math.ceil(len(dataset)/world):
-        raise ValueError('max_updates exceeds one population; enable repeat_population')
     training=dict(mode='bounded_updates',max_updates=max_updates,repeat_population=repeat_population) if bounded else None
     from openwam.train.convergence import (convergence_config,new_state,observe,fixed_flow_metric,
         evaluation_identity,flow_contract,preserve_rng)
@@ -268,19 +259,25 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
     # Validate on every rank and propagate failures before any rank starts DDP.
     order=None;order_error=None
     try:
+        for name,value,minimum in (('batch_size',batch_size,1),('dataset_num_workers',dataset_num_workers,0),
+                                  ('prefetch_factor',prefetch_factor,1)):
+            if type(value) is not int or value<minimum:raise ValueError(name+' has invalid value')
+        if identity.get('data_loading',defaults)!=loading:raise ValueError('data loading identity mismatch')
+        if bounded and not repeat_population and max_updates>math.ceil(len(dataset)/(world*batch_size)):
+            raise ValueError('max_updates exceeds one population; enable repeat_population')
         order=EpochOrder(identity.get('sampling'))
         if order.total!=len(dataset) or order.contract['seed']!=identity['seed']:
             raise ValueError('sampling contract population/seed mismatch')
     except Exception as exc:order_error=f'{type(exc).__name__}: {exc}'
     order_state=dict(error=order_error,contract=order.contract if order is not None else None,
-                     sha256=order.sha256 if order is not None else None)
+                     sha256=order.sha256 if order is not None else None,data_loading=loading)
     order_states=[order_state]
     if distributed:
         order_states=[None]*world
         dist.all_gather_object(order_states,order_state)
     if any(s['error'] for s in order_states):
         raise ValueError('sampling initialization failed: '+str([s['error'] for s in order_states]))
-    if any(s!=order_states[0] for s in order_states):raise ValueError('sampling order differs between ranks')
+    if any(s!=order_states[0] for s in order_states):raise ValueError('sampling order or data loading differs between ranks')
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
     p=next(expert.parameters());device,dtype=p.device,p.dtype
     def primary(call,*,broadcast_result=False):
@@ -335,7 +332,7 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
             local_world_size=local_world,workers_per_node=concurrency)
     event('resume' if resume else 'started',cursor=cursor,step=update,identity=identity,
           sampling=order.contract,sampling_sha256=order.sha256,sampling_host_bytes=order.nbytes,
-          optimizer_device=optimizer_device)
+          optimizer_device=optimizer_device,**loading)
     model=expert
     if distributed:
         from torch.nn.parallel import DistributedDataParallel
@@ -343,7 +340,7 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
             gradient_as_bucket_view=True,find_unused_parameters=True)
     summary=dict(mode='bounded_stage1' if bounded else 'finite_stage1',status='running',identity=identity,scope=dataset.scope_summary(),evaluations=[],
         representation=representation,finite_epoch_complete=False,
-        completed_steps=update,steps=max_updates if bounded else math.ceil(len(dataset)/world),evaluation_split='train',success_verified=False)
+        completed_steps=update,steps=max_updates if bounded else math.ceil(len(dataset)/(world*batch_size)),evaluation_split='train',success_verified=False)
     fixed=[];cards=[]
     def setup():
         nonlocal fixed,cards
@@ -419,56 +416,85 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
         timeline=output/'timeline.html'
         timeline.write_text(timeline.read_text().replace('href="../index.html"','href="index.html"').replace('href="../g1_concept_and_plan.html"','href="summary.json"'))
         event('report_ready',step=update,cursor=cursor,directory=directory)
+    loader=GoalBatchLoader(dataset,order,cursor=cursor,rank=rank,world=world,batch_size=batch_size,
+        num_workers=dataset_num_workers,prefetch_factor=prefetch_factor,seed=identity['seed'],
+        repeat_population=repeat_population,max_batches=max_updates-update if bounded else None,
+        sample_cache_size=sample_cache_size)
     started=time.monotonic()
-    while (update<max_updates if bounded else cursor<len(dataset)) and not (gate and gate['converged']):
-        population_cursor=cursor%len(dataset) if repeat_population else cursor
-        position,weight=rank_sample(population_cursor,len(dataset),rank,world)
-        index=order[position]
-        _seed(identity['seed']+index+(cursor//len(dataset))*len(dataset));expert.train_stage_a();optimizer.zero_grad()
-        error=None;batch=None;composition=None
-        try:
-            record,cpu=sample(index)
-            batch=prepare_batch(record,cpu,device=device,dtype=dtype,context_cache=context_cache)
-            if weight>0:composition=dict(family=record.get('family','unknown'),granularity=record.get('granularity','unknown'))
-        except Exception as exc:error=f'rank {rank}: {type(exc).__name__}: {exc}'
-        prepared=dict(error=error,composition=composition);preparations=[prepared]
-        if distributed:
-            preparations=[None]*world
-            dist.all_gather_object(preparations,prepared)
-        errors=[r['error'] for r in preparations if r['error']]
-        if any(errors):raise RuntimeError('sample preparation failed: '+str(errors))
-        family_counts=dict(Counter(r['composition']['family'] for r in preparations if r['composition']))
-        granularity_counts=dict(Counter(r['composition']['granularity'] for r in preparations if r['composition']))
-        out=model(batch['observed'],batch['context'],batch['targets'],context_lens=batch.get('context_lens'),
-                  observed_view_valid=batch.get('observed_view_valid'),**history_kwargs(batch))
-        finite=torch.tensor(int(torch.isfinite(out['loss']).item()),device=device)
-        if distributed:dist.all_reduce(finite,op=dist.ReduceOp.MIN)
-        if not finite.item():raise FloatingPointError('nonfinite Stage1 loss')
-        (out['loss']*weight).backward()
-        norm=torch.nn.utils.clip_grad_norm_(expert.parameters(),1.,error_if_nonfinite=True,foreach=False)
-        optimizer.step()
-        losses={k:float(v.detach())*weight/world for k,v in out.items() if k.endswith('loss') and isinstance(v,torch.Tensor) and v.numel()==1}
-        valid_tcp=int(out['valid_points']) if weight>0 else 0
-        values=torch.tensor([*losses.values(),valid_tcp,int(valid_tcp>0)],dtype=torch.float64,device=device)
-        if distributed:dist.all_reduce(values)
-        reduced=values.tolist();losses=dict(zip(losses,reduced[:-2]))
-        cursor+=min(world,len(dataset)-population_cursor);update+=1
-        del out,batch,cpu
-        event('update',step=update,cursor=cursor,total_samples=len(dataset),gradient_norm=float(norm),elapsed_s=time.monotonic()-started,
-              family_counts=family_counts,granularity_counts=granularity_counts,
-              valid_tcp_points=int(reduced[-2]),samples_with_tcp=int(reduced[-1]),**losses)
-        summary.update(completed_steps=update,seen_samples=cursor)
-        if rank==0:atomic_json(output/'summary.json',summary)
-        final=update==max_updates if bounded else cursor==len(dataset)
-        visual_due=update%eval_every==0 or final
-        if convergence is None and visual_due:primary(evaluate)
-        gate_due=convergence is not None and (update%convergence['eval_every']==0 or final)
-        if gate_due:
-            update_gate()
-        if update%checkpoint_every==0 or final or gate_due:
-            primary(save)
-            event('checkpoint_saved',step=update,cursor=cursor)
-        if convergence is not None and visual_due:primary(evaluate)
+    try:
+        while (update<max_updates if bounded else cursor<len(dataset)) and not (gate and gate['converged']):
+            update_started=time.monotonic()
+            population_cursor=cursor%len(dataset) if repeat_population else cursor
+            positions,real_count,weight,consumed=rank_batch(population_cursor,len(dataset),rank,world,batch_size)
+            index=order[positions[0]]
+            _seed(identity['seed']+index+(cursor//len(dataset))*len(dataset));expert.train_stage_a();optimizer.zero_grad()
+            error=None;batch=None;composition=None
+            try:
+                wait_started=time.monotonic()
+                pairs=next(loader)
+                loader_wait_s=time.monotonic()-wait_started
+                prepare_started=time.monotonic()
+                batch=prepare_goal_batch(pairs,device=device,dtype=dtype,context_cache=context_cache)
+                if real_count:
+                    composition=[dict(family=record.get('family','unknown'),granularity=record.get('granularity','unknown'))
+                                 for record,_ in pairs]
+                else:
+                    # An empty rank participates in DDP without supervising a duplicate.
+                    target=batch['targets']
+                    batch['targets']=replace(target,image_valid=torch.zeros_like(target.image_valid),
+                                             point_valid=torch.zeros_like(target.point_valid))
+                batch_prepare_host_s=time.monotonic()-prepare_started
+            except Exception as exc:error=f'rank {rank}: {type(exc).__name__}: {exc}'
+            prepared=dict(error=error,composition=composition);preparations=[prepared]
+            if distributed:
+                preparations=[None]*world
+                dist.all_gather_object(preparations,prepared)
+            errors=[r['error'] for r in preparations if r['error']]
+            if any(errors):raise RuntimeError('sample preparation failed: '+str(errors))
+            family_counts=dict(Counter(c['family'] for r in preparations for c in (r['composition'] or [])))
+            granularity_counts=dict(Counter(c['granularity'] for r in preparations for c in (r['composition'] or [])))
+            _seed(identity['seed']+index+(cursor//len(dataset))*len(dataset))
+            out=model(batch['observed'],batch['context'],batch['targets'],context_lens=batch.get('context_lens'),
+                      observed_view_valid=batch.get('observed_view_valid'),**history_kwargs(batch))
+            finite=torch.tensor(int(torch.isfinite(out['loss']).item()),device=device)
+            if distributed:dist.all_reduce(finite,op=dist.ReduceOp.MIN)
+            if not finite.item():raise FloatingPointError('nonfinite Stage1 loss')
+            (out['loss']*weight).backward()
+            norm=torch.nn.utils.clip_grad_norm_(expert.parameters(),1.,error_if_nonfinite=True,foreach=False)
+            optimizer.step()
+            losses={k:float(v.detach())*weight/world for k,v in out.items() if k.endswith('loss') and isinstance(v,torch.Tensor) and v.numel()==1}
+            valid_tcp=int(out['valid_points']) if weight>0 else 0
+            from openwam.model.goal.heads import point_mask
+            samples_with_tcp=int(point_mask(batch['targets']).any(dim=1).sum()) if real_count else 0
+            values=torch.tensor([*losses.values(),valid_tcp,samples_with_tcp],dtype=torch.float64,device=device)
+            if distributed:dist.all_reduce(values)
+            reduced=values.tolist();losses=dict(zip(losses,reduced[:-2]))
+            cursor+=consumed;update+=1
+            del out,batch,pairs
+            memory={} if device.type!='cuda' else dict(
+                cuda_max_memory_allocated_bytes=torch.cuda.max_memory_allocated(device),
+                cuda_max_memory_reserved_bytes=torch.cuda.max_memory_reserved(device))
+            event('update',step=update,cursor=cursor,total_samples=len(dataset),gradient_norm=float(norm),elapsed_s=time.monotonic()-started,
+                  batch_size=batch_size,global_batch_size=batch_size*world,real_samples=consumed,local_real_samples=real_count,
+                  dataset_num_workers=dataset_num_workers,prefetch_factor=prefetch_factor,
+                  loader_wait_s=loader_wait_s,batch_prepare_host_s=batch_prepare_host_s,
+                  update_host_s=time.monotonic()-update_started,**memory,
+                  family_counts=family_counts,granularity_counts=granularity_counts,
+                  valid_tcp_points=int(reduced[-2]),samples_with_tcp=int(reduced[-1]),**losses)
+            summary.update(completed_steps=update,seen_samples=cursor)
+            if rank==0:atomic_json(output/'summary.json',summary)
+            final=update==max_updates if bounded else cursor==len(dataset)
+            visual_due=update%eval_every==0 or final
+            if convergence is None and visual_due:primary(evaluate)
+            gate_due=convergence is not None and (update%convergence['eval_every']==0 or final)
+            if gate_due:
+                update_gate()
+            if update%checkpoint_every==0 or final or gate_due:
+                primary(save)
+                event('checkpoint_saved',step=update,cursor=cursor)
+            if convergence is not None and visual_due:primary(evaluate)
+    finally:
+        loader.close()
     if convergence is not None and not gate['converged']:
         def exhausted():
             summary.update(status='budget_exhausted_without_convergence',convergence=gate,

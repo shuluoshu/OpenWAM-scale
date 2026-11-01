@@ -1,0 +1,11 @@
+# 140 GiB-class devices: GPU FP32 master AdamW and GPU text encoding.
+# Batch 64 is near the measured throughput knee; 128 adds only about 5%.
+base_config: stage1_visual_history_relative112_production.yaml
+batch_size: 64
+dataset_num_workers: 8
+# Singleton worker tasks: at most one future local batch outstanding per rank.
+prefetch_factor: 8
+optimizer_device: model
+text_device: cuda
+text_cache_size: 128
+bootstrap_workers_per_node: 8

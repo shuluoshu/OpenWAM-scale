@@ -43,7 +43,7 @@ def test_bounded_visual_history_repeats_exactly_and_portable_resume(tmp_path):
     deps=dependency_identity(expert.codec.vae,text_dim=expert.context_width,precomputed_text_fingerprint='d'*64)
     result=train_epoch(expert,data,None,tmp_path,identity=identity,dependencies=deps,
         checkpoint_every=3,eval_every=5,sampling_steps=1,max_updates=5,repeat_population=True,sample_cache_size=2)
-    assert len(data.indices)==3  # one evaluation read and two distinct cached training reads
+    assert len(data.indices)==6  # one evaluation read and five distinct (index, cycle seed) reads
     assert result['updates']==result['completed_steps']==5
     assert result['seen_samples']==5 and result['unique_samples_seen']==2
     assert result['completion_kind']=='bounded_updates' and not result['finite_epoch_complete']

@@ -18,6 +18,10 @@ class ByteLRU(OrderedDict):
     def __init__(self, max_entries, max_bytes):
         super().__init__();self.max_entries=int(max_entries);self.max_bytes=int(max_bytes);self.bytes=0
         if min(self.max_entries,self.max_bytes)<1:raise ValueError('cache limits must be positive')
+    def __reduce__(self):
+        # OrderedDict's default reduction calls the subclass without arguments.
+        # Spawned DataLoader workers need our required cache bounds as well.
+        return type(self),(self.max_entries,self.max_bytes),self.__dict__,None,iter(self.items())
     def put(self,key,value,size):
         if size>self.max_bytes:raise ValueError(f'cache_byte_budget: episode {key} needs {size}, limit {self.max_bytes}')
         if key in self:self.bytes-=self.pop(key)[1]
@@ -186,10 +190,36 @@ def merge_source_masks(rep,columns,action_mask,state_mask):
     return global_valid
 
 
-def video_frame_base(episode,rows,camera,fps):
+def _curated_full_source_video(info):
+    curation=(info or {}).get('data_curation',{}).get('stationary_filter',{})
+    return (curation.get('video_materialization')=='hardlink_full_source_payload'
+            and curation.get('parquet_timeline')=='dense_reindexed_from_zero')
+
+
+def video_frame_base(episode,rows,camera,fps,*,info=None):
     """Cross-check file-local ordinal against merged episode metadata timestamps."""
     selected=[r for r in rows if int(r['episode_index'])==int(episode['episode_index'])]
     if len(selected)!=1:raise ValueError('invalid_video_offset: selected episode missing/duplicated')
+    if _curated_full_source_video(info):
+        # Whole episodes removed from the dense parquet timeline still occupy
+        # frames in the retained source video. Its declared segments are physical.
+        prefix='videos/'+camera+'/'
+        spans=[]
+        for row in rows:
+            bounds=np.array([row[prefix+'from_timestamp'],row[prefix+'to_timestamp']],float)*fps
+            if (not np.isfinite(bounds).all() or (bounds<0).any()
+                    or np.max(np.abs(bounds-np.rint(bounds)))>1e-3
+                    or int(row['length'])<1 or abs(bounds[1]-bounds[0]-int(row['length']))>1e-3):
+                raise ValueError(f'invalid_video_offset: {camera} invalid curated segment')
+            spans.append((int(round(bounds[0])),int(round(bounds[1]))))
+        ordered=sorted(spans)
+        if any(right[0]<left[1] for left,right in zip(ordered,ordered[1:])):
+            raise ValueError(f'invalid_video_offset: {camera} overlapping curated segments')
+        target=rows.index(selected[0])
+        bounds=np.array([episode[prefix+'from_timestamp'],episode[prefix+'to_timestamp']],float)*fps
+        if not np.isfinite(bounds).all() or np.max(np.abs(bounds-spans[target]))>1e-3:
+            raise ValueError(f'invalid_video_offset: {camera} selected curated segment mismatch')
+        return spans[target][0]
     rows=sorted(rows,key=lambda r:int(r['dataset_from_index']))
     base=0
     for row in rows:
@@ -207,8 +237,11 @@ def validate_video_metadata(m,camera):
     files=sorted((m['root']/'meta/episodes').glob('chunk-*/*.parquet'))
     dataset=ds.dataset([str(p) for p in files],format='parquet')
     ep=m['ep'];expression=(ds.field(prefix+'chunk_index')==int(ep[prefix+'chunk_index'])) & (ds.field(prefix+'file_index')==int(ep[prefix+'file_index']))
-    table=dataset.to_table(columns=['episode_index','length','dataset_from_index'],filter=expression)
-    return video_frame_base(ep,table.to_pylist(),camera,float(m['info']['fps']))
+    columns=['episode_index','length','dataset_from_index']
+    if _curated_full_source_video(m['info']):
+        columns.extend([prefix+'from_timestamp',prefix+'to_timestamp'])
+    table=dataset.to_table(columns=columns,filter=expression)
+    return video_frame_base(ep,table.to_pylist(),camera,float(m['info']['fps']),info=m['info'])
 
 
 def calibration_eligibility(root,family,episode):

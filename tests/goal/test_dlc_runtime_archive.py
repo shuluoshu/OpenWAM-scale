@@ -13,7 +13,7 @@ def site(tmp_path):
     return dict(workspace_id='workspace',quota_id='quota',image='image',cpu=144,
         memory='1500Gi',shared_memory='500Gi',python='/usr/bin/python',
         code_dir=str(tmp_path/'code'),commit='a'*40,pod_count=4,gpus_per_pod=8,
-        data_sources=[{'DataSourceId':'source'}],user_vpc={'VpcId':'vpc'},display_name='test')
+        data_sources=[{'DataSourceId':'source'}],user_vpc={'VpcId':'vpc'},display_name='test',startup_mode='train')
 
 
 @pytest.mark.parametrize('case',['not_mapping','missing','bad_sha','relative_path','relative_prefix','python_mismatch'])
