@@ -59,6 +59,38 @@ def test_cfr_path_remains_strict_about_fps_and_pts(tmp_path):
         assert alignment[index]['video_ordinal']==index+2
 
 
+@pytest.mark.parametrize('shift_ticks', [-8, -1, 1, 8])
+def test_cfr_quantized_pts_preserve_pixels_and_nonzero_episode_offset(tmp_path, shift_ticks):
+    """A one-tick muxing offset must not reject or shift a 30-Hz sample."""
+    av=pytest.importorskip('av')
+    from scripts.data.prepare_subtask_goals import decode_frames
+    path=tmp_path/'quantized.mp4'
+    with av.open(str(path),'w') as container:
+        stream=container.add_stream('mpeg4',rate=30)
+        stream.width=32;stream.height=24;stream.pix_fmt='yuv420p'
+        stream.codec_context.time_base=Fraction(1,15360)
+        for index in range(64):
+            rgb=np.full((24,32,3),index*3,np.uint8)
+            frame=av.VideoFrame.from_ndarray(rgb,format='rgb24')
+            frame.pts=index*512+(shift_ticks if 10<=index<50 else 0)
+            frame.time_base=Fraction(1,15360)
+            for packet in stream.encode(frame):container.mux(packet)
+        for packet in stream.encode():container.mux(packet)
+    with av.open(str(path)) as container:
+        reference=[(f.pts,np.asarray(f.to_image().convert('RGB')))
+                   for f in container.decode(video=0)]
+    assert reference[20][0]==20*512+shift_ticks
+    if abs(shift_ticks)>1:
+        with pytest.raises(ValueError,match='nonuniform PTS'):
+            decode_frames(path,10/30,30,[0,10,30,43])
+        return
+    images,alignment=decode_frames(path,10/30,30,[0,10,30,43])
+    for index in (0,10,30,43):
+        np.testing.assert_array_equal(np.asarray(images[index]),reference[index+10][1])
+        assert alignment[index]['video_ordinal']==index+10
+        assert alignment[index]['pts']==reference[index+10][0]
+
+
 @pytest.mark.parametrize('offset',[1/30,1e-7])
 def test_sequential_rejects_nonzero_time_offset_without_ordinal_origin(tmp_path,offset):
     from scripts.data.prepare_subtask_goals import decode_frames

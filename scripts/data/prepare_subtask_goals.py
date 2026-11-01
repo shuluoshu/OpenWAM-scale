@@ -71,6 +71,7 @@ def decode_frames(path,offset_s,fps,indices,*,sequential=False,video_ordinals=No
     Sequential decoding never estimates a frame number from nominal FPS or PTS.
     """
     import av
+    from fractions import Fraction
     from itertools import chain
     if sequential and offset_s!=0:
         raise ValueError('VFR nonzero time offset needs an explicit ordinal origin')
@@ -115,12 +116,20 @@ def decode_frames(path,offset_s,fps,indices,*,sequential=False,video_ordinals=No
                 if ordinal in requested:save(frame,ordinal,'sequential_decoded_ordinal')
                 if ordinal>=max(requested):break
         else:
+            # Muxed CFR chunks can be displaced by one integer timestamp tick.
+            # Bound that quantization allowance below half a frame so nearest
+            # ordinals remain unambiguous; real VFR still requires ordinal maps.
+            frames_per_tick = stream.time_base * Fraction(str(fps))
+            pts_tolerance = min(Fraction(1,4),max(Fraction(1,1000),frames_per_tick))
             remaining=set(requested)
             while remaining:
                 target=min(remaining);container.seek(first_pts+round(target/fps/tb),stream=stream,backward=True)
                 for frame in container.decode(stream):
-                    ordinal_float=(frame.pts-first_pts)*tb*fps;ordinal=round(ordinal_float)
-                    if abs(ordinal_float-ordinal)>1e-3:raise ValueError('nonuniform PTS requires sequential decode')
+                    if frame.pts is None:raise ValueError('missing decoded PTS')
+                    ordinal_exact=(frame.pts-first_pts)*frames_per_tick;ordinal=round(ordinal_exact)
+                    if abs(ordinal_exact-ordinal)>pts_tolerance:
+                        raise ValueError(f'nonuniform PTS requires sequential decode: {path}, '
+                                         f'pts={frame.pts}, requested_ordinal={target}')
                     if ordinal in remaining:save(frame,ordinal,'exact_cfr_pts_including_first_pts');remaining.remove(ordinal)
                     if not remaining or (ordinal>=target and min(remaining)-ordinal>60):break
                     if ordinal>max(requested):break
