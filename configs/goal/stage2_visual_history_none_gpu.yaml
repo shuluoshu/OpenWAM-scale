@@ -1,0 +1,13 @@
+# @package _global_
+defaults:
+  - stage2_visual_history_none
+  - _self_
+dataloader:
+  future_video_mode: none
+training:
+  offload_optimizer_device: none
+  # Explicit single-tensor GPU AdamW; validate the 32-rank recipe on DLC.
+  adam_foreach: false
+  adam_betas: [0.9, 0.95]
+  batch_size: 8
+  dataset_num_workers: 4

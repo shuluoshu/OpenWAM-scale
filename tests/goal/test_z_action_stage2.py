@@ -173,3 +173,20 @@ def test_action_curves_explain_colors_and_masked_channels(tmp_path):
     assert 'No valid GT: excluded from metrics' in svg
     assert 'channel 0 (no valid GT)' in svg
     assert 'height="2560"' in svg and 'translate(0,40)' in svg
+
+
+@pytest.mark.parametrize('architecture_mode',['joint','none'])
+def test_explicit_reader_future_mode_must_match_architecture(architecture_mode):
+    from hydra import compose, initialize_config_dir
+    from omegaconf import open_dict
+    from pathlib import Path
+    from openwam.train.utils.stage2 import validate_stage2_config
+    with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[2]/'configs'),version_base=None):
+        cfg=compose(config_name='goal/stage2_query_sample')
+    with open_dict(cfg):
+        cfg.model.architecture.future_video_mode=architecture_mode
+        cfg.dataloader.future_video_mode=architecture_mode
+    validate_stage2_config(cfg)
+    cfg.dataloader.future_video_mode='none' if architecture_mode=='joint' else 'joint'
+    with pytest.raises(ValueError,match='dataloader.future_video_mode disagrees'):
+        validate_stage2_config(cfg)

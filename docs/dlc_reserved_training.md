@@ -1,5 +1,10 @@
 # Reserved DLC launch and Stage1 batch profiles
 
+For the new GPU-sharded optimizer recipes, see
+[GPU optimizer training revision](stage12_gpu_optimizer.md). The older profiles
+documented below remain available for their pinned runs; the new profiles use
+separate configuration names and output directories.
+
 `scripts/pai/prepare_stage12_dlc.py` defaults to `startup_mode: hold`. Its DLC
 `UserCommand` is exactly `sleep 36000000` (shell seconds). Scheduling the job does
 not unpack the runtime, initialize a model, or start training. The reservation

@@ -138,7 +138,14 @@ def main(argv=None):
     finite=validated_population(dataset,args.index,sample_fps=sample_fps,prepared_runtime=args.prepared_runtime,config=config) if world==1 else None
     device=torch.device('cuda',local)
     torch.cuda.set_device(device)
+    singleton_group=None
     if world>1:dist.init_process_group('nccl',timeout=timedelta(hours=4))
+    elif config.get('optimizer_sharding','none')=='zero1':
+        # ZRO also needs a group during the required single-GPU capacity check.
+        import tempfile
+        singleton_group=tempfile.TemporaryDirectory(prefix='openwam-stage1-group-')
+        dist.init_process_group('nccl',init_method=Path(singleton_group.name,'rendezvous').as_uri(),
+                                rank=0,world_size=1,timeout=timedelta(hours=4))
     try:
         if world>1:finite=validated_population(dataset,args.index,sample_fps=sample_fps,device=device,prepared_runtime=args.prepared_runtime,config=config)
         from openwam.train.stage12 import epoch_identity
@@ -164,6 +171,9 @@ def main(argv=None):
             sampling_steps=config.get('sampling_steps',20),resume=args.resume,
             bootstrap_workers_per_node=config.get('bootstrap_workers_per_node',2),
             optimizer_device=config.get('optimizer_device','model'),
+            optimizer_sharding=config.get('optimizer_sharding','none'),
+            adam_betas=config.get('adam_betas',(.9,.999)),adam_eps=config.get('adam_eps',1e-8),
+            weight_decay=config.get('weight_decay',.01),dataset_pin_memory=config.get('dataset_pin_memory',False),
             max_updates=config.get('max_updates'),repeat_population=config.get('repeat_population',False),
             sample_cache_size=config.get('sample_cache_size',0),convergence=config.get('convergence'),
             batch_size=config.get('batch_size',1),dataset_num_workers=config.get('dataset_num_workers',0),
@@ -173,6 +183,7 @@ def main(argv=None):
             print(json.dumps(result,indent=2))
     finally:
         if dist.is_initialized():dist.destroy_process_group()
+        if singleton_group is not None:singleton_group.cleanup()
     return 0
 
 

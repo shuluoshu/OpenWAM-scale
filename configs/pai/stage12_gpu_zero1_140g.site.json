@@ -1,0 +1,86 @@
+{
+  "region": "cn-shanghai",
+  "workspace_id": "1140257",
+  "quota_id": "quota1r415ahnha3",
+  "priority": 9,
+  "image": "moqi-sh-arc-registry-vpc.cn-shanghai.cr.aliyuncs.com/moqi-sh/mq_sanyi_train:sanyi-dsw-0515",
+  "cpu": "144",
+  "memory": "1600Gi",
+  "shared_memory": "64Gi",
+  "display_name": "openwam-gpu-zero1-140g-none-hold",
+  "pod_count": 4,
+  "gpus_per_pod": 8,
+  "code_dir": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/stage12_gpu_optimizer_20261101/code",
+  "python": "/tmp/openwam-runtime-20261031/env/bin/python",
+  "commit": "auto",
+  "pipeline_config": "configs/goal/stage12_gpu_zero1_140g_none_4x8gpu.yaml",
+  "prepared_marker": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/stage12_gpu_optimizer_20261101/run_140g_none/prepared.json",
+  "resume": false,
+  "stage2_resume": null,
+  "data_sources": [
+    {
+      "MountPath": "/mnt/data/nas/F_zone_nas",
+      "Uri": "nas://0328f6e7-uykx.cn-shanghai.extreme.nas.aliyuncs.com/"
+    },
+    {
+      "MountPath": "/mnt/data/nas/B_zone_nas",
+      "Uri": "nas://03a06c7a-awqh.cn-shanghai.extreme.nas.aliyuncs.com/"
+    },
+    {
+      "MountPath": "/mnt/data/cpfs/b5",
+      "Uri": "bmcpfs://cpfs-01001yvf8qy3eg0e9mhv2-vpc-vyv66j.cn-shanghai.cpfs.aliyuncs.com/"
+    },
+    {
+      "MountPath": "/mnt/data/cpfs/b5big",
+      "Uri": "bmcpfs://cpfs-01001yicmjn0uwxwbk0z5-vpc-2fylmm.cn-shanghai.cpfs.aliyuncs.com/"
+    }
+  ],
+  "user_vpc": {
+    "SecurityGroupId": "sg-uf6c51dgcyyg22k9aabi",
+    "SwitchId": "vsw-uf6031nybmufu28ssvekq",
+    "VpcId": "vpc-uf6mp9wg299dfh8gzhkp7",
+    "ExtendedCIDRs": [
+      "10.1.192.0/21",
+      "10.1.160.0/19",
+      "10.1.255.0/24",
+      "10.1.128.0/19",
+      "10.1.96.0/19",
+      "10.1.64.0/19",
+      "10.1.32.0/19"
+    ]
+  },
+  "reference_only": {
+    "observed_at_utc": "2026-10-24",
+    "job_id": "dlc6s0umjw7jois6",
+    "workspace_id": "1140257",
+    "quota_id": "quota9lheyy49shl",
+    "specs": [
+      {
+        "Image": "moqi-sh-arc-registry-vpc.cn-shanghai.cr.aliyuncs.com/moqi-sh/mq_sanyi_train:sanyi-dsw-0515",
+        "PodCount": 1,
+        "ResourceConfig": {
+          "CPU": "168",
+          "GPU": "8",
+          "GPUType": "",
+          "Memory": "1600Gi",
+          "SharedMemory": "1600Gi"
+        }
+      }
+    ],
+    "note": "Mounts/VPC/image/per-node CPU and RAM from succeeded 8-GPU job. User approved 4 x 8 topology and explicitly declined capacity polling on 2026-10-24; use queued scheduling."
+  },
+  "startup_mode": "hold",
+  "expected_min_gpu_memory_gib": 130,
+  "runtime_archive": {
+    "path": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/stage12_dlc_preflight_20261031/openwam_runtime.tar",
+    "sha256": "1f16c0ddc69c92608ff2bf8d8fc0f1983abedd5ed17447e886e2607730849564",
+    "prefix": "/tmp/openwam-runtime-20261031/env"
+  },
+  "cache_env": {
+    "TMPDIR": "/tmp",
+    "XDG_CACHE_HOME": "/tmp/openwam-cache",
+    "HF_HOME": "/tmp/openwam-cache/huggingface",
+    "TORCH_HOME": "/tmp/openwam-cache/torch",
+    "TRITON_CACHE_DIR": "/tmp/openwam-cache/triton"
+  }
+}

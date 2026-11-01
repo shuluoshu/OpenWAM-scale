@@ -72,7 +72,7 @@ def _identity_collate(samples):return samples
 
 
 def _worker_init(worker_id):
-    """Each worker owns its readers and scratch image/NPZ slots."""
+    """Each worker owns its readers and evaluation asset directory."""
     torch.set_num_threads(1)
     wrapper=torch.utils.data.get_worker_info().dataset
     dataset=wrapper.dataset
@@ -113,16 +113,17 @@ class GoalBatchLoader:
     samples, in addition to the batch being assembled/processed in the parent.
     """
     def __init__(self,dataset,order,*,cursor,rank,world,batch_size=1,num_workers=0,prefetch_factor=2,
-                 seed=42,repeat_population=False,max_batches=None,sample_cache_size=0):
+                 seed=42,repeat_population=False,max_batches=None,sample_cache_size=0,pin_memory=False):
         for name,value,minimum in (('batch_size',batch_size,1),('num_workers',num_workers,0),
                                   ('prefetch_factor',prefetch_factor,1),('sample_cache_size',sample_cache_size,0)):
             if type(value) is not int or value<minimum:raise ValueError(name+' has invalid value')
+        if type(pin_memory) is not bool:raise ValueError('pin_memory must be boolean')
         self.dataset=dataset;self.order=order;self.cursor=cursor;self.rank=rank;self.world=world
         self.batch_size=batch_size;self.seed=seed;self.repeat_population=repeat_population;self.max_batches=max_batches
         self.read_cursor=cursor;self.read_batches=0
         self.wrapper=_CPURequests(dataset,sample_cache_size,uuid.uuid4().hex)
         kwargs=dict(dataset=self.wrapper,batch_size=None,sampler=self._requests(),num_workers=num_workers,
-                    collate_fn=_identity_collate,generator=torch.Generator().manual_seed(seed))
+                    collate_fn=_identity_collate,pin_memory=pin_memory,generator=torch.Generator().manual_seed(seed))
         if num_workers:kwargs.update(multiprocessing_context='spawn',worker_init_fn=_worker_init,prefetch_factor=prefetch_factor)
         self.loader=torch.utils.data.DataLoader(**kwargs);self.iterator=None
     def _requests(self):

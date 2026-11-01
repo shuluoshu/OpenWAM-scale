@@ -607,7 +607,9 @@ class OpenWAMTrainer:
                 video_lr=float(t.video_lr) if getattr(t, "video_lr", None) else None,
             )
         betas = tuple(getattr(t, "adam_betas", [0.9, 0.95]))
-        return torch.optim.AdamW(params, lr=float(t.learning_rate), weight_decay=float(t.weight_decay), betas=betas)
+        from openwam.train.utils.stage2 import stage2_optimizer_options
+        options = stage2_optimizer_options(t) if getattr(self, '_stage2', False) else {}
+        return torch.optim.AdamW(params, lr=float(t.learning_rate), weight_decay=float(t.weight_decay), betas=betas, **options)
 
     # (4) Called by train() — build the training DataLoader (seeded generator when reproducible).
     def build_dataloader(self, batch_size: int) -> torch.utils.data.DataLoader:

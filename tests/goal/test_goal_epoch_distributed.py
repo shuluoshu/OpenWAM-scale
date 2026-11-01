@@ -7,7 +7,7 @@ import torch.multiprocessing as mp
 import pytest
 
 
-def _worker(rank, rendezvous, output):
+def _worker(rank, rendezvous, output, optimizer_sharding):
     from test_query_goal import make_query
     from test_multiview_patch import multiview_batch
     from openwam.train.goal_epoch import train_epoch
@@ -26,13 +26,14 @@ def _worker(rank, rendezvous, output):
         identity=dict(index_sha256='a'*64,source_yaml_sha256='b'*64,total_samples=3,world_size=2,seed=42,config_sha256='c'*64)
         identity['sampling']=sampling_contract({'seed':42},3)
         deps=dependency_identity(expert.codec.vae,text_dim=expert.text_dim,precomputed_text_fingerprint='d'*64)
-        train_epoch(expert,Data(),None,output,identity=identity,dependencies=deps,checkpoint_every=1,eval_every=2,sampling_steps=2)
+        train_epoch(expert,Data(),None,output,identity=identity,dependencies=deps,checkpoint_every=1,eval_every=2,sampling_steps=2,optimizer_sharding=optimizer_sharding)
         torch.save(expert.state_dict(),Path(output)/f'rank{rank}.pt')
     finally:dist.destroy_process_group()
 
 
-def test_two_rank_partial_tail_and_synchronized_weights(tmp_path):
-    mp.spawn(_worker,args=(str(tmp_path/'rendezvous'),str(tmp_path/'run')),nprocs=2,join=True)
+@pytest.mark.parametrize("optimizer_sharding", ["none", "zero1"])
+def test_two_rank_partial_tail_and_synchronized_weights(tmp_path,optimizer_sharding):
+    mp.spawn(_worker,args=(str(tmp_path/'rendezvous'),str(tmp_path/'run'),optimizer_sharding),nprocs=2,join=True)
     output=tmp_path/'run';proof=json.loads((output/'epoch_complete.json').read_text())
     assert proof['seen_samples']==3 and proof['updates']==2
     left=torch.load(output/'rank0.pt',weights_only=True);right=torch.load(output/'rank1.pt',weights_only=True)

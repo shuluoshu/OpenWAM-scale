@@ -1,0 +1,16 @@
+# New-run GPU recipe. Never resume an old full/CPU optimizer checkpoint here.
+base_config: stage1_visual_history_relative112_production.yaml
+optimizer_device: model
+optimizer_sharding: zero1
+adam_betas: [0.9, 0.95]
+adam_eps: 1.0e-8
+weight_decay: 0.01
+# Same global batch (1024 at 32 ranks) on both GPU classes.
+batch_size: 32
+dataset_num_workers: 8
+# Singleton worker tasks: 8 * 4 = 32 future samples, plus current batch.
+prefetch_factor: 4
+dataset_pin_memory: true
+text_device: cuda
+text_cache_size: 128
+bootstrap_workers_per_node: 8

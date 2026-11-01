@@ -592,3 +592,87 @@ def test_stage2_history_head_only_range_and_per_draw_seed(tmp_path,monkeypatch):
     assert calls[0][3]!=calls[1][3] and calls[0][4]
     assert a['prompt']==option['instruction']['text']
     assert a['trace']['head_history']['indices']==[-1]*10
+
+
+def test_none_video_decodes_current_and_history_only_with_native_target_parity(tmp_path,monkeypatch):
+    import torch
+    import yaml
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import scripts.data.prepare_subtask_goals as decoder
+    from tests.dataloader.test_video_alignment import encode_video
+    from openwam.dataloader.curated_stage2 import CuratedStage2Dataset
+    from openwam.dataloader.native_stage2_stats import prepare_native_stats
+    selection=make_native_source(tmp_path,subtasks=False)
+    config=yaml.safe_load(selection.read_text())
+    config['resolver']['segments_by_repo']['interndata_a1/unit']=[[0,0,48]]
+    selection.write_text(yaml.safe_dump(config))
+    root=tmp_path/'source/interndata_a1/unit'
+    info=json.loads((root/'meta/info.json').read_text());info['fps']=2
+    (root/'meta/info.json').write_text(json.dumps(info))
+    data_path=root/'data/episode-0.parquet'
+    rows=pq.read_table(data_path).to_pylist()
+    rows += [{**row,'frame_index':row['frame_index']+24} for row in rows]
+    pq.write_table(pa.Table.from_pylist(rows),data_path)
+    camera='observation.images.cam_high';prefix='videos/'+camera+'/'
+    ep_path=root/'meta/episodes/chunk-000/file-000.parquet'
+    ep=pq.read_table(ep_path).to_pylist()[0]
+    ep.update({'length':48,'dataset_from_index':0,prefix+'chunk_index':0,prefix+'file_index':0,
+               prefix+'from_timestamp':0.,prefix+'to_timestamp':24.})
+    pq.write_table(pa.Table.from_pylist([ep]),ep_path)
+    video=root/'videos'/camera/'0.mp4';video.parent.mkdir(parents=True)
+    encode_video(video,count=48,fps=2,variable=False)
+    registry=prepare_native_stats(CuratedStage2Dataset(selection),tmp_path/'stats',max_episodes_per_profile=1,max_windows_per_profile=32)
+    kwargs=dict(normalization_registry=registry,history={'enabled':True,'jitter_fraction':0.},
+                observation_augmentation={'color_jitter':{'p':1.,'brightness':.2}})
+    joint=CuratedStage2Dataset(selection,**kwargs)
+    none=CuratedStage2Dataset.from_config(dict(source_yaml=str(selection),future_video_mode='none',**kwargs))
+    calls=[];decode=decoder.decode_frames
+    def recording_decode(*args,**kwargs):
+        calls.append(list(args[3]));return decode(*args,**kwargs)
+    monkeypatch.setattr(decoder,'decode_frames',recording_decode)
+    def sample(dataset):
+        repo=dataset.repos[0];m=dataset._episode(repo,0)
+        option=dataset._options(m,repo['ranges'],'task')[0]
+        return dataset._sample_selected(repo,0,m,option,12,'task',draw_id=3)
+    baseline=sample(joint);joint_calls=list(calls);calls.clear()
+    actual=sample(none)
+    assert joint_calls[0]==list(range(12,45,4)) and calls[0]==[12]
+    assert all(index<=12 for indices in calls for index in indices)
+    assert actual['history_images'].shape[0]==10 and actual['history_valid'].sum()>0
+    for key in ('action','action_mask','proprio','proprio_mask','history_images','history_valid','history_ages',
+                'goal_observed_head','goal_observed_multiview','goal_view_valid'):
+        torch.testing.assert_close(actual[key],baseline[key],rtol=0,atol=0)
+    assert actual['action'].shape==(32,112)
+    assert len(actual['video'])==9 and actual['video_view_mask'].shape==(9,3)
+    assert actual['video_mask'].tolist()==[True]+[False]*8
+    assert not actual['video_view_mask'][1:].any()
+    assert actual['trace']['video_source_indices']==baseline['trace']['video_source_indices']
+    assert actual['trace']['decoded_video_source_indices']==[12]
+    assert baseline['trace']['decoded_video_source_indices']==list(range(12,45,4))
+    np.testing.assert_array_equal(actual['video'][0],baseline['video'][0])
+    assert all(np.array_equal(frame,actual['video'][0]) for frame in actual['video'][1:])
+
+    # Feed both reader outputs through the real none-mode prepare/loss path.
+    from tests.goal.test_patch_stage2_memory import make_arch, inputs
+    from openwam.model.video_backbone.wan.shared.diffusion.flow_match import FlowMatchScheduler
+    arch=make_arch();arch.cfg['future_video_mode']='none';arch.set_training_runtime()
+    arch.video_backbone._scheduler=FlowMatchScheduler(template='Wan');arch.init_training_schedulers(10)
+    latent_inputs=inputs();encoded_lengths=[]
+    def preprocess(**kwargs):
+        encoded_lengths.append([len(clip) for clip in kwargs['frames']])
+        current=latent_inputs['latents'][:,:,:1].clone()
+        return dict(input_latents=current,first_frame_latents=current,context=latent_inputs['context'])
+    monkeypatch.setattr(arch.video_backbone,'preprocess_input_for_train',preprocess)
+    before=arch.prepare_inputs([baseline]);after=arch.prepare_inputs([actual])
+    assert encoded_lengths==[[1],[1]]
+    assert after['actions'].shape==after['action_is_pad'].shape==(1,32,112)
+    assert 'video_is_pad' not in after
+    torch.testing.assert_close(after['actions'],before['actions'],rtol=0,atol=0)
+    torch.testing.assert_close(after['action_is_pad'],before['action_is_pad'],rtol=0,atol=0)
+    torch.manual_seed(17);old_loss=arch.compute_loss(**before)
+    torch.manual_seed(17);new_loss=arch.compute_loss(**after)
+    torch.testing.assert_close(old_loss['loss'],new_loss['loss'],rtol=0,atol=0)
+    assert new_loss['loss_video']==0 and torch.isfinite(new_loss['loss'])
+    new_loss['loss'].backward()
+    assert arch.action_backbone.action_encoder.weight.grad.abs().sum()>0

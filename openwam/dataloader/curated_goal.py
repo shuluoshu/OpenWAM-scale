@@ -113,7 +113,7 @@ class CuratedGoalDataset:
         self.observation_augmentation=GoalObservationAugmentation(observation_augmentation,observation_mode=observation_mode)
         self.history=history if isinstance(history,HistorySamplingConfig) else HistorySamplingConfig(**(history or {}))
         self._history_draw_id=0
-        self._episodes=OrderedDict();self._evaluations=None;self._asset_slot=0;self._evaluating=False
+        self._episodes=OrderedDict();self._evaluations=None;self._evaluating=False
         self._weights=np.array([r['weight'] for r in self.repos]);self._weights/=self._weights.sum()
 
     def __getstate__(self):
@@ -241,7 +241,7 @@ class CuratedGoalDataset:
         from scripts.data.prepare_subtask_goals import decode_frames,recorded_tcp_transform,camera_eligibility,clean_json
         from scripts.data.prepare_goal_labels import goal_camera
         from scripts.data.trajectory_projection import goal_source_tcp,project_goal_tcp
-        from openwam.train.goal_overfit import prepare_overfit_images
+        from openwam.train.goal_input import prepare_goal_images
         def decode(camera,indices):
             prefix='videos/'+camera+'/'
             try:
@@ -316,11 +316,6 @@ class CuratedGoalDataset:
         color_policy=video_color_policy(video) if video else RGB
         if color_policy!=RGB:identity+=':'+color_policy
         ident=hashlib.sha256(identity.encode()).hexdigest()[:24]
-        # Training assets occupy a fixed rotating set; evaluation assets persist.
-        slot=('evaluation_'+ident if self._evaluating else 'sample_'+str(self._asset_slot % self.max_cached_episodes))
-        if not self._evaluating:self._asset_slot+=1
-        folder=self.cache_dir/slot;folder.mkdir(exist_ok=True)
-        images[goal].resize((320,256),Image.Resampling.BILINEAR).save(folder/'goal.png')
         if self.observation_mode=='multiview':
             canvas=clean_multiview(frames,torch.tensor(view_valid,dtype=torch.bool))
             rgb=((canvas[:,0]+1)*127.5).round().byte().permute(1,2,0).numpy()
@@ -330,17 +325,14 @@ class CuratedGoalDataset:
         augmentation_seed=int(hashlib.sha256(f'goal_observation:{self.seed}:{self._history_draw_id}:{identity}'.encode()).hexdigest()[:15],16)
         observed,augmentation_trace=self.observation_augmentation(observed,view_valid,
             seed=augmentation_seed,training=not self._evaluating)
-        observed.save(folder/'observed.png')
         if not goal_image_valid:
             projection['projection_valid'][:]=False
             projection['in_frame'][:]=False
-        np.savez_compressed(folder/'targets.npz',**{k:projection[k] for k in ('uv','projection_valid','in_frame','visibility')})
         record=dict(id=ident,metric_key=ident,family=repo['family'],granularity=level,instruction=segment['text'],
             source_repo=str(m['root']),source_episode=episode,source_episode_length=m['length'],
             instruction_start=segment['start'],instruction_end_exclusive=segment['end_exclusive'],
             anchor_source_frame=anchor,goal_source_frame=goal,head=m['head'],goal_image_valid=goal_image_valid,
             label_kind=level+'_end',success_verified=False,
-            observed_image_path=str(folder/'observed.png'),goal_image_path=str(folder/'goal.png'),target_path=str(folder/'targets.npz'),
             provenance=dict(source_parquet=str(m['data']),source_parquets=[str(p) for p in m['data_files']],source_video=str(video),annotation_file=m['annotation_file'],
                 subtask_availability=('annotations_absent' if m['annotation_file'] is None else 'available_in_selected_ranges' if self._options(m,[s for s in repo['ranges'] if s[0]==episode],'subtask') else 'no_usable_subtask_intersects_selected_observation_ranges'),
                 observed_video=alignment[anchor],goal_video=alignment[goal],goal_source_frame=goal,
@@ -351,8 +343,18 @@ class CuratedGoalDataset:
             record['provenance']['observed_views']=observed_views
         if augmentation_trace is not None:
             record['provenance']['observation_augmentation']=augmentation_trace
+        # Only persistent evaluation/export records advertise filesystem assets.
+        # Training provenance still identifies source videos, rows and frames.
+        record['provenance']['input_materialization']='exported_assets' if self._evaluating else 'in_memory'
+        if self._evaluating:
+            folder=self.cache_dir/('evaluation_'+ident);folder.mkdir(exist_ok=True)
+            observed.save(folder/'observed.png')
+            images[goal].resize((320,256),Image.Resampling.BILINEAR).save(folder/'goal.png')
+            np.savez_compressed(folder/'targets.npz',**{k:projection[k] for k in ('uv','projection_valid','in_frame','visibility')})
+            record.update(observed_image_path=str(folder/'observed.png'),
+                goal_image_path=str(folder/'goal.png'),target_path=str(folder/'targets.npz'))
         record=clean_json(record)
-        batch=prepare_overfit_images([record],device='cpu',dtype=self.dtype)[0]
+        batch=prepare_goal_images(record,observed,images[goal],projection,dtype=self.dtype)
         if not goal_image_valid:
             batch['targets'].image_valid.zero_()
             batch['targets'].point_valid.zero_()

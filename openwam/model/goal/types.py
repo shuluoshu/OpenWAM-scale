@@ -52,6 +52,10 @@ class GoalTargets:
                             dtype=dtype if getattr(self, f.name).is_floating_point() else None)
                             for f in fields(self)})
 
+    def pin_memory(self):
+        """Let DataLoader pin every custom-target tensor, preserving label dtypes."""
+        return type(self)(**{f.name: getattr(self, f.name).pin_memory() for f in fields(self)})
+
 
 def collate_goal_targets(targets):
     return GoalTargets(**{f.name: torch.stack([getattr(t, f.name) for t in targets])

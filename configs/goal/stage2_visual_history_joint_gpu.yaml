@@ -1,0 +1,14 @@
+# @package _global_
+# New-run native DeepSpeed ZeRO-2 recipe; no optimizer CPU offload.
+defaults:
+  - stage2_visual_history_joint
+  - _self_
+dataloader:
+  future_video_mode: joint
+training:
+  offload_optimizer_device: none
+  # Explicit single-tensor GPU AdamW; validate the 32-rank recipe on DLC.
+  adam_foreach: false
+  adam_betas: [0.9, 0.95]
+  batch_size: 8
+  dataset_num_workers: 4

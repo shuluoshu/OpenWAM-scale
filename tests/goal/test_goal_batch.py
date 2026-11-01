@@ -224,7 +224,7 @@ def test_repeated_population_keeps_small_tail_before_next_cycle():
     assert batches[0][0][0]['random_draw']!=batches[3][0][0]['random_draw']
 
 
-def test_real_finite_spawn_readers_decode_with_private_asset_slots(tmp_path):
+def test_real_finite_spawn_readers_decode_without_training_assets(tmp_path):
     from pathlib import Path
     import yaml
     av=pytest.importorskip('av')
@@ -249,8 +249,9 @@ def test_real_finite_spawn_readers_decode_with_private_asset_slots(tmp_path):
     with GoalBatchLoader(finite,order,cursor=0,rank=0,world=1,batch_size=2,num_workers=2,prefetch_factor=1,seed=42) as loader:
         pairs=[pair for batch in loader for pair in batch]
     assert len(pairs)==len(finite)
-    asset_dirs=[Path(record['observed_image_path']).parent for record,_ in pairs]
-    assert {path.parent.name for path in asset_dirs}=={'worker_0','worker_1'}
+    assert all('observed_image_path' not in record for record,_ in pairs)
+    assert not list((tmp_path/'cache/workers').rglob('*.png'))
+    assert not list((tmp_path/'cache/workers').rglob('*.npz'))
     assert source.cache_dir==tmp_path/'cache'
     for position,(record,batch) in enumerate(pairs):
         reference_record,reference=finite.sample(order[position])

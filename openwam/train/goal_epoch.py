@@ -48,11 +48,16 @@ def _cpu(value):
 
 
 def optimizer_payload(optimizer):
+    if hasattr(optimizer,'checkpoint_payload'):
+        return optimizer.checkpoint_payload()
     return dict(masters=[p.detach().cpu().clone() for p in optimizer.master_parameters],
                 adam=_cpu(optimizer.optimizer.state_dict()))
 
 
 def restore_optimizer(optimizer,payload):
+    if hasattr(optimizer,'restore_payload'):
+        optimizer.restore_payload(payload)
+        return
     if len(payload['masters'])!=len(optimizer.master_parameters):raise ValueError('optimizer parameter count mismatch')
     with torch.no_grad():
         for (model,master),saved in zip(optimizer.parameter_pairs,payload['masters']):
@@ -224,9 +229,10 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
                 learning_rate=1e-5,history_learning_rate=1e-4,checkpoint_every=5000,
                 eval_every=500,sampling_steps=20,resume=False,bootstrap_workers_per_node=2,optimizer_device='model',
                 condition_learning_rate=None,max_updates=None,repeat_population=False,sample_cache_size=0,
-                convergence=None,batch_size=1,dataset_num_workers=0,prefetch_factor=2):
+                convergence=None,batch_size=1,dataset_num_workers=0,prefetch_factor=2,
+                optimizer_sharding='none',adam_betas=(.9,.999),adam_eps=1e-8,weight_decay=.01,
+                dataset_pin_memory=False):
     from openwam.train.goal_curated import prepare_batch,goal_parameter_groups,_export_cases
-    from openwam.train.goal_overfit import FP32MasterAdamW
     from openwam.train.goal_trainer import _seed
     from openwam.train.goal_patch import evaluate_patch
     from openwam.train.goal_history import render_goal_history
@@ -310,8 +316,16 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
             return proof
         proof=primary(completed,broadcast_result=True);expert.freeze();return proof
     expert.train_stage_a()
-    optimizer=FP32MasterAdamW(goal_parameter_groups(expert,learning_rate,history_learning_rate,condition_learning_rate),
-                            master_device='cpu' if optimizer_device=='cpu' else None)
+    # Synchronize initial model weights before each owner takes its FP32 copy.
+    model=expert
+    if distributed:
+        from torch.nn.parallel import DistributedDataParallel
+        model=DistributedDataParallel(expert,device_ids=[device.index] if device.type=='cuda' else None,
+            gradient_as_bucket_view=True,find_unused_parameters=True)
+    from openwam.train.goal_optimizer import build_goal_optimizer
+    optimizer=build_goal_optimizer(goal_parameter_groups(expert,learning_rate,history_learning_rate,condition_learning_rate),
+        dict(optimizer_device=optimizer_device,optimizer_sharding=optimizer_sharding,
+             adam_betas=adam_betas,adam_eps=adam_eps,weight_decay=weight_decay))
     cursor=update=0
     if resume and (output/'latest.json').exists():
         # Bound transient host RAM per node while other nodes restore in parallel.
@@ -332,12 +346,8 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
             local_world_size=local_world,workers_per_node=concurrency)
     event('resume' if resume else 'started',cursor=cursor,step=update,identity=identity,
           sampling=order.contract,sampling_sha256=order.sha256,sampling_host_bytes=order.nbytes,
-          optimizer_device=optimizer_device,**loading)
-    model=expert
-    if distributed:
-        from torch.nn.parallel import DistributedDataParallel
-        model=DistributedDataParallel(expert,device_ids=[device.index] if device.type=='cuda' else None,
-            gradient_as_bucket_view=True,find_unused_parameters=True)
+          optimizer_device=optimizer_device,optimizer_sharding=optimizer_sharding,
+          adam_betas=list(adam_betas),dataset_pin_memory=dataset_pin_memory,**loading)
     summary=dict(mode='bounded_stage1' if bounded else 'finite_stage1',status='running',identity=identity,scope=dataset.scope_summary(),evaluations=[],
         representation=representation,finite_epoch_complete=False,
         completed_steps=update,steps=max_updates if bounded else math.ceil(len(dataset)/(world*batch_size)),evaluation_split='train',success_verified=False)
@@ -385,6 +395,11 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
         last_saved=save_epoch_checkpoint(expert,optimizer,output,identity=identity,cursor=cursor,
                                      update=update,dependencies=dependencies,_return_receipt=True,**extra)
         return last_saved.directory
+    def collective_save():
+        # ZeRO state must be gathered by every rank BEFORE rank zero writes.
+        if hasattr(optimizer,'prepare_checkpoint'):
+            optimizer.prepare_checkpoint()
+        return primary(save)
     def update_gate():
         nonlocal gate
         try:
@@ -393,13 +408,13 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
             # Commit the actual current optimizer and an invalid evidence row;
             # every rank received the same error before entering this checkpoint.
             gate=primary(lambda:observe(gate,update,None,max_updates=max_updates),broadcast_result=True)
-            primary(save)
+            collective_save()
             raise
     if convergence is not None:
         gate=primary(setup_gate,broadcast_result=True)
         if not gate['history']:
             update_gate()
-            primary(save)
+            collective_save()
         summary['convergence']=gate
         summary.update(evaluation_split='fixed_train_population_diagnostic',formal_generalization=False)
     def evaluate():
@@ -419,6 +434,7 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
     loader=GoalBatchLoader(dataset,order,cursor=cursor,rank=rank,world=world,batch_size=batch_size,
         num_workers=dataset_num_workers,prefetch_factor=prefetch_factor,seed=identity['seed'],
         repeat_population=repeat_population,max_batches=max_updates-update if bounded else None,
+        pin_memory=dataset_pin_memory,
         sample_cache_size=sample_cache_size)
     started=time.monotonic()
     try:
@@ -490,7 +506,7 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
             if gate_due:
                 update_gate()
             if update%checkpoint_every==0 or final or gate_due:
-                primary(save)
+                collective_save()
                 event('checkpoint_saved',step=update,cursor=cursor)
             if convergence is not None and visual_due:primary(evaluate)
     finally:

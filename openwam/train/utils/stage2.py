@@ -107,7 +107,21 @@ def build_stage2_parameter_groups(architecture,training):
     return groups
 
 
+def stage2_optimizer_options(training):
+    """Select the native AdamW backend; absent options preserve old recipes.
+
+    New GPU profiles disable both foreach and fused kernels. Torch 2.7.1
+    multi-tensor kernels overrun large (>2**31-element) flattened ZeRO groups
+    in single-GPU validation.
+    """
+    foreach = getattr(training, 'adam_foreach', None)
+    if foreach is not None and type(foreach) is not bool:
+        raise ValueError('adam_foreach must be boolean or null')
+    return dict(foreach=foreach, **({'fused': False} if foreach is not None else {}))
+
+
 def validate_stage2_config(cfg):
+    stage2_optimizer_options(cfg.training)
     from openwam.model.goal.runtime import goal_observation_mode, goal_representation
     goal_config=OmegaConf.to_container(cfg.goal,resolve=True)
     from openwam.model.goal.runtime import validate_goal_model_config
@@ -130,6 +144,9 @@ def validate_stage2_config(cfg):
     future_mode = OmegaConf.select(cfg, 'model.architecture.future_video_mode', default='joint')
     if future_mode not in ('joint', 'none'):
         raise ValueError("future_video_mode must be 'joint' or 'none'")
+    reader_future_mode = OmegaConf.select(cfg, 'dataloader.future_video_mode')
+    if reader_future_mode is not None and reader_future_mode != future_mode:
+        raise ValueError('dataloader.future_video_mode disagrees with model.architecture.future_video_mode')
     if future_mode == 'none':
         if not token_memory:
             raise ValueError("future_video_mode='none' requires query_latent or visual_history_masked_sa Stage2")

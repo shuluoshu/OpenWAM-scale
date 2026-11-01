@@ -380,7 +380,13 @@ def test_finite_goal_source_validity_preserves_current_views_and_history(tmp_pat
     assert batch['history_images'][batch['history_valid']].isfinite().all()
     assert record['provenance']['head_history']['head'] == 'observation.images.head_left'
     assert record['goal_image_valid'] is goal_valid
-    for targets in (batch['targets'], prepare_overfit_images([record], device='cpu', dtype=torch.float32)[0]['targets']):
+    assert 'target_path' not in record
+    dataset._evaluating = True
+    try:
+        exported_record, _ = finite.sample(4)
+    finally:
+        dataset._evaluating = False
+    for targets in (batch['targets'], prepare_overfit_images([exported_record], device='cpu', dtype=torch.float32)[0]['targets']):
         assert targets.image_valid.tolist() == [goal_valid]
         assert targets.point_valid.tolist() == [[goal_valid, goal_valid]]
         assert targets.in_frame.tolist() == [[goal_valid, goal_valid]]

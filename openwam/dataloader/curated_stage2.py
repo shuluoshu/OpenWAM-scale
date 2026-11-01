@@ -23,7 +23,9 @@ class CuratedStage2Dataset(Dataset):
     """
     def __init__(self,source_yaml,*,data_root=None,seed=42,normalization_registry=None,
                  split='train',max_cached_episodes=2,max_cache_bytes=256*1024*1024,
-                 observation_augmentation=None,gripper_state_filter=None,draws_per_epoch=100000,history=None,path_aliases=None):
+                 observation_augmentation=None,gripper_state_filter=None,draws_per_epoch=100000,history=None,path_aliases=None,future_video_mode='joint'):
+        if future_video_mode not in ('joint','none'):raise ValueError("future_video_mode must be 'joint' or 'none'")
+        self.future_video_mode=future_video_mode
         self.selection=parse_curated_yaml(source_yaml,data_root,path_aliases);self.repos=self.selection['repos']
         self.seed=int(seed);self.split=split;self.draws_per_epoch=int(draws_per_epoch)
         self.history=history if isinstance(history,HistorySamplingConfig) else HistorySamplingConfig(**(history or {}))
@@ -53,7 +55,7 @@ class CuratedStage2Dataset(Dataset):
         source=get_cfg(config,'source_yaml') if split=='train' else get_cfg(config,'evaluation_source_yaml')
         if not source:raise ValueError('explicit source_yaml required' if split=='train' else 'independent evaluation_source_yaml required')
         keys=('data_root','seed','normalization_registry','max_cached_episodes','max_cache_bytes',
-              'observation_augmentation','gripper_state_filter','draws_per_epoch','history','path_aliases')
+              'observation_augmentation','gripper_state_filter','draws_per_epoch','history','path_aliases','future_video_mode')
         kwargs={k:get_cfg(config,k) for k in keys if get_cfg(config,k) is not None}
         if split!='train':
             stats=get_cfg(config,'evaluation_normalization_registry')
@@ -158,6 +160,9 @@ class CuratedStage2Dataset(Dataset):
         proprio=np.zeros((1,112),np.float32);proprio_mask=np.zeros_like(proprio,bool)
         proprio[:,rep.scatter]=norm_state;proprio_mask[:,rep.scatter]=sm
         video_indices=anchor+np.arange(9)*4;video_mask=video_indices<=option['last_source']
+        # Keep the native nine-slot sample contract for diagnostics/evaluation.
+        # None-mode tails are placeholders, never decoded RGB or valid GT.
+        if self.future_video_mode=='none':video_mask[1:]=False
         real_indices=video_indices[video_mask].tolist();views,alignment=self._decode_views(m,real_indices)
         from PIL import Image
         from openwam.dataloader.transforms.multiview import assemble_multiview_layout
@@ -193,7 +198,8 @@ class CuratedStage2Dataset(Dataset):
             trace=dict(identity=identity,draw_id=draw_id,source_repo=str(m['root']),episode=episode,anchor=anchor,last_source=option['last_source'],
                 source_parquet=str(m['data']),source_parquets=[str(p) for p in m['data_files']],info_sha256=m['info_hash'],profile_id=m['profile']['profile_id'],
                 raw_action=raw,raw_action_mask=mask,raw_state=state,raw_state_mask=sm,
-                video_source_indices=video_indices.tolist(),video_alignment=alignment,
+                video_source_indices=video_indices.tolist(),decoded_video_source_indices=real_indices,
+                future_video_mode=self.future_video_mode,video_alignment=alignment,
                 mask_reasons=m['profile']['mask_reasons']+(['head_calibration_ineligible'] if not m['head_calibration_eligible'] else []),
                 calibration_eligibility=m['head_calibration_qa'],gripper_filter_reasons=m['filter_reasons'],
                 selected_range=[option['selected_start'],option['selected_end_exclusive']],
