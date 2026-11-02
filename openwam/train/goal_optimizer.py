@@ -105,7 +105,8 @@ class ShardedFP32MasterAdamW:
         self.zero_grad()
 
     def prepare_checkpoint(self):
-        self.optimizer.consolidate_state_dict(to=0)
+        from openwam.train.optimizer_checkpoint import consolidate_fp32_optimizer
+        consolidate_fp32_optimizer(self.optimizer)
 
     def checkpoint_payload(self):
         return dict(format=self.format, adam=self.optimizer.state_dict())

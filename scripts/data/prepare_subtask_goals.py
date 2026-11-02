@@ -65,14 +65,17 @@ def camera_eligibility(family,root,episode):
 
 
 def decode_frames(path,offset_s,fps,indices,*,sequential=False,video_ordinals=None):
-    """Exact CFR PTS seeks, or sequential presentation ordinals for VFR.
+    """Exact CFR PTS seeks, or verified presentation ordinals for VFR.
 
     video_ordinals maps episode row indices to explicit raw-video frame indices.
-    Sequential decoding never estimates a frame number from nominal FPS or PTS.
+    VFR uses a verified ordinal index when available, with sequential fallback.
+    Neither VFR path estimates a frame number from nominal FPS or rounded PTS.
     """
     import av
     from fractions import Fraction
     from itertools import chain
+    from openwam.dataloader.video_ordinal_index import video_decode_threads
+    decode_threads=video_decode_threads()
     if sequential and offset_s!=0:
         raise ValueError('VFR nonzero time offset needs an explicit ordinal origin')
     if video_ordinals is not None and not sequential:
@@ -88,7 +91,7 @@ def decode_frames(path,offset_s,fps,indices,*,sequential=False,video_ordinals=No
             raise ValueError('explicit video ordinals must be nonnegative increasing integers')
         requested={int(v):i for i,v in zip(indices,ordinals)}
     with av.open(str(path)) as container:
-        stream=container.streams.video[0];stream.codec_context.thread_count=2
+        stream=container.streams.video[0];stream.codec_context.thread_count=decode_threads
         # average_rate is a container timing statistic, not an ordinal contract.
         # Only the CFR path derives ordinals from FPS and must match that rate.
         if not sequential and (stream.average_rate is None or abs(float(stream.average_rate)-fps)>1e-4):
@@ -109,12 +112,19 @@ def decode_frames(path,offset_s,fps,indices,*,sequential=False,video_ordinals=No
                 decoded_rgb_sha256=hashlib.sha256(np.asarray(raw).tobytes()).hexdigest(),
                 image_color_policy=video_color_policy(path))
         if sequential:
-            # Count every decoded frame from stream start, including the first;
-            # do not seek, round timestamps, or discard frames on a PTS filter.
-            for ordinal,frame in enumerate(chain((first,),decoded)):
-                if frame.pts is None:raise ValueError('missing decoded PTS')
-                if ordinal in requested:save(frame,ordinal,'sequential_decoded_ordinal')
-                if ordinal>=max(requested):break
+            from openwam.dataloader.video_ordinal_index import read_indexed_frames
+            indexed=read_indexed_frames(path,requested)
+            if indexed is not None:
+                for ordinal,frame in indexed['frames'].items():
+                    save(frame,ordinal,'indexed_verified_presentation_ordinal')
+                    alignment[requested[ordinal]]['index_decoded_frames']=indexed['decoded_frames']
+            else:
+                # Count every decoded frame from stream start, including first.
+                # Index lookup uses its own container so fallback starts cleanly.
+                for ordinal,frame in enumerate(chain((first,),decoded)):
+                    if frame.pts is None:raise ValueError('missing decoded PTS')
+                    if ordinal in requested:save(frame,ordinal,'sequential_decoded_ordinal')
+                    if ordinal>=max(requested):break
         else:
             # Muxed CFR chunks can be displaced by one integer timestamp tick.
             # Bound that quantization allowance below half a frame so nearest
