@@ -1520,6 +1520,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
             return None
         return inactive_action_dims
 
+    def can_cache_action_only(self, *, decode_video: bool, cfg_scale: float) -> bool:
+        """Architectures opt in only when action has no changing video dependency."""
+        return False
+
     @torch.no_grad()
     def generate(
         self,
@@ -1541,6 +1545,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         tile_stride: tuple = None,
         dit_cache=None,
         decode_video: bool = True,
+        use_action_kv_cache: Optional[bool] = None,
         profile: bool = False,
         vace_cache: Optional[dict] = None,
         prompt_embed_cache: Optional[dict] = None,
@@ -1580,6 +1585,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
             goal_head_valid: Missing-head flag; false masks the 80 memory tokens.
             goal_seed: Per-example predicted-goal seed, defaults to ``seed``.
                 Evaluation should pass the dataset sample's ``goal_seed``.
+            use_action_kv_cache: Override model.architecture.action_kv_cache. Eligible
+                Wan first-frame-only calls prefill visual/C* KV once; unsupported
+                masks, video-output requests and CFG retain the uncached path.
             active_action_mask: Optional ``(action_dim,)`` boolean mask for the
                 benchmark being generated. Inactive unified-action dimensions
                 stay on their analytic zero-padding noise path. When omitted,
@@ -1618,6 +1626,16 @@ class BaseWAMArchitecture(ABC, nn.Module):
             raise ValueError(f"cfg_scale must be >= 1.0; got {cfg_scale!r}.")
         if cfg_scale_f > 1.0:
             dit_cache = None
+
+        cache_requested = (BaseWAMArchitecture._cfg_get(getattr(self, "cfg", None), "action_kv_cache", False)
+                           if use_action_kv_cache is None else use_action_kv_cache)
+        if type(cache_requested) is not bool:
+            raise ValueError("use_action_kv_cache/action_kv_cache must be boolean")
+        cache_enabled = cache_requested and self.can_cache_action_only(
+            decode_video=decode_video, cfg_scale=cfg_scale_f)
+        # Explicit non-native timestep overrides invalidate fixed-prefix equality.
+        cache_enabled = cache_enabled and all(extra_pipeline_inputs.get(k, True) is True
+            for k in ('force_per_token_t_mod', 'zero_clean_prefix_t_mod'))
 
         action_num_frames = int(action_num_frames if action_num_frames is not None else num_frames)
 
@@ -1679,6 +1697,15 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 raise ValueError("use_proprioception=True requires `proprio` during generation.")
             inputs_shared["proprio"] = proprio.to(device=device, dtype=dtype)
 
+        # Cache is local to this request. The frozen Stage1 runtime above supplies
+        # C*; caller-provided goals remain rejected before this hook is reached.
+        # Validate the final prefix after caller overrides, preserving the full
+        # preprocessing contract when an absent/multi-frame prefix needs fallback.
+        current_prefix = inputs_shared.get("first_frame_latents")
+        cache_enabled = (cache_enabled and current_prefix is not None
+                         and current_prefix.ndim == 5 and current_prefix.shape[2] == 1)
+        action_kv_cache = self.prepare_action_kv_cache(inputs_shared) if cache_enabled else None
+
         action_latents = torch.randn(
             1,
             action_num_frames - 1,
@@ -1710,7 +1737,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
             sigma_v_next = t_v_next / num_train_ts_v
             sigma_a_next = t_a_next / num_train_ts_a
 
-            video_stepping = self.future_video_mode != "none" and sigma_v != sigma_v_next
+            video_stepping = action_kv_cache is None and self.future_video_mode != "none" and sigma_v != sigma_v_next
             action_stepping = sigma_a != sigma_a_next
 
             if not video_stepping and not action_stepping:
@@ -1723,7 +1750,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
             v_timestep = torch.tensor([0 if self.future_video_mode == "none" else t_v], dtype=dtype, device=device)
             a_timestep = torch.tensor([t_a], dtype=dtype, device=device)
 
-            if (
+            if action_kv_cache is not None:
+                noise_pred = None
+                action_noise_pred = self.forward_action_kv_cache(action_latents, a_timestep, action_kv_cache)
+            elif (
                 dit_cache is not None
                 and video_stepping
                 and not dit_cache.should_recompute(sigma_v, require_action=action_stepping)

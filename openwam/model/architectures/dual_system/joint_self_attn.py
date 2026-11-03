@@ -167,6 +167,27 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
             return
         logger.info("Enabled dual self-attn MoT compile with torch.compile kwargs=%s", kwargs)
 
+    def can_cache_action_only(self, *, decode_video, cfg_scale):
+        """Cache only a fixed clean Wan prefix; never silently drop joint dependencies."""
+        from openwam.model.video_backbone.wan_backbone import Wan22Ti2v
+        vb, driver = self.video_backbone, self.mot_driver
+        if not isinstance(vb, Wan22Ti2v) or driver is None or cfg_scale != 1.:
+            return False
+        if vb.video_attention_mask_mode != 'first_frame_causal':
+            return False
+        if driver.attention_mask_mode not in ('mutual', 'isolated'):
+            return False
+        return self.future_video_mode == 'none' or (
+            driver.attention_mask_mode == 'isolated' and not decode_video)
+
+    def prepare_action_kv_cache(self, inputs):
+        from .action_cache import prefill
+        return prefill(self, inputs)
+
+    def forward_action_kv_cache(self, actions, timestep, cache):
+        from .action_cache import action_step
+        return action_step(self, actions, timestep, cache)
+
     def forward(
         self,
         noisy_actions: Optional[Tensor],

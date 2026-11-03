@@ -527,6 +527,7 @@ def test_generate_forwards_cfg_kwargs_to_backbone():
         video_backbone = _FakeVB()
         device = torch.device("cpu")
         dtype = torch.float32
+        future_video_mode = "joint"
 
         def eval(self):
             return self

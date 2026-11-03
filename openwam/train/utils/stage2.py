@@ -161,10 +161,17 @@ def validate_stage2_config(cfg):
     required={'goal.enabled':True,'goal.conditioning':'visual_history_memory' if visual else 'query_memory' if query else 'image_memory',
         'goal.mode':'predicted','goal.num_steps':1 if token_memory else 20,
         'model.architecture.action_dim':112,'model.architecture.state_dim':112,
-        'model.architecture.use_proprioception':True,'model.architecture.attention_mask_mode':'mutual',
+        'model.architecture.use_proprioception':True,
         'model.architecture.video_attention_mask_mode':'first_frame_causal',
         'dataloader.type':'curated_stage2','training.step_unit':'optimizer_updates',
         'training.expand_action_dim_from_checkpoint':False}
+    attention_mode = OmegaConf.select(cfg, 'model.architecture.attention_mask_mode')
+    if attention_mode not in (('mutual', 'isolated') if visual else ('mutual',)):
+        raise ValueError('Stage2 attention_mask_mode requires mutual, or isolated with visual history')
+    if attention_mode == 'isolated' and OmegaConf.select(cfg, 'model.architecture.variant') != 'joint_self_attn':
+        raise ValueError('isolated C* requires joint_self_attn')
+    if attention_mode == 'isolated' and future_mode == 'joint' and float(cfg.training.lambda_video) <= 0:
+        raise ValueError('isolated auxiliary video requires positive lambda_video')
     for key,expected in required.items():
         if OmegaConf.select(cfg,key)!=expected:raise ValueError(f'Stage2 contract requires {key}={expected!r}')
     for key in ('goal.cache_size','goal.cache_max_bytes','dataloader.max_cached_episodes','dataloader.max_cache_bytes'):
@@ -191,6 +198,25 @@ def validate_stage2_checkpoint(cfg,path):
             shape=handle.get_slice(key).get_shape()
             if len(shape)!=(1 if key.endswith('.bias') else 2) or shape[axis]!=112:
                 raise ValueError(f'Stage2 baseline projection must retain width112: {key}={shape}')
+
+
+def validate_stage2_baseline_architecture(cfg, baseline_cfg, *, resume):
+    """Only an explicit new-run C* auxiliary warm-start may change the mask."""
+    allow = OmegaConf.select(cfg, 'training.allow_attention_mask_warmstart', default=False)
+    if type(allow) is not bool:
+        raise ValueError('allow_attention_mask_warmstart must be boolean')
+    for key in ('action_dim', 'state_dim', 'attention_mask_mode', 'video_attention_mask_mode'):
+        source = OmegaConf.select(baseline_cfg, 'model.architecture.' + key)
+        target = OmegaConf.select(cfg, 'model.architecture.' + key)
+        if source == target:
+            continue
+        permitted = (key == 'attention_mask_mode' and not resume and allow
+            and source == 'mutual' and target == 'isolated'
+            and OmegaConf.select(cfg, 'goal.representation') == 'visual_history_masked_sa'
+            and OmegaConf.select(cfg, 'model.architecture.future_video_mode') == 'joint'
+            and OmegaConf.select(cfg, 'model.architecture.variant') == 'joint_self_attn')
+        if not permitted:
+            raise ValueError(f'Stage2 baseline structural contract mismatch: {key}')
 
 
 def validate_stage2_launch(cfg,*,metadata_only=False,prepared_runtime=None):
@@ -274,9 +300,7 @@ def validate_stage2_launch(cfg,*,metadata_only=False,prepared_runtime=None):
     elif metadata.get('codec',{}).get('latent_shape')!=[48,1,16,20]:
         raise ValueError('Stage1 patch bundle codec mismatch')
     if not metadata.get('dependencies'):raise ValueError('Stage1 patch bundle dependencies missing')
-    for key in ('action_dim','state_dim','attention_mask_mode','video_attention_mask_mode'):
-        if OmegaConf.select(baseline_cfg,'model.architecture.'+key)!=OmegaConf.select(cfg,'model.architecture.'+key):
-            raise ValueError(f'Stage2 baseline structural contract mismatch: {key}')
+    validate_stage2_baseline_architecture(cfg, baseline_cfg, resume=bool(resume))
     validate_stage2_checkpoint(cfg, (str(Path(directory)/full_metadata["unified_weights"]) if resume else weights or find_latest_weights(directory)))
     if not cfg.dataloader.source_yaml:raise ValueError('STAGE2_SOURCE_YAML is required')
     source=Path(cfg.dataloader.source_yaml)

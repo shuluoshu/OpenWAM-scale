@@ -1,0 +1,19 @@
+# @package _global_
+# C* remains the frozen Stage1 visual-history representation. Future video is
+# auxiliary supervision; action reads only clean current video + C* + itself.
+defaults:
+  - stage2_visual_history_joint_gpu
+  - _self_
+model:
+  architecture:
+    attention_mask_mode: isolated
+    video_attention_mask_mode: first_frame_causal
+    future_video_mode: joint
+    action_kv_cache: true
+training:
+  lambda_video: 1.0
+  lambda_action: 1.0
+  # Explicit new-run warm-start only. Full-state resume remains mask-strict.
+  allow_attention_mask_warmstart: true
+project:
+  name: openwam-stage2-visual-history-aux

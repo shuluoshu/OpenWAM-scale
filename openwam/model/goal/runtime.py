@@ -319,8 +319,9 @@ def configure_goal(architecture, cfg, *, checkpoint_dir=None):
     mode = goal_observation_mode(config)
     vb = architecture.video_backbone
     driver = architecture.mot_driver
-    if driver.attention_mask_mode != 'mutual' or vb.video_attention_mask_mode != 'first_frame_causal':
-        raise ValueError('goal memory requires mutual + first_frame_causal')
+    allowed_modes = ('mutual', 'isolated') if goal_representation(config) == 'visual_history_masked_sa' else ('mutual',)
+    if driver.attention_mask_mode not in allowed_modes or vb.video_attention_mask_mode != 'first_frame_causal':
+        raise ValueError('goal memory requires a compatible mutual/isolated + first_frame_causal mask')
     asset = resolve_goal_asset(config, checkpoint_dir)
     identity = goal_asset_sha256(asset)
     expected = config.get("asset_sha256")
