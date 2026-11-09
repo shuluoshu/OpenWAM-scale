@@ -1,0 +1,7 @@
+# New causal language-conditioned C*, preserving the 32 history / 120 C* tokens.
+base_config: stage1_text_visual_history_relative112_production.yaml
+model:
+  visual_history:
+    causal_history: true
+dataset:
+  cache_dir: outputs/stage1_causal_text_visual_history_relative112/cache

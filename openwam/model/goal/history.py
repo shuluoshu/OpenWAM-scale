@@ -97,12 +97,11 @@ class HistoryCompressor(nn.Module):
 
 
 class HeadFeatureCache:
-    """Bounded CPU cache of frozen pre-compressor features, never trainable tokens.
+    """Bounded multi-episode CPU LRU of frozen single-frame VAE outputs.
 
-    Pixels are keyed after model dtype conversion within one episode only.
-    Episode changes evict all entries, even when pixels happen to be identical.
-    Incomplete histories explicitly evict earlier entries before encoding their
-    valid frames; missing slots always remain zero, never filled from the cache.
+    Episode/content keys isolate sources without evicting shuffled episodes.
+    Age and dropout are applied after lookup; invalid slots stay zero. Unknown
+    episode identity disables persistent reuse between calls.
     """
     def __init__(self, size):
         self.size=size
@@ -118,45 +117,58 @@ class HeadFeatureCache:
         self.hits=self.misses=0
 
     def begin_episode(self, episode_id):
-        # Legacy callers without identity cannot safely reuse cross-call state.
-        if episode_id is None or episode_id != self.episode_id:
-            self.entries.clear(); self.hits=self.misses=0
-            self.episode_id=episode_id
+        if episode_id is None:self.clear()
+        self.episode_id=episode_id
 
     @torch.no_grad()
-    def encode(self, codec, images, valid, *, episode_ids=None):
+    def encode(self, codec, images, valid, *, episode_ids=None, device=None):
+        from .codec import GoalCodec, vae_cache_identity
         b,h=valid.shape
         if images.shape != (b,h,3,1,256,320):
             raise ValueError('history images must be [B,10,3,1,256,320]')
-        identity=(id(codec.vae),str(images.device),str(images.dtype),
-            tuple((id(p),p._version) for p in codec.vae.parameters()))
+        device=torch.device(images.device if device is None else device)
+        identity=(vae_cache_identity(codec.vae),str(images.dtype))
         ids=history_episode_ids(episode_ids,b)
         cpu_valid=valid.detach().cpu()
-        if identity!=self.identity or not bool(cpu_valid.all()):
+        if identity!=self.identity or None in ids:
             self.clear();self.identity=identity
-        # One device-to-host transfer and one host-to-device transfer per batch.
-        # Per-slot GPU validation/copy introduces a synchronization for every frame
-        # and costs substantially more than the small learned compressor.
+        # Stage1 keeps RGB on CPU; legacy CUDA inputs remain supported.
         cpu_images=images.detach().cpu().contiguous()
         result=torch.zeros((b,h,48,1,16,20),dtype=images.dtype)
+        pending=OrderedDict()
         for row in range(b):
-            self.begin_episode(ids[row])
+            self.episode_id=ids[row]
+            owner=ids[row] if ids[row] is not None else ('unknown',row)
             for slot in cpu_valid[row].nonzero().flatten().tolist():
                 image=cpu_images[row,slot]
-                if not torch.isfinite(image).all() or image.abs().max()>1.00001:
-                    raise ValueError('history RGB must be finite normalized [-1,1]')
                 raw=image.view(torch.uint8).numpy().tobytes()
-                key=hashlib.sha256(raw).digest()
+                key=(owner,hashlib.sha256(raw).digest())
                 if key in self.entries:
                     self.hits+=1;self.entries.move_to_end(key)
-                    latent=self.entries[key]
+                    result[row,slot]=self.entries[key]
+                elif key in pending:
+                    self.hits+=1;pending[key][1].append((row,slot))
                 else:
-                    self.misses+=1;latent=codec.encode(images[row,slot][None])[0].detach().cpu()
-                    if self.size:
-                        self.entries[key]=latent.clone()
-                        while len(self.entries)>self.size:self.entries.popitem(last=False)
-                result[row,slot]=latent
-        return result.to(device=images.device)
+                    self.misses+=1;pending[key]=[image,[(row,slot)]]
+        missing=list(pending.items())
+        chunk_size=getattr(codec,'max_encode_batch_size',4)
+        if type(chunk_size) is not int or chunk_size<1:
+            raise ValueError('VAE encode batch size must be a positive integer')
+        for start in range(0,len(missing),chunk_size):
+            chunk=missing[start:start+chunk_size]
+            pixels=torch.stack([item[1][0] for item in chunk])
+            if not torch.isfinite(pixels).all() or pixels.abs().max()>1.00001:
+                raise ValueError('history RGB must be finite normalized [-1,1]')
+            latents=(codec.encode(pixels,device=device) if isinstance(codec,GoalCodec)
+                     else codec.encode(pixels.to(device))).detach().cpu()
+            if latents.shape!=(len(chunk),48,1,16,20) or not torch.isfinite(latents).all():
+                raise ValueError('history codec must return finite single-frame latents')
+            for (key,(_,positions)),latent in zip(chunk,latents):
+                for row,slot in positions:result[row,slot]=latent
+                if self.size:
+                    self.entries[key]=latent.clone()
+                    while len(self.entries)>self.size:self.entries.popitem(last=False)
+        return result.to(device=device)
 
 
 def history_episode_ids(episode_ids, batch_size):
@@ -174,7 +186,7 @@ def history_kwargs(batch):
     return {key:batch[key] for key in HISTORY_FIELDS if key in batch}
 
 
-def move_history(batch, device, dtype):
-    return {key:value.to(device=device,dtype=(torch.int64 if key=='history_episode_id' else torch.bool if key=='history_valid' else
+def move_history(batch, device, dtype, *, keep_images_cpu=False):
+    return {key:value.to(device='cpu' if key=='history_images' and keep_images_cpu else device,dtype=(torch.int64 if key=='history_episode_id' else torch.bool if key=='history_valid' else
             torch.float32 if key=='history_ages' else dtype))
             for key,value in history_kwargs(batch).items()}

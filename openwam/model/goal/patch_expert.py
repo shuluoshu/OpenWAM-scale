@@ -91,7 +91,8 @@ class PatchGoalExpert(nn.Module):
             return self.codec
         return GoalCodec(self.codec.vae, GoalCodecSpec(
             name='wan22_vae48_multiview_single_frame',
-            image_shape=MULTIVIEW_IMAGE_SHAPE, latent_shape=MULTIVIEW_LATENT_SHAPE),cache=self.codec.cache)
+            image_shape=MULTIVIEW_IMAGE_SHAPE, latent_shape=MULTIVIEW_LATENT_SHAPE),cache=self.codec.cache,
+            max_encode_batch_size=self.codec.max_encode_batch_size)
 
     def encode_observation(self, observed, *, observed_view_valid=None):
         if self.observation_mode == 'multiview':

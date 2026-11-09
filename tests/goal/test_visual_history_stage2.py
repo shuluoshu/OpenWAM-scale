@@ -20,8 +20,15 @@ def config():
         num_steps=1, microbatch_size=1, cache_size=8, cache_max_bytes=1000000)
 
 
-def load_encoder(tmp_path):
-    expert=make_model().freeze();expert.history_gate.data.fill_(.2)
+def load_encoder(tmp_path,language=False,causal=False):
+    factory=make_model
+    if language:
+        from test_text_visual_history import make_text_model
+        factory=make_text_model
+    if causal:
+        from test_causal_visual_history import make_causal_model
+        factory=make_causal_model
+    expert=factory().freeze();expert.history_gate.data.fill_(.2)
     path=tmp_path/'visual.safetensors'
     save_visual_history_bundle(expert,path,precomputed_text_fingerprint='a'*64)
     encoder=runtime.load_stage2_goal(path,vae=expert.codec.vae,text_encoder=None,
@@ -151,13 +158,18 @@ def test_stage2_visual_preflight_config(mode):
     with pytest.raises(ValueError,match='conditioning'):validate_stage2_config(cfg)
 
 
-def test_visual_unified_checkpoint_and_asset_relocation(tmp_path):
+@pytest.mark.parametrize('language,causal',[(False,False),(True,False),(True,True)])
+def test_visual_unified_checkpoint_and_asset_relocation(tmp_path,language,causal):
     import shutil
     from safetensors.torch import load_file
-    full,encoder,path=load_encoder(tmp_path)
+    full,encoder,path=load_encoder(tmp_path,language=language,causal=causal)
     a=make_arch();a.video_backbone.vae=full.codec.vae
     cfg=OmegaConf.create(dict(goal={**config(),'checkpoint':str(path),'precomputed_text_fingerprint':'a'*64},
         model=dict(query_history={'enabled':True},goal_representation='visual_history_masked_sa')))
+    if language:
+        cfg.goal.format='openwam.visual_history.v2';cfg.goal.language_conditioning=True
+    if causal:
+        cfg.goal.format='openwam.visual_history.v3';cfg.goal.causal_history=True
     runtime.configure_goal(a,cfg)
     obs,ctx,_,views=multiview_batch(1);h=history()
     def condition(arch):
@@ -179,11 +191,12 @@ def test_visual_unified_checkpoint_and_asset_relocation(tmp_path):
     x=inputs()
     for u,v in zip(a(**x,**before),b(**x,**after)):
         torch.testing.assert_close(u,v,rtol=0,atol=0)
-    assert runtime.goal_prediction_policy(b)['format']=='openwam.visual_history.v1'
+    assert runtime.goal_prediction_policy(b)['format']==cfg.goal.format
 
 
 @pytest.mark.parametrize('codec_mode',['absent','correct','bad_shape','bad_range'])
-def test_visual_preflight_accepts_legacy_missing_codec_and_validates_present_codec(tmp_path,monkeypatch,codec_mode):
+@pytest.mark.parametrize('language,causal',[(False,False),(True,False),(True,True)])
+def test_visual_preflight_accepts_legacy_missing_codec_and_validates_present_codec(tmp_path,monkeypatch,codec_mode,language,causal):
     import json
     from dataclasses import asdict
     from safetensors.torch import save_file
@@ -202,6 +215,14 @@ def test_visual_preflight_accepts_legacy_missing_codec_and_validates_present_cod
     selection=make_native_source(tmp_path)
     metadata=dict(format='openwam.visual_history.v1',dit_config=dict(dim=48,patch_size=[1,2,2]),
         history=dict(num_history_tokens=32),dependencies={'test':'identity'})
+    if language:
+        with open_dict(cfg):
+            cfg.goal.format='openwam.visual_history.v2';cfg.goal.language_conditioning=True
+        metadata['format']=cfg.goal.format;metadata['history']['language_conditioning']=True
+    if causal:
+        with open_dict(cfg):
+            cfg.goal.format='openwam.visual_history.v3';cfg.goal.causal_history=True
+        metadata['format']=cfg.goal.format;metadata['history']['causal_history']=True
     if codec_mode!='absent':metadata['codec']=asdict(GoalCodecSpec())
     if codec_mode=='bad_shape':metadata['codec']['latent_shape']=(48,1,24,20)
     if codec_mode=='bad_range':metadata['codec']['pixel_range']=(0.,1.)

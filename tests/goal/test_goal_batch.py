@@ -27,6 +27,38 @@ class TinyBatchData:
     def scope_summary(self): return {'total_samples':self.total}
 
 
+class LargeMetadataData(TinyBatchData):
+    def __init__(self):
+        super().__init__()
+        self.metadata = b'curated-selection' * 300000
+
+    def sample(self, index):
+        record, batch = super().sample(index)
+        record['metadata_bytes'] = len(self.metadata)
+        return record, batch
+
+
+def test_spawn_payload_is_small_and_workers_keep_full_dataset_metadata():
+    from pathlib import Path
+    from openwam.train.goal_batch import GoalBatchLoader
+    from openwam.train.epoch_order import EpochOrder, sampling_contract
+    data = LargeMetadataData()
+    order = EpochOrder(sampling_contract({'seed': 42}, len(data)))
+    assert len(pickle.dumps(data)) > 4 * 1024 * 1024
+    with GoalBatchLoader(data, order, cursor=0, rank=0, world=1,
+                         batch_size=2, num_workers=2, prefetch_factor=1) as loader:
+        # The spawn pipe must not carry the full curated selection per worker:
+        # a multi-MB payload blocks each parent until that child finishes imports.
+        assert len(pickle.dumps(loader.wrapper)) < 4096
+        snapshot = Path(loader.wrapper.dataset.path)
+        assert snapshot.is_file()
+        pairs = next(loader)
+        assert [int(record['id']) for record, _ in pairs] == [order[0], order[1]]
+        assert all(record['metadata_bytes'] == len(data.metadata) for record, _ in pairs)
+        assert all(record['worker_pid'] != os.getpid() for record, _ in pairs)
+    assert not snapshot.exists()
+
+
 def test_collation_retains_mixed_masks_history_and_context_lengths():
     from openwam.train.goal_batch import prepare_goal_batch
     from openwam.model.goal.history import history_kwargs

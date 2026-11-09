@@ -350,7 +350,7 @@ def train_epoch(expert,dataset,context_cache,output,*,identity,dependencies,
           adam_betas=list(adam_betas),dataset_pin_memory=dataset_pin_memory,**loading)
     summary=dict(mode='bounded_stage1' if bounded else 'finite_stage1',status='running',identity=identity,scope=dataset.scope_summary(),evaluations=[],
         representation=representation,finite_epoch_complete=False,
-        completed_steps=update,steps=max_updates if bounded else math.ceil(len(dataset)/(world*batch_size)),evaluation_split='train',success_verified=False)
+        completed_steps=update,steps=max_updates if bounded else update+math.ceil((len(dataset)-cursor)/(world*batch_size)),evaluation_split='train',success_verified=False)
     fixed=[];cards=[]
     def setup():
         nonlocal fixed,cards

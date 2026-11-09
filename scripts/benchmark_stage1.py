@@ -32,6 +32,8 @@ def main(argv=None):
     parser.add_argument('--measured-steps',type=int,default=10)
     parser.add_argument('--timeout-seconds',type=int,default=180,help='process group and per-step watchdog, maximum 300')
     parser.add_argument('--startup-timeout-seconds',type=int,default=600,help='CUDA/NCCL/model bootstrap watchdog, maximum 900')
+    parser.add_argument('--input-startup-timeout-seconds',type=int,default=600,
+                        help='worker startup and first input watchdog, maximum 900; separate from normal step deadline')
     args=parser.parse_args(argv)
     import torch
     import torch.distributed as dist
@@ -44,6 +46,7 @@ def main(argv=None):
     from scripts.train_goal_epoch import validated_population
     if not 1<=args.timeout_seconds<=300:parser.error('--timeout-seconds must be between 1 and 300')
     if not 1<=args.startup_timeout_seconds<=900:parser.error('--startup-timeout-seconds must be between 1 and 900')
+    if not 1<=args.input_startup_timeout_seconds<=900:parser.error('--input-startup-timeout-seconds must be between 1 and 900')
     config=load_config(args.config,source_yaml=args.source_yaml)
     options=optimizer_config(config)
     if options['sharding']!='zero1' or options['device']!='model':
@@ -80,6 +83,8 @@ def main(argv=None):
                                         prepared_runtime=args.prepared_runtime,config=config)
             proof_facts=dict(config=config,index=str(Path(args.index).resolve()),
                              proof=str(Path(args.prepared_runtime).resolve()),cases=cases,population=finite.summary,
+                             deadlines_s=dict(step=args.timeout_seconds,model_startup=args.startup_timeout_seconds,
+                                              input_startup=args.input_startup_timeout_seconds),
                              environment=environment,cache_policy=environment['cache_policy'])
             all_facts=[None]*world;dist.all_gather_object(all_facts,proof_facts)
             if any(facts!=proof_facts for facts in all_facts):raise ValueError('base config/proof/population/matrix/environment differs between ranks')
@@ -108,7 +113,8 @@ def main(argv=None):
             # Bootstrap may exceed a training-step deadline; restore the strict
             # collective deadline before DDP setup or any benchmark update.
             set_group_timeout(timeout)
-        run_benchmark(expert,finite,encode,config,cases,output,timeout_seconds=args.timeout_seconds)
+        run_benchmark(expert,finite,encode,config,cases,output,timeout_seconds=args.timeout_seconds,
+                      input_startup_timeout_seconds=args.input_startup_timeout_seconds)
     except BaseException as exc:
         if output_accepted and not (output/f'failure_rank_{rank}.json').exists():
             atomic_json(output/f'failure_rank_{rank}.json',dict(benchmark_only=True,rank=rank,

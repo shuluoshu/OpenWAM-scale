@@ -9,7 +9,9 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import fields
 from pathlib import Path
+import pickle
 import random
+import tempfile
 import uuid
 
 import numpy as np
@@ -105,6 +107,33 @@ class _CPURequests(torch.utils.data.Dataset):
         return result
 
 
+class _DatasetSnapshot:
+    """Small spawn payload; load the parent's private local snapshot in workers.
+
+    A multi-MB dataset sent through spawn's pipe blocks the parent until each
+    child imports its Python environment and drains the pipe. Sending only this
+    reference lets all readers start independently. The snapshot is written by
+    this process, never accepted from an external source, and stays alive until
+    the loader has joined its workers.
+    """
+    def __init__(self, path):
+        self.path = str(path)
+        self._dataset = None
+
+    def __getstate__(self):
+        return dict(path=self.path, _dataset=None)
+
+    @property
+    def dataset(self):
+        if self._dataset is None:
+            with open(self.path, 'rb') as stream:
+                self._dataset = pickle.load(stream)
+        return self._dataset
+
+    def sample(self, index):
+        return self.dataset.sample(index)
+
+
 class GoalBatchLoader:
     """Lazy ordered sample readers; the parent assembles true training batches.
 
@@ -121,7 +150,19 @@ class GoalBatchLoader:
         self.dataset=dataset;self.order=order;self.cursor=cursor;self.rank=rank;self.world=world
         self.batch_size=batch_size;self.seed=seed;self.repeat_population=repeat_population;self.max_batches=max_batches
         self.read_cursor=cursor;self.read_batches=0
-        self.wrapper=_CPURequests(dataset,sample_cache_size,uuid.uuid4().hex)
+        self._snapshot_dir=None
+        worker_dataset=dataset
+        if num_workers:
+            self._snapshot_dir=tempfile.TemporaryDirectory(prefix='openwam-worker-dataset-')
+            path=Path(self._snapshot_dir.name)/'dataset.pkl'
+            try:
+                with path.open('wb') as stream:
+                    pickle.dump(dataset,stream,protocol=pickle.HIGHEST_PROTOCOL)
+            except BaseException:
+                self._snapshot_dir.cleanup()
+                raise
+            worker_dataset=_DatasetSnapshot(path)
+        self.wrapper=_CPURequests(worker_dataset,sample_cache_size,uuid.uuid4().hex)
         kwargs=dict(dataset=self.wrapper,batch_size=None,sampler=self._requests(),num_workers=num_workers,
                     collate_fn=_identity_collate,pin_memory=pin_memory,generator=torch.Generator().manual_seed(seed))
         if num_workers:kwargs.update(multiprocessing_context='spawn',worker_init_fn=_worker_init,prefetch_factor=prefetch_factor)
@@ -149,5 +190,7 @@ class GoalBatchLoader:
     def close(self):
         if self.iterator is not None and hasattr(self.iterator,'_shutdown_workers'):self.iterator._shutdown_workers()
         self.iterator=None
+        if self._snapshot_dir is not None:
+            self._snapshot_dir.cleanup();self._snapshot_dir=None
     def __enter__(self):return self
     def __exit__(self,*exc):self.close()

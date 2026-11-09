@@ -130,7 +130,8 @@ class QueryGoalEncoder(nn.Module):
             return self.codec
         return GoalCodec(self.codec.vae, GoalCodecSpec(
             name='wan22_vae48_multiview_single_frame', image_shape=MULTIVIEW_IMAGE_SHAPE,
-            latent_shape=MULTIVIEW_LATENT_SHAPE))
+            latent_shape=MULTIVIEW_LATENT_SHAPE),cache=self.codec.cache,
+            max_encode_batch_size=self.codec.max_encode_batch_size)
 
     def extract_tokens(self, observed, context, *, context_lens=None, observed_view_valid=None,
                        history_images=None, history_latents=None, history_ages=None, history_valid=None, history_episode_id=None):
@@ -143,14 +144,11 @@ class QueryGoalEncoder(nn.Module):
             if (history_images is None) == (history_latents is None):
                 raise ValueError('history requires exactly one of images or cached latents')
             if history_latents is None:
-                history_latents=self._history_cache.encode(self.codec,history_images,history_valid,episode_ids=history_episode_id)
+                history_latents=self._history_cache.encode(self.codec,history_images,history_valid,
+                    episode_ids=history_episode_id,device=observed.device)
             else:
                 for episode_id in history_episode_ids(history_episode_id,len(observed)):
                     self._history_cache.begin_episode(episode_id)
-            if history_images is None and not bool(history_valid.all()):
-                # Switching to precomputed features at an episode start must
-                # also discard any pixel-feature cache left by earlier inputs.
-                self.clear_history_cache()
             history_args=dict(history_latents=history_latents,history_ages=history_ages,history_valid=history_valid)
         if self.observation_mode == 'multiview':
             observed = sanitize_canvas(observed, observed_view_valid)

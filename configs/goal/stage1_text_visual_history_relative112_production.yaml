@@ -1,0 +1,8 @@
+# New Stage1: language enters the exported 120 x 3072 C* memory.
+# Initialize from the foundation; visual-only v1 optimizer states cannot resume.
+base_config: stage1_visual_history_relative112_production.yaml
+model:
+  visual_history:
+    language_conditioning: true
+dataset:
+  cache_dir: outputs/stage1_text_visual_history_relative112/cache

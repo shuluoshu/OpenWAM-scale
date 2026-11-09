@@ -1,0 +1,10 @@
+# @package _global_
+# Requires a newly trained language-conditioned Stage1 v2 bundle.
+defaults:
+  - stage2_visual_history_joint_gpu
+  - _self_
+goal:
+  format: openwam.visual_history.v2
+  language_conditioning: true
+project:
+  name: openwam-stage2-text-visual-history-joint

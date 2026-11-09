@@ -22,8 +22,16 @@ def goal_representation(config):
     is_query = config.get('format') == 'openwam.goal.query.v1'
     if is_query != (representation == 'query_latent'):
         raise ValueError('goal representation/format mismatch')
-    if (config.get('format') == 'openwam.visual_history.v1') != (representation == 'visual_history_masked_sa'):
+    is_visual = config.get('format') in ('openwam.visual_history.v1','openwam.visual_history.v2','openwam.visual_history.v3')
+    if is_visual != (representation == 'visual_history_masked_sa'):
         raise ValueError('goal representation/format mismatch')
+    language = config.get('language_conditioning',False)
+    causal = config.get('causal_history',False)
+    expected = 'openwam.visual_history.v3' if causal else 'openwam.visual_history.v2' if language else 'openwam.visual_history.v1'
+    if (type(language) is not bool or (language and not is_visual)
+            or type(causal) is not bool or (causal and not is_visual)
+            or (is_visual and config.get('format') != expected)):
+        raise ValueError('goal format/language/causal conditioning mismatch')
     return representation
 
 
@@ -47,7 +55,9 @@ def goal_observation_mode(config):
                  ('openwam.goal.patch.v2', 'clean_multiview'): 'multiview',
                  ('openwam.goal.query.v1', 'clean_head'): 'head',
                  ('openwam.goal.query.v1', 'clean_multiview'): 'multiview',
-                 ('openwam.visual_history.v1', 'clean_multiview'): 'multiview'}
+                 ('openwam.visual_history.v1', 'clean_multiview'): 'multiview',
+                 ('openwam.visual_history.v2', 'clean_multiview'): 'multiview',
+                 ('openwam.visual_history.v3', 'clean_multiview'): 'multiview'}
     if pair not in contracts:
         raise ValueError('goal format/input_policy contract mismatch')
     mode = contracts[pair]
@@ -89,6 +99,10 @@ def validate_goal_compatibility(requested, saved):
         if QueryConfig(**requested.get('query', {})) != QueryConfig(**saved.get('query', {})):
             raise ValueError('Stage2 query dimensions differ from saved checkpoint')
     if goal_representation(requested) == 'visual_history_masked_sa':
+        if requested.get('causal_history',False) != saved.get('causal_history',False):
+            raise ValueError('Stage2 causal history differs from saved checkpoint')
+        if requested.get('language_conditioning',False) != saved.get('language_conditioning',False):
+            raise ValueError('Stage2 language conditioning differs from saved checkpoint')
         if visual_history_config(requested) != visual_history_config(saved):
             raise ValueError('Stage2 visual history dimensions differ from saved checkpoint')
 
@@ -110,8 +124,12 @@ def goal_prediction_policy(architecture):
         result.update(format='openwam.goal.query.v1', representation='query_latent',
                       query=asdict(QueryConfig(**config.get('query', {}))), num_steps=1)
     if goal_representation(config) == 'visual_history_masked_sa':
-        result.update(format='openwam.visual_history.v1', representation='visual_history_masked_sa',
+        result.update(format=config['format'], representation='visual_history_masked_sa',
                       visual_history=visual_history_config(config), num_steps=1)
+        if config.get('language_conditioning',False):
+            result['language_conditioning'] = True
+        if config.get('causal_history',False):
+            result['causal_history'] = True
     history = HistoryConfig(**config.get('history', {}))
     if history.enabled:
         from dataclasses import asdict
@@ -274,8 +292,10 @@ def predict_goals(*, expert, observed, context, context_lens, seeds, num_steps,
         representation = getattr(expert, 'representation', 'patch_denoise')
         if representation == 'visual_history_masked_sa':
             from .observation import observation_token_mask
+            text = (dict(context=context[ids],context_lens=kwargs['context_lens'])
+                    if expert.language_conditioning else {})
             z = expert.condition_tokens(observed[ids], observed_view_valid=observed_view_valid[ids],
-                **{k:v[ids] for k,v in history.items()}).detach()
+                **text, **{k:v[ids] for k,v in history.items()}).detach()
             if z.shape != (len(ids), 120, expert.dit.dim):
                 raise ValueError('visual history conditioner must return [B,120,DiT_dim]')
             pred = GoalCondition(z, observation_token_mask(observed_view_valid[ids]),
@@ -351,6 +371,10 @@ def configure_goal(architecture, cfg, *, checkpoint_dir=None):
         if expert.query_config != QueryConfig(**config.get('query', {})):
             raise ValueError('goal query config disagrees with checkpoint')
     if representation == 'visual_history_masked_sa':
+        if expert.causal_history != config.get('causal_history',False):
+            raise ValueError('goal causal history disagrees with checkpoint')
+        if expert.language_conditioning != config.get('language_conditioning',False):
+            raise ValueError('goal language conditioning disagrees with checkpoint')
         if (expert.token_dim, expert.num_tokens) != tuple(visual_history_config(config)[k] for k in ('dim', 'num_tokens')):
             raise ValueError('goal visual history dimensions disagree with checkpoint')
         if expert.history_config != HistoryConfig(**config.get('history', {})):
@@ -583,5 +607,7 @@ def _reset_history_caches(expert, cache, history, count):
             or not bool(history['history_valid'].all())):
         if cache is not None:
             cache.entries.clear();cache.bytes_used=0
-        expert.clear_history_cache()
+        # Conditional goals keep the policy above; raw VAE entries have their
+        # own episode/content keys and may safely survive known episode changes.
+        if None in ids:expert.clear_history_cache()
     owner._history_episode_ids=ids

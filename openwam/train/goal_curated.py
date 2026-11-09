@@ -69,8 +69,12 @@ def load_config(path, *, source_yaml=None, data_root=None):
             raise ValueError('visual_history_masked_sa requires multiview and enabled dataset history')
         from openwam.model.goal.visual_history import HistoryTokenPool
         options=config.get('model',{}).get('visual_history',{})
-        if set(options)-{'num_history_tokens','pool_dim','pool_heads','adapter_block'}:
+        if set(options)-{'num_history_tokens','pool_dim','pool_heads','adapter_block','language_conditioning','causal_history'}:
             raise ValueError('unsupported visual history options')
+        if type(options.get('language_conditioning',False)) is not bool:
+            raise ValueError('language_conditioning must be boolean')
+        if type(options.get('causal_history',False)) is not bool:
+            raise ValueError('causal_history must be boolean')
         # Validate pool dimensions without constructing the baseline model.
         HistoryTokenPool(8,options.get('num_history_tokens',32),options.get('pool_dim',256),options.get('pool_heads',8))
     from openwam.model.goal.observation import OBSERVATION_MODES
@@ -163,7 +167,7 @@ def prepare_batch(record,batch,*,device,dtype,context_cache=None):
     result=dict(batch)
     result['observed']=batch['observed'].to(device=device,dtype=dtype)
     from openwam.model.goal.history import move_history
-    result.update(move_history(batch,device,dtype))
+    result.update(move_history(batch,device,dtype,keep_images_cpu=True))
     if 'observed_view_valid' in batch:
         result['observed_view_valid']=batch['observed_view_valid'].to(device=device)
     target=batch['targets'].to(device=device)

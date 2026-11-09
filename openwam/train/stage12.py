@@ -117,6 +117,12 @@ def validate_stage1_stage2_contract(stage1,stage2):
         if any(stage1['model'].get(k)!=stage2['model'].get(k) for k in ('query_goal','query_history')):
             raise ValueError('Stage1/Stage2 query or history configuration mismatch')
     elif representation=='visual_history_masked_sa':
+        if (stage1['model'].get('visual_history',{}).get('causal_history',False)
+                != stage2.get('goal',{}).get('causal_history',False)):
+            raise ValueError('Stage1/Stage2 causal history mismatch')
+        if (stage1['model'].get('visual_history',{}).get('language_conditioning',False)
+                != stage2.get('goal',{}).get('language_conditioning',False)):
+            raise ValueError('Stage1/Stage2 language conditioning mismatch')
         if stage1.get('observation_mode')!='multiview' or stage2.get('goal',{}).get('observation_mode')!='multiview':
             raise ValueError('visual history requires multiview in both stages')
         from openwam.model.goal.runtime import visual_history_config

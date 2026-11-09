@@ -86,6 +86,7 @@ def test_missing_head_keeps_wrists_and_masks_head_supervision(tmp_path):
     info=json.loads((root/'meta/info.json').read_text());del info['features']['observation.images.head_left']
     (root/'meta/info.json').write_text(json.dumps(info))
     data=CuratedGoalDataset(source,tmp_path/'cache',observation_mode='multiview',history={'enabled':True})
+    data._evaluating=True  # The export reader below requires persistent image/NPZ assets.
     record,batch=data.sample(0)
     assert batch['observed_view_valid'].tolist()==[[False,True,True]]
     assert not batch['targets'].image_valid.any()
@@ -146,11 +147,16 @@ def test_visual_history_optimizer_groups_pool_adapter_and_gate():
     assert set(all_params)=={id(p) for p in expert.parameters() if p.requires_grad}
 
 
-def test_interrupted_bounded_visual_history_resume_matches_uninterrupted(tmp_path,monkeypatch):
+@pytest.mark.parametrize('language',[False,True,'causal'])
+def test_interrupted_bounded_visual_history_resume_matches_uninterrupted(tmp_path,monkeypatch,language):
     import openwam.train.goal_epoch as epoch
     from openwam.train.epoch_order import sampling_contract
     from openwam.model.goal.dependencies import dependency_identity
     from test_visual_history import make_model,history
+    if language:
+        from test_text_visual_history import make_text_model as make_model
+    if language=='causal':
+        from test_causal_visual_history import make_causal_model as make_model
     from test_multiview_patch import multiview_batch
     torch.set_num_threads(2)
     original=make_model();obs,ctx,target,views=multiview_batch(1);past=history()

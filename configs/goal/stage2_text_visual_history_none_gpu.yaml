@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - stage2_visual_history_none_gpu
+  - _self_
+goal:
+  format: openwam.visual_history.v2
+  language_conditioning: true
+project:
+  name: openwam-stage2-text-visual-history-none

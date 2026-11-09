@@ -1,0 +1,7 @@
+# New-run GPU optimizer recipe with text-conditioned C*.
+base_config: stage1_visual_history_relative112_gpu_zero1.yaml
+model:
+  visual_history:
+    language_conditioning: true
+dataset:
+  cache_dir: outputs/stage1_text_visual_history_relative112/cache

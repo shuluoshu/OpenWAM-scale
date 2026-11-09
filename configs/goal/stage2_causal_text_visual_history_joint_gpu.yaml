@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - stage2_text_visual_history_joint_gpu
+  - _self_
+goal:
+  format: openwam.visual_history.v3
+  causal_history: true
+project:
+  name: openwam-stage2-causal-text-visual-history-joint

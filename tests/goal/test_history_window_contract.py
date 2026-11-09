@@ -28,29 +28,29 @@ def test_start_and_short_history_never_wrap():
     assert age.tolist()==[0]*8+[2,1]
 
 
-def test_full_history_cache_cleared_on_episode_switch_even_identical_pixels():
+def test_full_history_cache_isolates_and_reuses_known_episodes():
     calls=[]
     def encode(x):
         calls.append(len(x)); return x.new_zeros((len(x),48,1,16,20))
     codec=SimpleNamespace(vae=torch.nn.Linear(1,1),encode=encode)
     cache=HeadFeatureCache(256)
     images=torch.zeros(1,10,3,1,256,320);valid=torch.ones(1,10,dtype=torch.bool)
-    for ep,expected in [(10,1),(10,1),(20,2),(10,3)]:
+    for ep,expected in [(10,1),(10,1),(20,2),(10,2)]:
         cache.encode(codec,images,valid,episode_ids=torch.tensor([ep]))
         assert len(calls)==expected
     assert cache.episode_id==10
 
 
-def test_mixed_batch_clears_at_each_episode_and_missing_ids_do_not_reuse():
+def test_mixed_batch_reuses_known_episodes_but_missing_ids_do_not_persist():
     calls=[]
     def encode(x):
-        calls.append(1);return x.new_zeros((len(x),48,1,16,20))
+        calls.append(len(x));return x.new_zeros((len(x),48,1,16,20))
     codec=SimpleNamespace(vae=torch.nn.Linear(1,1),encode=encode);cache=HeadFeatureCache(256)
     images=torch.zeros(3,10,3,1,256,320);valid=torch.ones(3,10,dtype=torch.bool)
     cache.encode(codec,images,valid,episode_ids=torch.tensor([1,2,1]))
-    assert len(calls)==3
+    assert sum(calls)==2
     cache.encode(codec,images[:1],valid[:1]);cache.encode(codec,images[:1],valid[:1])
-    assert len(calls)==5
+    assert sum(calls)==4
 
 
 def test_episode_id_transfer_preserves_integer_precision():
@@ -71,7 +71,7 @@ def test_one_history_switch_controls_reader_and_model(tmp_path):
         assert cfg['dataset']['history']['frame_dropout_prob']==.2
 
 
-def test_stage2_episode_switch_flushes_both_caches():
+def test_stage2_episode_switch_flushes_conditional_goals_but_retains_raw_vae_cache():
     from test_query_stage2 import attach
     from test_query_history import history_expert, history
     from test_multiview_patch import multiview_batch
@@ -86,7 +86,7 @@ def test_stage2_episode_switch_flushes_both_caches():
     second=run(2)['goal_latent']
     torch.testing.assert_close(first,second)
     assert not (oldkeys & set(a.goal_cache.entries))
-    assert b'old' not in a.goal_expert._history_cache.entries
+    assert b'old' in a.goal_expert._history_cache.entries
 
 
 def test_dropout_extremes_reproducibility_and_fractional_fps():

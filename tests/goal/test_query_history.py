@@ -73,7 +73,7 @@ def test_cached_images_equal_live_features_and_cache_bounded():
     e=history_expert().eval(); obs,ctx,_,views=multiview_batch(1)
     images=torch.randn(1,10,3,1,256,320).clamp(-1,1); h=history(); h.pop('history_latents')
     calls=[]; encode=e.codec.encode
-    def wrapped(x): calls.append(len(x)); return encode(x)
+    def wrapped(x,**kwargs): calls.append(len(x)); return encode(x,**kwargs)
     e.codec.encode=wrapped
     a=e.extract_tokens(obs,ctx,observed_view_valid=views,history_images=images,**h)
     first=sum(calls)
@@ -216,9 +216,9 @@ def test_episode_start_discards_previous_cache_and_masks_missing_slots(available
         assert (actual[valid] == -.5).all()
 
 
-def test_precomputed_partial_history_also_clears_previous_pixel_cache():
+def test_precomputed_partial_history_does_not_invalidate_raw_pixel_cache():
     e=history_expert().eval(); obs,ctx,_,views=multiview_batch(1)
     e._history_cache.entries[b'previous_episode'] = torch.ones(1)
     h=history(); h['history_valid'][:,:8]=False
     e.extract_tokens(obs,ctx,observed_view_valid=views,**h)
-    assert len(e._history_cache)==0
+    assert b'previous_episode' in e._history_cache.entries

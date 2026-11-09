@@ -13,6 +13,18 @@ from openwam.model.video_backbone.wan.models.dit import WanModel
 from openwam.train.goal_overfit import _write_json
 
 FORMAT = 'openwam.visual_history.v1'
+TEXT_FORMAT = 'openwam.visual_history.v2'
+CAUSAL_FORMAT = 'openwam.visual_history.v3'
+
+
+def validate_visual_history_language(metadata):
+    """Bind the bundle format to its actual encoder topology."""
+    language = metadata.get('history', {}).get('language_conditioning', False)
+    causal = metadata.get('history', {}).get('causal_history', False)
+    expected = CAUSAL_FORMAT if causal else TEXT_FORMAT if language else FORMAT
+    if type(language) is not bool or type(causal) is not bool or metadata.get('format') != expected:
+        raise ValueError('visual history format/language conditioning mismatch')
+    return language
 
 
 def save_visual_history_bundle(expert, path, *, precomputed_text_fingerprint=None,
@@ -20,7 +32,8 @@ def save_visual_history_bundle(expert, path, *, precomputed_text_fingerprint=Non
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
     deps=dependency_identities or dependency_identity(expert.codec.vae,
         text_dim=expert.context_width,precomputed_text_fingerprint=precomputed_text_fingerprint)
-    meta=dict(format=FORMAT,dit_config=expert.dit_config,history=expert.history_options,
+    meta=dict(format=CAUSAL_FORMAT if expert.causal_history else TEXT_FORMAT if expert.language_conditioning else FORMAT,
+        dit_config=expert.dit_config,history=expert.history_options,
         shift=expert.shift,lambda_image=expert.lambda_image,lambda_tcp=expert.lambda_tcp,
         codec=expert.codec.metadata(),dependencies=deps,training=training_metadata or {},
         representation=expert.representation,observation_mode=expert.observation_mode,
@@ -38,14 +51,14 @@ def load_visual_history_bundle(path, *, vae, text_dim, precomputed_text_fingerpr
 
     No historical training path is opened; all trainable weights and structure
     are reconstructed from this single bundle. Returned expert is frozen.
-    encoder_only removes target blocks/head/text embedding on CPU before device
-    placement, retaining the modules used by condition_tokens exactly.
+    encoder_only removes target blocks/head/decoder text projection before
+    placement, retaining the separate C* text projection in language mode.
     """
     with safe_open(str(path),framework='pt',device='cpu') as f:
         raw=(f.metadata() or {}).get('visual_history')
         if raw is None:raise ValueError('missing visual history metadata')
         meta=json.loads(raw)
-        if meta.get('format')!=FORMAT:raise ValueError('unsupported visual history format')
+        validate_visual_history_language(meta)
         dep=meta['dependencies']
         if text_dim!=dep['text_dim']:raise ValueError('incompatible text dimension')
         if precomputed_identity(precomputed_text_fingerprint)['fingerprint']!=dep['text']['fingerprint']:

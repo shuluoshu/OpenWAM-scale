@@ -253,6 +253,11 @@ def validate_stage2_launch(cfg,*,metadata_only=False,prepared_runtime=None):
         if metadata.get('representation')!='query_latent' or QueryConfig(**metadata['query_config'])!=QueryConfig(**OmegaConf.to_container(cfg.goal.query,resolve=True)):
             raise ValueError('Stage1 query bundle model configuration mismatch')
     if metadata_key=='visual_history':
+        from openwam.train.goal_visual_history import validate_visual_history_language
+        if validate_visual_history_language(metadata) != cfg.goal.get('language_conditioning',False):
+            raise ValueError('Stage1 language conditioning configuration mismatch')
+        if metadata.get('history',{}).get('causal_history',False) != cfg.goal.get('causal_history',False):
+            raise ValueError('Stage1 causal history configuration mismatch')
         from openwam.model.goal.runtime import visual_history_config
         options=visual_history_config(OmegaConf.to_container(cfg.goal,resolve=True))
         if metadata.get('dit_config',{}).get('dim')!=options['dim']:

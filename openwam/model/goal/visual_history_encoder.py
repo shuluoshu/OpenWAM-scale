@@ -24,6 +24,10 @@ class FrozenVisualHistoryEncoder(VisualHistoryGoalExpert):
         self.dit_config = expert.dit_config
         self.shift = expert.shift
         self.history_options = expert.history_options
+        self.language_conditioning = expert.language_conditioning
+        self.causal_history = expert.causal_history
+        if self.language_conditioning:
+            self.condition_text_embedding = expert.condition_text_embedding
         self.history_pool = expert.history_pool
         self.visual_adapter = expert.visual_adapter
         self.history_gate = expert.history_gate
@@ -39,8 +43,8 @@ class FrozenVisualHistoryEncoder(VisualHistoryGoalExpert):
     def context_width(self):
         return self.text_dim
 
-    def forward(self, observed, **kwargs):
-        return self.condition_tokens(observed, **kwargs)
+    def forward(self, observed, context=None, **kwargs):
+        return self.condition_tokens(observed, context, **kwargs)
 
     def generate(self, *args, **kwargs):
         raise RuntimeError('visual history Stage2 encoder has no goal decoder')

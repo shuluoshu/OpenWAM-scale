@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import timedelta
 import gc
 import json
 import math
@@ -139,7 +140,8 @@ def watchdog(seconds, output, rank, phase):
     finally:timer.cancel()
 
 
-def run_benchmark(expert,dataset,encode_text,config,cases,output,*,timeout_seconds=180):
+def run_benchmark(expert,dataset,encode_text,config,cases,output,*,timeout_seconds=180,
+                  input_startup_timeout_seconds=600):
     """Run native batches, DDP, losses, clipping and optimizer; return summaries.
 
     CPU execution is supported for focused tiny-model tests. Production launch
@@ -157,6 +159,8 @@ def run_benchmark(expert,dataset,encode_text,config,cases,output,*,timeout_secon
     from openwam.model.goal.heads import point_mask
     if type(timeout_seconds) is not int or not 1<=timeout_seconds<=300:
         raise ValueError('timeout_seconds must be between 1 and 300')
+    if type(input_startup_timeout_seconds) is not int or not 1<=input_startup_timeout_seconds<=900:
+        raise ValueError('input_startup_timeout_seconds must be between 1 and 900')
     distributed=dist.is_initialized(); rank=dist.get_rank() if distributed else 0
     world=dist.get_world_size() if distributed else 1
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
@@ -201,7 +205,7 @@ def run_benchmark(expert,dataset,encode_text,config,cases,output,*,timeout_secon
               world_size=world,base_config=config)
         log.flush()
         for case in cases:
-            loader=optimizer=cache=None;case_start=time.monotonic(); rows=[];cursor=0
+            loader=optimizer=cache=first_pairs=None;case_start=time.monotonic(); rows=[];cursor=0
             prior_decode_threads=os.environ.get('OPENWAM_VIDEO_DECODE_THREADS')
             try:
                 with watchdog(timeout_seconds,output,rank,case['name']+':setup'):
@@ -232,8 +236,25 @@ def run_benchmark(expert,dataset,encode_text,config,cases,output,*,timeout_secon
                         pin_memory=config.get('dataset_pin_memory',False))
                     sync();barrier()
                     if device.type=='cuda':torch.cuda.reset_peak_memory_stats(device)
+                # DataLoader starts spawn workers lazily at its first next().
+                # Large reader pools can spend most of the normal step deadline
+                # starting interpreters before a single model forward occurs.
+                # Bound and report that startup separately; consume this same
+                # batch in update 1, preserving the population cursor and RNG.
+                event('input_startup',case=case['name']);log.flush()
+                with watchdog(input_startup_timeout_seconds,output,rank,case['name']+':input-startup'):
+                    if distributed:
+                        dist.distributed_c10d._set_pg_timeout(timedelta(seconds=input_startup_timeout_seconds))
+                    t=time.monotonic()
+                    first_pairs=next(loader)
+                    first_input_load_s=time.monotonic()-t
+                    sync();barrier()
+                    input_startup_s=time.monotonic()-t
+                    if distributed:
+                        dist.distributed_c10d._set_pg_timeout(timedelta(seconds=timeout_seconds))
                 setup_s=time.monotonic()-case_start
-                event('case_setup',case=case['name'],setup_s=setup_s,profile=case);log.flush()
+                event('case_setup',case=case['name'],setup_s=setup_s,profile=case,
+                      input_startup_s=input_startup_s,first_input_load_s=first_input_load_s);log.flush()
                 measured_start=None
                 for step in range(1,case['warmup_steps']+case['measured_steps']+1):
                     with watchdog(timeout_seconds,output,rank,f"{case['name']}:step:{step}"):
@@ -243,7 +264,12 @@ def run_benchmark(expert,dataset,encode_text,config,cases,output,*,timeout_secon
                         positions,real_count,weight,consumed=rank_batch(cursor,len(dataset),rank,world,case['batch_size'])
                         index=order[positions[0]];seed=config.get('seed',42)+index
                         _seed(seed);expert.train_stage_a();optimizer.zero_grad()
-                        t=time.monotonic();pairs=next(loader);load_s=time.monotonic()-t
+                        t=time.monotonic()
+                        if step==1:
+                            pairs=first_pairs;first_pairs=None
+                        else:
+                            pairs=next(loader)
+                        load_s=time.monotonic()-t
                         t=time.monotonic()
                         batch=prepare_goal_batch(pairs,device=device,dtype=dtype,context_cache=cache)
                         if not real_count:
@@ -272,6 +298,7 @@ def run_benchmark(expert,dataset,encode_text,config,cases,output,*,timeout_secon
                         del out,batch,pairs,norm
                 sync();barrier();elapsed=time.monotonic()-measured_start
                 local=dict(rank=rank,rows=rows,measured_wall_s=elapsed,setup_s=setup_s,
+                           input_startup_s=input_startup_s,first_input_load_s=first_input_load_s,
                            peak_allocated_bytes=torch.cuda.max_memory_allocated(device) if device.type=='cuda' else 0,
                            peak_reserved_bytes=torch.cuda.max_memory_reserved(device) if device.type=='cuda' else 0)
                 with watchdog(timeout_seconds,output,rank,case['name']+':summarize'):
@@ -294,7 +321,7 @@ def run_benchmark(expert,dataset,encode_text,config,cases,output,*,timeout_secon
                 else:os.environ['OPENWAM_VIDEO_DECODE_THREADS']=prior_decode_threads
                 with watchdog(timeout_seconds,output,rank,case['name']+':cleanup'):
                     if loader is not None:loader.close()
-                    loader=optimizer=cache=None
+                    loader=optimizer=cache=first_pairs=None
                     expert.zero_grad(set_to_none=True)
                     if hasattr(expert.codec,'clear_cache'):expert.codec.clear_cache()
                     gc.collect()

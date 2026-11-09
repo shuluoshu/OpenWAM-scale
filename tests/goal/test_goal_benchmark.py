@@ -218,6 +218,50 @@ def test_update_log_visible_before_following_update(tmp_path):
     assert result[0]['cache_policy']['video_index_builds_allowed'] is False
 
 
+def test_first_input_startup_has_separate_budget_and_preserves_samples(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    import openwam.train.goal_benchmark as benchmark
+    from test_query_goal import make_query
+    from test_multiview_patch import multiview_batch
+    observed, context, targets, valid = multiview_batch(1)
+    active = []
+
+    @contextmanager
+    def timer(seconds, output, rank, phase):
+        active.append((seconds, phase))
+        try:
+            yield
+        finally:
+            active.pop()
+
+    monkeypatch.setattr(benchmark, 'watchdog', timer)
+
+    class Data:
+        reads = []
+        def __len__(self): return 3
+        def sample(self, index):
+            if not self.reads:
+                assert active[-1] == (600, 'startup:input-startup')
+            else:
+                assert active[-1][0] == 30
+                assert ':step:' in active[-1][1]
+            self.reads.append(index)
+            return dict(family='tiny', instruction='move', id=str(index)), dict(
+                observed=observed, context=context, targets=targets, observed_view_valid=valid)
+
+    data = Data()
+    cases = benchmark.parse_cases([dict(name='startup', batch_size=1, num_workers=0,
+                                         warmup_steps=1, measured_steps=2)], {})
+    result = benchmark.run_benchmark(make_query(), data, None, dict(learning_rate=1e-5),
+                                     cases, tmp_path, timeout_seconds=30)
+    rows = [json.loads(line) for line in (tmp_path / 'rank_0.jsonl').read_text().splitlines()]
+    updates = [row for row in rows if row['event'] == 'update']
+    assert [row['anchor_index'] for row in updates] == data.reads
+    assert len(data.reads) == 3 and result[0]['measured_global_samples'] == 2
+    setup = next(row for row in rows if row['event'] == 'case_setup')
+    assert 0 <= setup['input_startup_s'] <= setup['setup_s']
+
+
 def test_startup_watchdog_is_active_before_first_cuda_call(tmp_path,monkeypatch):
     from contextlib import contextmanager
     from types import SimpleNamespace
