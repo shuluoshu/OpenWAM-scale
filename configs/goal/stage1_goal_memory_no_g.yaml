@@ -1,0 +1,4 @@
+base_config: stage1_goal_memory.yaml
+# G remains as a UV readout branch; all G keys are masked for its readers.
+memory:
+  goal_dropout: 1.0

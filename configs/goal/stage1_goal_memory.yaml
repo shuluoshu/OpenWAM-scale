@@ -1,0 +1,37 @@
+# Opt-in RFC revision71 with user overrides. Does not alter live C* jobs.
+base_config: stage1_joint_base.yaml
+stage: 1
+representation: goal_memory
+model:
+  goal_representation: goal_memory
+seed: 42
+baseline_checkpoint: /mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Pretrain-Foundation-Model/checkpoint_step_154000.safetensors
+history:
+  fps: 1
+  recent_frames: 2
+memory:
+  num_goal_tokens: 32
+  recent_frames: 2
+  history_dropout: 0.15
+  history_noise_mix: 0.1
+  goal_dropout: 0.0
+  lambda_image: 1.0
+  lambda_uv: 1.0
+  warmup_fraction: 0.2
+  warmup_y_text_probability: 0.5
+  use_gradient_checkpointing: true
+memory_cache:
+  directory: outputs/goal_memory_frames
+  require_cache: true
+learning_rate: 1.0e-5
+new_learning_rate: 1.0e-4
+max_updates: 50000
+checkpoint_every: 1000
+max_grad_norm: 1.0
+optimizer_device: model
+dataset:
+  source_yaml: /mnt/data/cpfs/b5/yeqingda/pretrain/launch/moravla/train_files/pretrain_v0_3_curated_3000h_posttrain_20261019_exclude_rcv1_rmv1_rmv2_20261030_exclude_missing_wipe_table_20261031.yaml
+  cache_dir: outputs/goal_memory_reader
+  observation_mode: multiview
+  subtask_probability: 0.7
+  max_cached_episodes: 2

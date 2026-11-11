@@ -1,0 +1,6 @@
+base_config: stage2_goal_memory.yaml
+policy:
+  attention_mode: action_sees_video
+  future_video_mode: joint
+action_data:
+  future_video_mode: joint

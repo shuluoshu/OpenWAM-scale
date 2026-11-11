@@ -1,0 +1,3 @@
+base_config: stage1_goal_memory.yaml
+memory:
+  history_dropout: 1.0

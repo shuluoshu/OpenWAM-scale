@@ -1,0 +1,3 @@
+base_config: stage2_goal_memory.yaml
+policy:
+  goal_dropout: 0.15

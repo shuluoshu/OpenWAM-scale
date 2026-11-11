@@ -100,7 +100,7 @@ def language_intervals(labels, task_mapping, annotations, length):
 class CuratedGoalDataset:
     def __init__(self,source_yaml,cache_dir,seed=42,subtask_probability=.5,
                  max_cached_episodes=8,dtype=torch.bfloat16,data_root=None,observation_mode='head',history=None,path_aliases=None,
-                 observation_augmentation=None):
+                 observation_augmentation=None, materialize_multiview_target=False, episode_metadata_reader=None):
         if observation_mode not in OBSERVATION_MODES:raise ValueError(f'invalid observation_mode: {observation_mode}')
         if not 0<=subtask_probability<=1:raise ValueError('invalid subtask probability')
         if max_cached_episodes<1:raise ValueError('max_cached_episodes must be positive')
@@ -109,6 +109,10 @@ class CuratedGoalDataset:
         self.seed=int(seed);self.subtask_probability=subtask_probability;self.max_cached_episodes=max_cached_episodes
         self.dtype=getattr(torch,dtype) if isinstance(dtype,str) else dtype
         self.observation_mode=observation_mode
+        self.materialize_multiview_target=bool(materialize_multiview_target)
+        self.episode_metadata_reader=episode_metadata_reader
+        if self.materialize_multiview_target and observation_mode!='multiview':
+            raise ValueError('multiview targets require multiview observations')
         from openwam.dataloader.transforms.goal_observation import GoalObservationAugmentation
         self.observation_augmentation=GoalObservationAugmentation(observation_augmentation,observation_mode=observation_mode)
         self.history=history if isinstance(history,HistorySamplingConfig) else HistorySamplingConfig(**(history or {}))
@@ -153,7 +157,7 @@ class CuratedGoalDataset:
             if self.observation_mode!='multiview':raise ValueError('missing head camera requires multiview')
             head=None
         if not any(cameras):raise ValueError('no available observation camera')
-        ep=read_episode_metadata(root,episode);length=int(ep['length'])
+        ep=(self.episode_metadata_reader or read_episode_metadata)(root,episode);length=int(ep['length'])
         data=episode_data_path(root,info,ep)
         names=pq.ParquetFile(data).schema_arrow.names
         ann=root/'meta/sub_tasks.parquet';has_annotations=ann.exists()
@@ -268,6 +272,7 @@ class CuratedGoalDataset:
             video=None;images={i:Image.new('RGB',(320,256)) for i in (anchor,goal)}
             alignment={i:dict(available=False,mask_reason='missing_camera_feature') for i in (anchor,goal)}
         frames=[images[anchor] if head_valid else None,None,None];view_valid=[head_valid,False,False]
+        target_frames=[images[goal] if head_valid else None,None,None]
         observed_views=dict(head=dict(camera=m['head'],available=head_valid,
             mask_reason=None if head_valid else 'missing_camera_feature',
             source_video=str(video) if video else None,alignment=alignment[anchor]))
@@ -276,8 +281,9 @@ class CuratedGoalDataset:
                 if camera is None:
                     observed_views[VIEW_NAMES[i]]=dict(camera=None,available=False,mask_reason='missing_camera_feature')
                     continue
-                wrist_video,wrist_images,wrist_alignment=decode(camera,[anchor])
+                wrist_video,wrist_images,wrist_alignment=decode(camera,[anchor,goal] if self.materialize_multiview_target else [anchor])
                 frames[i]=wrist_images[anchor];view_valid[i]=True
+                if self.materialize_multiview_target:target_frames[i]=wrist_images[goal]
                 observed_views[VIEW_NAMES[i]]=dict(camera=camera,available=True,mask_reason=None,
                     source_video=str(wrist_video),alignment=wrist_alignment[anchor])
         from openwam.dataloader.episode_data import read_episode_rows
@@ -360,6 +366,12 @@ class CuratedGoalDataset:
             batch['targets'].point_valid.zero_()
             batch['targets'].in_frame.zero_()
         batch.update(instruction=record['instruction'],id=ident,family=repo['family'],granularity=level)
+        if self.materialize_multiview_target:
+            valid=torch.tensor(view_valid,dtype=torch.bool) & bool(m['source_valid'][goal])
+            target=(clean_multiview(target_frames,valid) if valid.any()
+                    else torch.full((3,1,384,320),-1.))
+            batch.update(target_image=target.to(dtype=self.dtype).unsqueeze(0),
+                         target_view_valid=valid.unsqueeze(0),target_image_valid=valid.any().reshape(1))
         if self.history.enabled:
             start=next(a for e,a,b in repo['ranges'] if e==episode and a<=anchor<b)
             history_seed=int(hashlib.sha256(f'{self.seed}:{self._history_draw_id}:{identity}'.encode()).hexdigest()[:15],16)

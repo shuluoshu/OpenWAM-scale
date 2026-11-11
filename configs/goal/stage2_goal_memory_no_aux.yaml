@@ -1,0 +1,4 @@
+base_config: stage2_goal_memory.yaml
+policy:
+  freeze_video: false
+  keyframe_aux_weight: 0.0
