@@ -19,6 +19,7 @@ memory:
   lambda_uv: 1.0
   warmup_fraction: 0.2
   warmup_y_text_probability: 0.5
+  goal_horizon_mode: kf1_endpoint
   use_gradient_checkpointing: true
 memory_cache:
   directory: outputs/goal_memory_frames

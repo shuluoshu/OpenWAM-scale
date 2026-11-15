@@ -28,9 +28,12 @@ class GoalMemoryConfig:
     warmup_fraction: float = .2
     warmup_y_text_probability: float = .5
     use_gradient_checkpointing: bool = True
+    goal_horizon_mode: str = 'seconds'
 
     def __post_init__(self):
         self.latent_shape = tuple(self.latent_shape)
+        if self.goal_horizon_mode not in ('seconds', 'kf1_endpoint'):
+            raise ValueError('goal_horizon_mode must be seconds or kf1_endpoint')
         if self.num_goal_tokens < 1 or not 0 <= self.recent_frames <= 4:
             raise ValueError('positive G count and zero to four recent memory frames required')
         if len(self.latent_shape) != 4 or self.latent_shape[:2] != (48, 1) or self.latent_shape[2] % 6 or self.latent_shape[3] % 4:
@@ -154,6 +157,10 @@ class GoalMemoryExpert(nn.Module):
         horizon = torch.zeros(b,device=device,dtype=dtype) if goal_horizon_s is None else torch.as_tensor(goal_horizon_s,device=device,dtype=dtype)
         if horizon.shape != (b,) or not torch.isfinite(horizon).all() or (horizon<0).any():
             raise ValueError('goal horizon must be finite nonnegative [B] seconds')
+        if cfg.goal_horizon_mode == 'kf1_endpoint':
+            # KF1 denotes the instruction endpoint. Its remaining time is unknown
+            # at deployment, so training and generation use the same condition.
+            horizon = torch.zeros_like(horizon)
         time = torch.cat((time[:,:ys.start], time[:,ys] + self.horizon_embedding(sinusoidal_embedding_1d(d.freq_dim,horizon).to(dtype))[:,None]),1)
         modulation = d.time_projection(time).unflatten(-1,(6,d.dim))
         frequencies = [self._frequencies(i,rows,columns,device) for i in range(m+1)]
