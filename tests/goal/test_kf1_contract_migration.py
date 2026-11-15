@@ -21,6 +21,8 @@ def contracts(arch='G'):
 @pytest.mark.parametrize('arch', ['G', 'Cstar'])
 def test_only_kf1_condition_and_evaluation_may_change(arch):
     old, new = contracts(arch)
+    old['runner']['data_pipeline.py'] = 'old-code-binding'
+    new['runner']['data_pipeline.py'] = 'new-code-binding'
     validate_kf1_contract_change(old, new)
 
 

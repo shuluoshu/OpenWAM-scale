@@ -39,7 +39,7 @@ def validate_kf1_contract_change(source, target):
         old_pin[field] = new_pin[field]
     if set(old['runner']) != set(new['runner']):
         raise ValueError('runner file set differs')
-    for name in ('validation16.py', 'distributed16.py'):
+    for name in ('validation16.py', 'distributed16.py', 'data_pipeline.py'):
         if name in old['runner']:
             old['runner'][name] = new['runner'][name]
     if old['arch'] == 'G':
