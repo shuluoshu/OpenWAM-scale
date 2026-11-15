@@ -39,7 +39,9 @@ def validate_kf1_contract_change(source, target):
         old_pin[field] = new_pin[field]
     if set(old['runner']) != set(new['runner']):
         raise ValueError('runner file set differs')
-    old['runner']['validation16.py'] = new['runner']['validation16.py']
+    for name in ('validation16.py', 'distributed16.py'):
+        if name in old['runner']:
+            old['runner'][name] = new['runner'][name]
     if old['arch'] == 'G':
         old_memory = old['model_config'].setdefault('memory', {})
         new_memory = new['model_config'].get('memory', {})
@@ -73,6 +75,17 @@ def assert_preserved(source, target):
             assert_preserved(first, second)
     elif source != target:
         raise ValueError('preserved scalar differs')
+
+
+def optimizer_contract_for_restore(manifest, contract):
+    """Validate the one-time bridge before accepting unchanged source shards."""
+    if canonical(manifest['contract']) != canonical(contract):
+        raise ValueError('target restore contract differs')
+    if manifest.get('lineage', {}).get('optimizer_state_policy') != 'source-shards-immutable-v1':
+        raise ValueError('missing explicit KF1 optimizer preservation policy')
+    source = manifest['optimizer_contract']
+    validate_kf1_contract_change(source, contract)
+    return canonical(source)
 
 
 def rebind_native_checkpoint(source_manifest, destination, target_contract):
@@ -143,21 +156,22 @@ def rebind_native_checkpoint(source_manifest, destination, target_contract):
                         raise ValueError('invalid FP32 optimizer shape/dtype')
                 if 'exp_avg_sq' in state and (state['exp_avg_sq'] < 0).any():
                     raise ValueError('negative Adam second moment')
-            payload['contract'] = canonical(target_contract)
             target = destination / receipt['file']
-            torch.save(payload, target)
-            reopened = torch.load(target, map_location='cpu', mmap=True, weights_only=False)
-            assert_preserved(payload, reopened)
-            # Verify against the source again with only the authorized contract edit.
-            reopened['contract'] = canonical(parent['contract'])
-            assert_preserved(torch.load(shard, map_location='cpu', mmap=True, weights_only=False), reopened)
-            receipt.update(bytes=target.stat().st_size, sha256=sha256(target))
-            del payload, reopened
+            os.link(shard, target)
+            if not os.path.samefile(shard, target) or target.stat().st_size != old_receipt['bytes']:
+                raise ValueError('optimizer immutable shard identity differs')
+            # The checked source inode is shared, preserving all tensor and RNG
+            # bytes, including its original contract. Native restore validates
+            # that source contract through the explicit KF1 bridge.
+            receipt.update(bytes=old_receipt['bytes'], sha256=old_receipt['sha256'])
+            del payload
     manifest['weights'].update(bytes=weights.stat().st_size, sha256=sha256(weights))
     manifest['lineage'] = dict(reason='KF1 endpoint fixed0 and copy/region evaluation',
+                               optimizer_state_policy='source-shards-immutable-v1',
                                source_manifest=str(source_manifest), source_manifest_sha256=sha256(source_manifest),
                                preserved_model_tensors=len(tensors), preserved_optimizer_names=len(all_names),
                                update_cursor_rng_preserved=True)
+    manifest['optimizer_contract'] = parent['contract']
     del tensors
     for path in destination.iterdir():
         with path.open('rb') as file:

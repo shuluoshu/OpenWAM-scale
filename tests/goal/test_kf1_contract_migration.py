@@ -69,10 +69,24 @@ def test_native_rebind_preserves_model_optimizer_and_rng(tmp_path):
     rebound = rebind_native_checkpoint(path, tmp_path / 'new', new)
     assert rebound['update'] == 12 and rebound['global_cursor'] == 30720
     result = torch.load(tmp_path / 'new' / shard.name, weights_only=False)
-    assert result['contract'] == canonical(new)
-    result['contract'] = canonical(old)
+    assert result['contract'] == canonical(old)
+    assert rebound['optimizer_contract'] == old
+    assert __import__('os').path.samefile(tmp_path / 'new' / shard.name, shard)
     assert_preserved(payload, result)
     with safe_open(str(tmp_path / 'new' / weights.name), framework='pt') as restored:
         assert torch.equal(restored.get_tensor('weight'), weight)
         assert json.loads(restored.metadata()['goal_memory_bundle'])['goal_memory']['goal_horizon_mode'] == 'kf1_endpoint'
     assert sha256(shard) == manifest['shards'][0]['sha256']
+
+
+def test_optimizer_source_contract_is_only_accepted_for_verified_kf1_bridge():
+    from openwam.train.goal_memory_kf1_migration import optimizer_contract_for_restore, canonical
+    old, new = contracts()
+    manifest = dict(contract=new, optimizer_contract=old,
+                    lineage=dict(optimizer_state_policy='source-shards-immutable-v1'))
+    assert optimizer_contract_for_restore(manifest, new) == canonical(old)
+    manifest['optimizer_contract']['execution']['global_batch_size'] = 8
+    with pytest.raises(ValueError):
+        optimizer_contract_for_restore(manifest, new)
+    with pytest.raises(ValueError):
+        optimizer_contract_for_restore(dict(contract=new, optimizer_contract=old), new)
