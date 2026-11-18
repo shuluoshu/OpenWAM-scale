@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the unchanged production trainer with helpers shipped in this repository."""
+"""Run the archived trainer with explicit, identity-tracked maintained adapters."""
 from pathlib import Path
 import argparse
 import json
@@ -37,7 +37,28 @@ def load_trainer():
     # location changes, while data locations still come from explicit config.
     original_reviewed = Path(json.loads((ROOT / 'snapshot.json').read_text())['reviewed_path'])
     trainer.DEFAULT_CSTAR = str(original_reviewed / 'baseline_cstar/data')
+    install_goal_generation(trainer)
     return trainer
+
+
+def install_goal_generation(trainer):
+    """Leave archived helper bytes intact; extend the strict run identity."""
+    if getattr(trainer, '_goal_generation_adapter', False):
+        return
+    base = trainer.d.load_reviewed().base
+    def generate(model, batch, *, arm, seed, index, steps=20):
+        # Imports follow the code directory selected by the config/bootstrap.
+        from openwam.train.goal_generation import generate_goal_latents
+        return generate_goal_latents(model, batch, common_noise=base.common_noise,
+                                     arm=arm, seed=seed, index=index, steps=steps)
+    base.generate_latents = generate
+    original_identity = trainer.runner_identity
+    def identity():
+        from openwam.train import goal_generation
+        return {**original_identity(), 'entrypoint.py': trainer.d.sha256(Path(__file__)),
+                'adapters/goal_generation.py': trainer.d.sha256(Path(goal_generation.__file__))}
+    trainer.runner_identity = identity
+    trainer._goal_generation_adapter = True
 
 
 def main(argv=None):

@@ -163,7 +163,7 @@ class CuratedGoalDataset:
         ann=root/'meta/sub_tasks.parquet';has_annotations=ann.exists()
         columns=['frame_index','task_index']
         if repo['family']=='mecka':columns+=['source_frame_index']
-        columns += [key for key in ('canonical.frame_valid','training.valid') if key in names]
+        columns += [key for key in ('canonical.frame_valid','training.valid','source.frame_validity') if key in names]
         if has_annotations:
             if 'subtask_index' not in names:raise ValueError('present annotations lack frame subtask_index')
             columns+=['subtask_index']
@@ -191,6 +191,9 @@ class CuratedGoalDataset:
             result['video_ordinals']=mecka_video_ordinals(labels,ep)
         from openwam.dataloader.native_stage2_io import source_frame_validity
         result['source_valid']=source_frame_validity(labels,length)
+        from openwam.dataloader.goal_validity import stage1_goal_validity
+        result['goal_observation_valid'],result['goal_validity_policy']=stage1_goal_validity(
+            labels,length,family=repo['family'],info=info)
         if self.history.enabled:result['history_source_valid']=result['source_valid']
         self._episodes[key]=result
         while len(self._episodes)>self.max_cached_episodes:self._episodes.popitem(last=False)
@@ -265,7 +268,9 @@ class CuratedGoalDataset:
             return video,images,alignment
         head_valid=m['head'] is not None
         # Future supervision validity is independent of current/history camera availability.
-        goal_image_valid=head_valid and bool(m['source_valid'][goal])
+        from openwam.dataloader.goal_validity import GOAL_LABEL_POLICY,goal_camera_validity
+        goal_observation_valid=bool(m['goal_observation_valid'][goal])
+        goal_image_valid=head_valid and goal_observation_valid
         if head_valid:
             video,images,alignment=decode(m['head'],[anchor,goal])
         else:
@@ -289,6 +294,9 @@ class CuratedGoalDataset:
         from openwam.dataloader.episode_data import read_episode_rows
         rows=read_episode_rows(m,episode,filters=[('frame_index','=',goal)]).to_pylist()
         if len(rows)!=1:raise ValueError('goal geometry source row not unique')
+        target_views=goal_camera_validity(rows[0],m['cameras'],
+            observation_valid=goal_observation_valid,policy=m['goal_validity_policy'])
+        goal_image_valid=bool(target_views[0])
         projection=dict(uv=np.zeros((2,2),np.float32),projection_valid=np.zeros(2,bool),in_frame=np.zeros(2,bool),visibility=np.full(2,-1,np.int8))
         if not head_valid:
             endpoint=dict(mask_reason='missing_head_camera')
@@ -343,7 +351,11 @@ class CuratedGoalDataset:
                 subtask_availability=('annotations_absent' if m['annotation_file'] is None else 'available_in_selected_ranges' if self._options(m,[s for s in repo['ranges'] if s[0]==episode],'subtask') else 'no_usable_subtask_intersects_selected_observation_ranges'),
                 observed_video=alignment[anchor],goal_video=alignment[goal],goal_source_frame=goal,
                 endpoint=endpoint,camera=cam_meta,calibration_eligibility_record=qa,
+                goal_observation_valid=goal_observation_valid,goal_validity_policy=m['goal_validity_policy'],
+                goal_label_policy=GOAL_LABEL_POLICY,goal_view_valid=target_views,
                 goal_policy='original contiguous instruction end_exclusive-1; may extend curated observation range',geometry_review_status='pending_review'))
+        record['goal_label_identity']=hashlib.sha256(json.dumps(dict(id=ident,policy=GOAL_LABEL_POLICY,
+            source_policy=m['goal_validity_policy'],views=target_views),sort_keys=True).encode()).hexdigest()
         if self.observation_mode=='multiview':
             record.update(observation_mode='multiview',view_valid=view_valid)
             record['provenance']['observed_views']=observed_views
@@ -353,7 +365,7 @@ class CuratedGoalDataset:
         # Training provenance still identifies source videos, rows and frames.
         record['provenance']['input_materialization']='exported_assets' if self._evaluating else 'in_memory'
         if self._evaluating:
-            folder=self.cache_dir/('evaluation_'+ident);folder.mkdir(exist_ok=True)
+            folder=self.cache_dir/('evaluation_'+ident+'_'+GOAL_LABEL_POLICY);folder.mkdir(exist_ok=True)
             observed.save(folder/'observed.png')
             images[goal].resize((320,256),Image.Resampling.BILINEAR).save(folder/'goal.png')
             np.savez_compressed(folder/'targets.npz',**{k:projection[k] for k in ('uv','projection_valid','in_frame','visibility')})
@@ -367,7 +379,7 @@ class CuratedGoalDataset:
             batch['targets'].in_frame.zero_()
         batch.update(instruction=record['instruction'],id=ident,family=repo['family'],granularity=level)
         if self.materialize_multiview_target:
-            valid=torch.tensor(view_valid,dtype=torch.bool) & bool(m['source_valid'][goal])
+            valid=torch.tensor(target_views,dtype=torch.bool)
             target=(clean_multiview(target_frames,valid) if valid.any()
                     else torch.full((3,1,384,320),-1.))
             batch.update(target_image=target.to(dtype=self.dtype).unsqueeze(0),

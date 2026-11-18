@@ -148,7 +148,8 @@ class RFCGoalDataset(Dataset):
         for level,prob in [('task',1-subtask_probability),('subtask',subtask_probability)]:
             if prob and not self.pools[level]:raise ValueError(f'no eligible {level} population for requested mixture')
         self._rebuild_sampler()
-        population=dict(sources=sorted(s['identity'] for s in self.sources.values()),
+        from openwam.dataloader.goal_validity import GOAL_LABEL_POLICY
+        population=dict(sources=sorted(s['identity'] for s in self.sources.values()),goal_label_policy=GOAL_LABEL_POLICY,
                         epoch_size=epoch_size,seed=seed,subtask_probability=subtask_probability,
                         recent_frames=recent_frames,policy='strict-past-episode-grid-1Hz-sink-recent-v1',
                         sampler='global-grain-then-repo-marginal-then-uniform-valid-anchor-v2')

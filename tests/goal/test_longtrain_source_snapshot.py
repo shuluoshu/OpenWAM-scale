@@ -88,9 +88,14 @@ assert pathlib.Path(d.load_reviewed().__file__).resolve().is_relative_to(root)
 # bind_code happens before native C* is imported, as in the production runner.
 d.load_reviewed().base.bind_code(pathlib.Path(sys.argv[2]))
 assert pathlib.Path(d.load_cstar().__file__).resolve().is_relative_to(root)
-assert trainer.runner_identity() == json.loads((root/'provenance/G.contract.json').read_text())['runner']
+runner = trainer.runner_identity()
+archived = json.loads((root/'provenance/G.contract.json').read_text())['runner']
+assert {key: runner[key] for key in archived} == archived
+assert set(runner) - set(archived) == {'entrypoint.py', 'adapters/goal_generation.py'}
+assert d.load_reviewed().base.generate_latents.__module__ == 'repository_entry'
 assert trainer.source_identity(sys.argv[2])['reviewed_helpers'] == json.loads((root/'provenance/G.contract.json').read_text())['source']['reviewed_helpers']
-assert trainer.source_identity(sys.argv[2])['pinned']['python_tree_sha256'] == json.loads((root/'snapshot.json').read_text())['core_python_tree_sha256']
+# snapshot.json identifies the historical base core, not subsequent maintained fixes.
+assert trainer.source_identity(sys.argv[2])['pinned']['python_tree_sha256'] != json.loads((root/'snapshot.json').read_text())['core_python_tree_sha256']
 # Both import-time defaults must use the selected clone, not the old live core.
 import frozen_metadata_view, raw_metadata_overlay, data_pipeline
 assert pathlib.Path(data_pipeline.DEFAULT_CODE) == pathlib.Path(sys.argv[2])

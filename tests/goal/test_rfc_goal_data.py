@@ -61,6 +61,18 @@ def test_finite_ratio_resume_and_source_change(tmp_path):
     (root/'meta/info.json').write_text((root/'meta/info.json').read_text()+' ')
     with pytest.raises(ValueError,match='source dependency changed'):dataset[0]
 
+
+def test_goal_label_version_changes_population_but_preserves_history_keys_and_draws(tmp_path, monkeypatch):
+    from openwam.dataloader import goal_validity
+    config, _ = source(tmp_path)
+    old = RFCGoalDataset(config, tmp_path / 'reader-a', epoch_size=10)
+    monkeypatch.setattr(goal_validity, 'GOAL_LABEL_POLICY', 'test-next-goal-policy')
+    new = RFCGoalDataset(config, tmp_path / 'reader-b', epoch_size=10)
+    assert old.population_identity != new.population_identity
+    for index in range(10):
+        assert old.selection_at(index) == new.selection_at(index)
+        assert old.memory_requests(index) == new.memory_requests(index)
+
 def test_required_cache_miss_before_history_decode(tmp_path):
     config,_=source(tmp_path)
     codec=GoalMemoryCodec(VAE(),tmp_path/'latents',vae_identity='test')
