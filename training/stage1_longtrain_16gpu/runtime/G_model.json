@@ -1,0 +1,106 @@
+{
+  "model": {
+    "goal_representation": "goal_memory",
+    "query_goal": {
+      "num_image_tokens": 64,
+      "num_tcp_tokens": 2,
+      "dim": 512,
+      "num_heads": 8,
+      "num_layers": 4,
+      "ffn_dim": 2048
+    }
+  },
+  "baseline_checkpoint": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Pretrain-Foundation-Model/checkpoint_step_154000.safetensors",
+  "shift": 5.0,
+  "dtype": "bfloat16",
+  "batch_size": 1,
+  "learning_rate": 1e-05,
+  "max_steps": 5000,
+  "eval_every": 500,
+  "sampling_steps": 20,
+  "gradient_checkpointing": true,
+  "components": {
+    "dit": {
+      "model_class": "openwam.model.video_backbone.wan.models.dit.WanModel",
+      "extra_kwargs": {
+        "has_image_input": false,
+        "patch_size": [
+          1,
+          2,
+          2
+        ],
+        "in_dim": 48,
+        "dim": 3072,
+        "ffn_dim": 14336,
+        "freq_dim": 256,
+        "text_dim": 4096,
+        "out_dim": 48,
+        "num_heads": 24,
+        "num_layers": 30,
+        "eps": 1e-06,
+        "seperated_timestep": true,
+        "require_clip_embedding": false,
+        "require_vae_embedding": false,
+        "fuse_vae_embedding_in_latents": true
+      }
+    },
+    "vae": {
+      "model_class": "openwam.model.video_backbone.wan.models.vae.WanVideoVAE38",
+      "extra_kwargs": {}
+    },
+    "text_encoder": {
+      "model_class": "openwam.model.video_backbone.wan.models.text_encoder.WanTextEncoder",
+      "extra_kwargs": {}
+    }
+  },
+  "tokenizer": {
+    "model_class": "openwam.model.video_backbone.wan.models.text_encoder.HuggingfaceTokenizer",
+    "subdir": "tokenizer/google/umt5-xxl",
+    "kwargs": {
+      "name": null,
+      "seq_len": 512,
+      "clean": "whitespace"
+    }
+  },
+  "lambda_image": 0.5,
+  "lambda_tcp": 1.0,
+  "text_device": "cpu",
+  "text_cache_size": 32,
+  "dataset": {
+    "source_yaml": "/mnt/data/cpfs/b5/yeqingda/CodeX/docs/2026-11-11/stage1-8133-dlc-comparison/cohort/source_train.yaml",
+    "cache_dir": "/mnt/data/cpfs/b5/yeqingda/CodeX/experiments/rfc_stage1_compare_20261111/data/reader_cache/train",
+    "max_cached_episodes": 2,
+    "subtask_probability": 0.7,
+    "data_root": null,
+    "observation_mode": "multiview"
+  },
+  "stage": 1,
+  "representation": "goal_memory",
+  "seed": 42,
+  "history": {
+    "fps": 1,
+    "recent_frames": 2
+  },
+  "memory": {
+    "num_goal_tokens": 32,
+    "recent_frames": 2,
+    "history_dropout": 0.15,
+    "history_noise_mix": 0.1,
+    "goal_dropout": 0.0,
+    "lambda_image": 1.0,
+    "lambda_uv": 1.0,
+    "warmup_fraction": 0.2,
+    "warmup_y_text_probability": 0.5,
+    "use_gradient_checkpointing": true,
+    "goal_horizon_mode": "kf1_endpoint"
+  },
+  "memory_cache": {
+    "directory": "/mnt/data/cpfs/b5/yeqingda/CodeX/runtime/openwam-rfc-goal-memory-16e1180-dlc/outputs/goal_memory_frames",
+    "require_cache": true
+  },
+  "new_learning_rate": 0.0001,
+  "max_updates": 50000,
+  "checkpoint_every": 1000,
+  "max_grad_norm": 1.0,
+  "optimizer_device": "model"
+}

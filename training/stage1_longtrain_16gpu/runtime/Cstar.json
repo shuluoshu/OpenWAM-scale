@@ -1,0 +1,23 @@
+{
+  "seed": 42,
+  "schedule_reference_updates": 50000,
+  "code_dir": "/mnt/data/cpfs/b5/yeqingda/CodeX/runtime/openwam-kf1-endpoint-221464d-dlc",
+  "distributed_timeout_seconds": 900,
+  "global_batch_size": 2560,
+  "data_pipeline": {
+    "cache_dir": "/mnt/data/cpfs/b5big/yeqingda/CodeX/longtrain_16gpu_20261112/cache",
+    "frame_cache_dir": "/tmp/openwam16_frames_{arch}_{rank}",
+    "frame_disk_gb": 128,
+    "text_cache_dir": "/tmp/openwam16_text_Cstar",
+    "text_disk_gb": 64,
+    "vae_batch_size": 16,
+    "text_batch_size": 4,
+    "num_workers": 8,
+    "prefetch_factor": 2,
+    "source_yaml": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/stage12_subset_continuation_20261109/source_exclude_missing_133.yaml",
+    "population_index": "/mnt/data/cpfs/b5big/yeqingda/CodeX/longtrain_16gpu_20261112/metadata_generation_v2/population.sqlite",
+    "audit_file": "/mnt/data/cpfs/b5big/yeqingda/CodeX/longtrain_16gpu_20261112/metadata_generation_v2/audit.json",
+    "metadata_view_manifest": "/mnt/data/cpfs/b5big/yeqingda/CodeX/longtrain_16gpu_20261112/metadata_generation_v2/manifest.json",
+    "path_aliases": "/mnt/data/cpfs/b5big/yeqingda/CodeX/longtrain_16gpu_20261112/metadata_generation_v2/path_aliases.json"
+  }
+}

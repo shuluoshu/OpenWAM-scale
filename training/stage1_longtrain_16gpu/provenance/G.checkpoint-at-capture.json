@@ -1,0 +1,8 @@
+{
+  "update": 5000,
+  "samples": 12800000,
+  "generation": "/mnt/data/cpfs/b5big/yeqingda/CodeX/storage/longtrain_16gpu_20261112_20261115/runs/G/checkpoints/step_000005000_389de9fc24bb",
+  "manifest_sha256": "b11c041840a13b15a3119237e5c15e12cc0bea7fc1d96d3bd094d472ddab0529",
+  "weights": "/mnt/data/cpfs/b5big/yeqingda/CodeX/storage/longtrain_16gpu_20261112_20261115/runs/G/checkpoints/step_000005000_389de9fc24bb/goal_memory.safetensors",
+  "resume": "/mnt/data/cpfs/b5big/yeqingda/CodeX/storage/longtrain_16gpu_20261112_20261115/runs/G/checkpoints/step_000005000_389de9fc24bb/manifest.json"
+}

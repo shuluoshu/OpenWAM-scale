@@ -1,0 +1,84 @@
+{
+  "files": {
+    "foundation": {
+      "path": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Pretrain-Foundation-Model/checkpoint_step_154000.safetensors",
+      "size": 24813767464,
+      "mtime_ns": 1789532039580325253,
+      "in_git": false,
+      "sha256": "180a02653118b0f96da28a9cae9ec7b4c1c1e6cd0e4608b56c7b4884f8001d3d",
+      "sha256_source": "existing live run contract; not rehashed during archive"
+    },
+    "source_yaml": {
+      "path": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/stage12_subset_continuation_20261109/source_exclude_missing_133.yaml",
+      "size": 13752406,
+      "mtime_ns": 1794156162825057521,
+      "in_git": false,
+      "sha256": "88d2d0ea76f2bdaf5eef3d19e80c4eaf4de2439e42177987abd67cbe9d29012d",
+      "sha256_source": "read during snapshot capture"
+    },
+    "population_index": {
+      "path": "/mnt/data/cpfs/b5big/yeqingda/CodeX/longtrain_16gpu_20261112/metadata_generation_v2/population.sqlite",
+      "size": 1196384256,
+      "mtime_ns": 1794479438814344231,
+      "in_git": false,
+      "sha256_source": "not hashed; native audit binds size/mtime and logical index identity"
+    },
+    "data_audit": {
+      "path": "/mnt/data/cpfs/b5big/yeqingda/CodeX/longtrain_16gpu_20261112/metadata_generation_v2/audit.json",
+      "size": 3124870,
+      "mtime_ns": 1794479582604411011,
+      "in_git": false,
+      "sha256": "e723a962a94b0c187108b2f7eb93e3de36c12d2da45ee16bd09ed4b48db3ce58",
+      "sha256_source": "read during snapshot capture"
+    },
+    "metadata_manifest": {
+      "path": "/mnt/data/cpfs/b5big/yeqingda/CodeX/longtrain_16gpu_20261112/metadata_generation_v2/manifest.json",
+      "size": 113011,
+      "mtime_ns": 1794478916178537418,
+      "in_git": false,
+      "sha256": "45dede1580c7ce4e3d5a2ecbb4c4f361b865ab001ae59f83245dd1f035d88cdf",
+      "sha256_source": "read during snapshot capture"
+    },
+    "path_aliases": {
+      "path": "/mnt/data/cpfs/b5big/yeqingda/CodeX/longtrain_16gpu_20261112/metadata_generation_v2/path_aliases.json",
+      "size": 2829,
+      "mtime_ns": 1794478915467537547,
+      "in_git": false,
+      "sha256": "4ea2cce8035bf87c41556120441381c2366ccd64eb50ee248c5d837cf50a6823",
+      "sha256_source": "read during snapshot capture"
+    },
+    "G_diagnostic_manifest": {
+      "path": "/mnt/data/cpfs/b5/yeqingda/CodeX/experiments/rfc_stage1_compare_20261111/data/manifest.json",
+      "size": 451624,
+      "mtime_ns": 1794400590549956192,
+      "in_git": false,
+      "sha256": "987b385a32586300e4c1ad6f49e0d1d5a49d7cbfaa0a3917992e74b983e10704",
+      "sha256_source": "read during snapshot capture"
+    },
+    "Cstar_diagnostic_manifest": {
+      "path": "/mnt/data/cpfs/b5/yeqingda/CodeX/experiments/rfc_stage1_compare_8gpu_20261111/baseline_cstar/data/manifest.json",
+      "size": 497893,
+      "mtime_ns": 1794407698344275039,
+      "in_git": false,
+      "sha256": "0437fd3b55966e87598d0385e1579f036412e231928fce934e0e800626bc8cc6",
+      "sha256_source": "read during snapshot capture"
+    },
+    "raw_original_info_audit": {
+      "path": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/causal_cstar_h100_switch_20261109/h100_causal_text/stage2_metadata_audit.json",
+      "size": 3793406,
+      "mtime_ns": 1794239459341497151,
+      "in_git": false,
+      "sha256": "fd18479493585cb6033c925eaeddcc26cc0d0c15ec1df7e980904eb3c9ed3b42",
+      "sha256_source": "read during snapshot capture"
+    }
+  },
+  "metadata_fingerprint": "b3bd71da661092045f0ef336bda9ae5a3f012937c9bd6805bcab89ccbb8400fe",
+  "foundation_tensor_data_in_git": false,
+  "diagnostics": "Both complete prepared directories, including train256, val64 and context tensors referenced by their manifests; Cstar context paths may be absolute. Fixed64 may overlap full training, fitting diagnostic only.",
+  "data": "Full native repo trees from source YAML plus frozen metadata views and their external annotations; preserve native camera identity, labels, source size and mtime.",
+  "video_index_cache": "/mnt/data/cpfs/b5/yeqingda/openwam-0911/OpenWAM/outputs/stage1_dlc_efficiency_20261101/video_index",
+  "code_snapshot_required_for_exact_live_contract": {
+    "directory": "/mnt/data/cpfs/b5/yeqingda/CodeX/runtime/openwam-kf1-endpoint-221464d-dlc",
+    "python_tree_sha256": "d5b14604016368bed83356fb1b8008a3721c6b5da16ad841c03b4a750ed348e3"
+  }
+}
